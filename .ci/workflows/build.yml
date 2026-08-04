@@ -1,0 +1,42 @@
+# This repository's own CI, which is also the worked example the README points
+# at. It builds `ci` with `ci`.
+name: build
+on: [submit]
+
+jobs:
+  test:
+    # Any online host in the workflow object's network. Pin with
+    # `uses: <network>/<runner>` when a job needs particular hardware.
+    vm:
+      driver: firecracker
+      image: ubuntu:24.04
+      size_class: medium
+      disk_size_gb: 20
+      setup_hooks:
+        - apt-get update && apt-get install -y build-essential curl pkg-config libssl-dev
+        - curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      # A dependency change is the one thing that must not reuse a warm VM:
+      # the cached `~/.cargo` and `target/` in it were built against the old
+      # lockfile.
+      cache_key_files:
+        - Cargo.lock
+        - rust-toolchain.toml
+    env:
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Format
+        run: . "$HOME/.cargo/env" && cargo fmt --check
+      - name: Clippy
+        run: . "$HOME/.cargo/env" && cargo clippy --all-targets
+      - name: Test
+        # Unit tests only. The integration suite needs Postgres, NATS and a
+        # heyvmd, which is a job for a runner provisioned with them rather than
+        # a default one.
+        run: . "$HOME/.cargo/env" && cargo test --bin ci
+        timeout-minutes: 30
+      - name: Build
+        run: . "$HOME/.cargo/env" && cargo build --release
+      - uses: ci/upload-artifact
+        with:
+          name: ci-binary
+          path: target/release/ci

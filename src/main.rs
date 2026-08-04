@@ -1,0 +1,235 @@
+//! CI orchestration and dashboard for heyvm networks.
+//!
+//! A machine becomes a runner by running `heyvmd` and joining a heyvm network —
+//! there is no agent to install. This process discovers those hosts, opens an
+//! iroh tunnel to each, and drives workflow jobs on them: claiming or creating a
+//! VM from a fingerprinted pool, running each step through the daemon's async
+//! exec-operation API, and streaming the output back.
+//!
+//! Startup order is deliberate. Config is resolved and *fully* validated before
+//! anything binds a port or dials NATS, so a misconfiguration is a non-zero exit
+//! with a message naming the variable — not a process that supervisord reports
+//! as `RUNNING` while every job fails.
+
+mod artifacts;
+mod bus;
+mod config;
+mod dispatch;
+mod expr;
+mod nats_auth;
+mod objects;
+mod plan;
+mod pool;
+mod runners;
+mod secrets;
+mod store;
+mod trigger;
+mod vm;
+mod web;
+mod workflow;
+
+use bus::Bus;
+use config::Config;
+use dispatch::Dispatcher;
+use pool::Pool;
+use runners::{RunnerError, Runners};
+use std::sync::Arc;
+use store::Store;
+use vm::Vms;
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,ci=debug".into()),
+        )
+        .init();
+
+    let config = match Config::from_env() {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            // stderr as well as the log: a startup failure has to be visible in
+            // `supervisorctl tail` even when the log filter is set to `error`.
+            eprintln!("ci: refusing to start — {e}");
+            tracing::error!("refusing to start: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if config.nats.credential_from_url {
+        tracing::warn!(
+            "the NATS credential arrived inside CI_NATS_URL, which is visible in \
+             shell history and process listings; prefer CI_NATS_TOKEN, \
+             CI_NATS_USER/CI_NATS_PASSWORD, CI_NATS_CREDS or CI_NATS_NKEY"
+        );
+    }
+
+    tracing::info!("{} starting — {}", config.name, config.summary());
+
+    let secrets_client = secrets::Secrets::new(&config);
+    let objects = Arc::new(objects::Workflows::new(&config));
+    let runners = Arc::new(Runners::new(config.clone()));
+    // The first read of the pool is awaited so a network that does not exist is
+    // reported now rather than by the first job. Which failures are fatal is the
+    // distinction that matters: naming a network wrongly is a configuration
+    // error and behaves like one, while a cloud that is merely unreachable
+    // right now must not stop the dashboard from serving — the refresh loop
+    // will pick the pool up when it recovers.
+    match runners.refresh().await {
+        Ok(()) => {
+            let set = runners.snapshot();
+            tracing::info!(
+                "network {} ({}) has {} runner(s), {} online",
+                set.network_name,
+                set.network_id,
+                set.runners.len(),
+                set.dispatchable().count(),
+            );
+        }
+        Err(e @ (RunnerError::UnknownNetwork { .. } | RunnerError::AmbiguousNetwork { .. })) => {
+            eprintln!("ci: refusing to start — {e}");
+            tracing::error!("refusing to start: {e}");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            tracing::warn!("could not read the runner pool at startup, will retry: {e}");
+        }
+    }
+    runners.clone().spawn_refresh_loop();
+
+    // Postgres before NATS: a bad connection string is far more common than a
+    // bad NATS one, and failing on the likelier cause first makes the message
+    // people actually see the useful one.
+    let store = match Store::connect(&config.database_url, config.log_dir.clone()).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("ci: refusing to start — {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = store
+        .migrate(std::path::Path::new(&config.migrations_dir))
+        .await
+    {
+        eprintln!("ci: refusing to start — {e}");
+        std::process::exit(1);
+    }
+    tracing::info!("database ready");
+
+    let bus = match Bus::connect(&config.nats, &config.nats_prefix).await {
+        Ok(b) => Arc::new(b),
+        Err(e) => {
+            eprintln!("ci: refusing to start — {e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        "jetstream ready: {} / {}",
+        bus.jobs_stream(),
+        bus.events_stream()
+    );
+
+    let artifacts = match artifacts::sink_for(&config) {
+        Ok(s) => Arc::from(s),
+        Err(e) => {
+            eprintln!("ci: refusing to start — {e}");
+            std::process::exit(1);
+        }
+    };
+    if !secrets_client.is_configured() {
+        tracing::warn!(
+            "heyosecret is not configured, so `${{{{ secrets.* }}}}` will resolve empty. \
+             Set CI_HEYOSECRET_URL and CI_HEYOSECRET_TOKEN."
+        );
+    }
+
+    let dispatcher = Arc::new(Dispatcher {
+        config: config.clone(),
+        store: store.clone(),
+        pool: Pool::new(store.pool().clone()),
+        bus: bus.clone(),
+        runners: runners.clone(),
+        vms: Arc::new(Vms::new()),
+        secrets: secrets_client,
+        artifacts,
+        objects: objects.clone(),
+    });
+
+    // One eager read so a misconfigured CI_APP_LB_URL is visible at startup
+    // rather than at the first submit.
+    if objects.is_configured() {
+        match objects.refresh().await {
+            Ok(()) => tracing::info!(
+                "{} workflow object(s) registered in app-lb",
+                objects.snapshot().workflows.len()
+            ),
+            Err(e) => tracing::warn!("could not read workflow objects at startup: {e}"),
+        }
+    }
+    objects.clone().spawn_refresh_loop();
+
+    // A previous process may have died holding VMs. Reclaim before taking work,
+    // or the pool leaks its capacity one restart at a time.
+    if let Err(e) = dispatcher.reclaim_pool().await {
+        tracing::warn!("could not reclaim the VM pool: {e}");
+    }
+    dispatcher.clone().spawn_consumers();
+
+    // Bind before announcing readiness. A listener that cannot bind is a hard
+    // failure here rather than a task that dies quietly and leaves the process
+    // up with no data plane.
+    let listener = match tokio::net::TcpListener::bind(config.listen_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "ci: cannot bind CI_LISTEN_ADDR={} — {e}",
+                config.listen_addr
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let app = web::router(
+        config.clone(),
+        runners.clone(),
+        store.clone(),
+        dispatcher.clone(),
+    );
+    tracing::info!("listening on http://{}", config.listen_addr);
+
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+    {
+        tracing::error!("server stopped: {e}");
+        std::process::exit(1);
+    }
+    tracing::info!("shut down cleanly");
+}
+
+/// SIGTERM as well as ctrl-c: supervisord stops a program with `TERM`, and a
+/// process that only handles ctrl-c gets killed after `stopwaitsecs` instead of
+/// draining.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            // Nothing useful to do if the handler cannot be installed; fall
+            // back to ctrl-c alone rather than refusing to serve.
+            Err(e) => {
+                tracing::warn!("could not install a SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received ctrl-c, draining"),
+        _ = terminate => tracing::info!("received SIGTERM, draining"),
+    }
+}

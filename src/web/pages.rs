@@ -316,6 +316,7 @@ mod tests {
             unjoined: vec![runner("hd-9", "laptop", RunnerStatus::Online)],
             last_error: None,
             default_network_id: "net-1".into(),
+            default_node_id: String::new(),
         }
     }
 

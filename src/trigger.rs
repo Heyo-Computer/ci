@@ -1,27 +1,41 @@
 //! The submit endpoint: `git submit` posts here.
 //!
-//! The client sends a **`git archive` tarball of the tree it wants built**,
-//! signed with HMAC-SHA256. Two consequences follow from that choice, and both
-//! are the point:
+//! The client sends the source it wants built — a **`git bundle`** by default,
+//! or a **`git archive` tarball** with `--archive`. Two consequences follow from
+//! the submitter packing it rather than the server fetching it, and both are the
+//! point:
 //!
 //! - **No repository credential exists anywhere in this system.** Not on the
 //!   orchestrator, not in a guest. The submitter already had read access — they
-//!   ran `git archive` — so nothing here needs its own. A CI system that clones
+//!   ran `git bundle` — so nothing here needs its own. A CI system that clones
 //!   for you is a CI system holding a key to every repository it builds.
 //! - **The tree is exactly what the submitter meant.** No re-resolving a ref
 //!   that may have moved, no guessing whether `--dirty` work was included. What
 //!   arrives is what runs.
 //!
-//! The cost is that the guest gets a tree with no `.git`, so `git describe` and
-//! friends do not work in a step. The commit, ref and branch are supplied as
-//! `CI_*`/`GITHUB_*` environment variables instead, which covers what build
-//! scripts actually read them for.
+//! ## Why a bundle, and why the tarball survives
+//!
+//! A bundle clones in the guest into a real repository, so `git describe`,
+//! `git log` and `git rev-parse` work in a step — which a tarball cannot offer,
+//! having no `.git` at all.
+//!
+//! It costs history. A bundle that clones on its own **must reach a root
+//! commit**: `git bundle create --depth` does not exist, and a `--max-count`
+//! slice is refused at clone time with *"Repository lacks these prerequisite
+//! commits"*. So the payload is proportional to the repository's history rather
+//! than to one tree, and `--archive` stays supported for the repository where
+//! that is the wrong trade.
+//!
+//! Both formats need a tool the other does not: a bundle needs `git` on the
+//! orchestrator *and* in the guest image; a tarball needs neither. Each absence
+//! is reported by name.
 //!
 //! ## The signature is the whole security boundary
 //!
 //! This route is in the deployment's `public_paths`, because an app-lb gate
-//! admits browsers only and `git submit` is not a browser. So a credential here is
-//! stands between the open internet and arbitrary code execution on a runner.
+//! admits browsers only and `git submit` is not a browser. So the credential
+//! here stands between the open internet and arbitrary code execution on a
+//! runner.
 //! It is compared in constant time, over the raw body, before the body is
 //! parsed — a JSON parse on unauthenticated input is a decision, not a default.
 
@@ -65,8 +79,9 @@ pub struct GitIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceArchive {
-    /// Only `tar.gz` today. Named rather than assumed so a future format is a
-    /// rejected value instead of a corrupt extraction.
+    /// `tar.gz` or `git-bundle`. Named rather than assumed so an unknown format
+    /// is a rejected value instead of a corrupt unpack — and so a client older
+    /// than this server keeps working by saying which one it sent.
     pub format: String,
     pub content_base64: String,
 }
@@ -140,36 +155,103 @@ pub fn verify_signature(
     }
 }
 
-/// Where a run's extracted tree and its archive live.
+/// How a submitted tree arrived, and therefore how it reaches the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceFormat {
+    /// `git archive` of one tree. No `.git` in the guest.
+    TarGz,
+    /// `git bundle` of the branch. Clones in the guest into a real repository,
+    /// so `git describe`, `git log` and `git rev-parse` work in a step.
+    GitBundle,
+}
+
+impl SourceFormat {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "tar.gz" => Some(Self::TarGz),
+            "git-bundle" => Some(Self::GitBundle),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::TarGz => "tar.gz",
+            Self::GitBundle => "git-bundle",
+        }
+    }
+
+    /// The extension the submitted bytes are stored under.
+    ///
+    /// Distinct per format on purpose: the executor re-derives a [`Workspace`]
+    /// from a run id alone, long after the submit that chose the format, and
+    /// the file that exists is what tells it which one to ship.
+    fn extension(&self) -> &'static str {
+        match self {
+            Self::TarGz => "tar.gz",
+            Self::GitBundle => "bundle",
+        }
+    }
+}
+
+/// Where a run's tree and the bytes it came from live.
 pub struct Workspace {
     pub root: PathBuf,
-    pub archive: PathBuf,
+    /// `git archive` tarball, when that is what was submitted.
+    pub tarball: PathBuf,
+    /// `git bundle`, when that is what was submitted.
+    pub bundle: PathBuf,
 }
 
 impl Workspace {
     pub fn for_run(config: &Config, run_id: &str) -> Self {
         Self {
             root: config.workspace_dir.join(run_id),
-            archive: config.workspace_dir.join(format!("{run_id}.tar.gz")),
+            tarball: config
+                .workspace_dir
+                .join(format!("{run_id}.{}", SourceFormat::TarGz.extension())),
+            bundle: config
+                .workspace_dir
+                .join(format!("{run_id}.{}", SourceFormat::GitBundle.extension())),
         }
+    }
+
+    pub fn path_for(&self, format: SourceFormat) -> &Path {
+        match format {
+            SourceFormat::TarGz => &self.tarball,
+            SourceFormat::GitBundle => &self.bundle,
+        }
+    }
+
+    /// Which of the two is actually on disk, for a run whose submit happened in
+    /// another process.
+    pub fn stored_source(&self) -> Option<(SourceFormat, &Path)> {
+        for format in [SourceFormat::GitBundle, SourceFormat::TarGz] {
+            let path = self.path_for(format);
+            if path.exists() {
+                return Some((format, path));
+            }
+        }
+        None
     }
 }
 
-/// Decode and extract a submitted archive into `workspace.root`, keeping the
-/// compressed copy at `workspace.archive` for shipping to the guest.
+/// Decode a submitted source into `workspace.root`, keeping the original bytes
+/// alongside it for shipping to the guest.
 ///
-/// Keeping the original rather than re-taring is not just an optimisation: a
-/// round trip through extract-and-repack would silently normalise permissions
-/// and drop anything the extractor chose not to write, so what runs in the guest
-/// would differ from what was submitted.
+/// Keeping the original rather than re-packing is not just an optimisation: a
+/// round trip through unpack-and-repack would silently normalise permissions and
+/// drop anything the unpacker chose not to write, so what runs in the guest
+/// would differ from what was submitted. For a bundle it matters more still —
+/// re-packing would discard the history that is the whole reason to send one.
 pub fn materialize(
     source: &SourceArchive,
     workspace: &Workspace,
     max_bytes: usize,
 ) -> Result<usize, TriggerError> {
-    if source.format != "tar.gz" {
-        return Err(TriggerError::UnsupportedFormat(source.format.clone()));
-    }
+    let format = SourceFormat::parse(&source.format)
+        .ok_or_else(|| TriggerError::UnsupportedFormat(source.format.clone()))?;
+
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(source.content_base64.as_bytes())
         .map_err(|e| TriggerError::BadArchive(format!("not valid base64: {e}")))?;
@@ -191,13 +273,100 @@ pub fn materialize(
         reason: e.to_string(),
     })?;
 
-    extract(&bytes, &workspace.root)?;
-
-    std::fs::write(&workspace.archive, &bytes).map_err(|e| TriggerError::Io {
-        path: workspace.archive.clone(),
+    // The bytes are written before they are unpacked, because cloning a bundle
+    // reads it from disk — and because a stale file of the *other* format left
+    // by a re-submit would otherwise be what `stored_source` finds later.
+    let stored = workspace.path_for(format);
+    std::fs::write(stored, &bytes).map_err(|e| TriggerError::Io {
+        path: stored.to_path_buf(),
         reason: e.to_string(),
     })?;
+    let _ = std::fs::remove_file(workspace.path_for(match format {
+        SourceFormat::TarGz => SourceFormat::GitBundle,
+        SourceFormat::GitBundle => SourceFormat::TarGz,
+    }));
+
+    match format {
+        SourceFormat::TarGz => extract(&bytes, &workspace.root)?,
+        SourceFormat::GitBundle => clone_bundle(stored, &workspace.root)?,
+    }
     Ok(bytes.len())
+}
+
+/// Clone a submitted bundle into `root`, producing a real working tree.
+///
+/// Shelling out to `git` rather than linking a git library: the orchestrator
+/// only needs this to read workflow files and hash `cache_key_files` out of the
+/// tree, and `git` is already a hard requirement of the deployment (app-lb's
+/// update block runs `git pull`). A missing binary is reported by name rather
+/// than as a confusing clone failure.
+///
+/// **The bundle is unauthenticated input until the credential check passes**, and
+/// only as trustworthy afterwards as whoever holds the token. `git clone` of a
+/// local bundle writes only inside the destination — there is no hook to run,
+/// because hooks live in the destination's own `.git` which git creates fresh —
+/// but it is still given an empty environment-ish treatment below: `core.hooksPath`
+/// is pinned away and the bundle is verified before it is used.
+fn clone_bundle(bundle: &Path, root: &Path) -> Result<(), TriggerError> {
+    let git = |args: &[&str]| -> Result<std::process::Output, TriggerError> {
+        std::process::Command::new("git")
+            .args(args)
+            .output()
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    TriggerError::NoGit
+                } else {
+                    TriggerError::BadArchive(format!("running git: {e}"))
+                }
+            })
+    };
+
+    // Verify first: `git bundle verify` rejects a truncated or corrupt bundle,
+    // and a bundle whose prerequisites are absent — which is exactly what a
+    // client that tried to send a shallow slice would produce, and which would
+    // otherwise fail later as an unexplained empty checkout.
+    let verify = git(&["bundle", "verify", &bundle.display().to_string()])?;
+    if !verify.status.success() {
+        return Err(TriggerError::BadArchive(format!(
+            "the git bundle is not usable on its own: {}",
+            String::from_utf8_lossy(&verify.stderr).trim()
+        )));
+    }
+
+    // `verify` is not enough, and the gap is not obvious: a file containing
+    // nothing but the header `# v2 git bundle` **passes** it — reported as
+    // "is okay", "0 refs", "records a complete history" — and then clones into
+    // an empty repository. The submitter's next error would be "no workflow
+    // files matched", sending them to look at their glob when the real problem
+    // is that nothing was sent. So the refs are counted explicitly.
+    let heads = git(&["bundle", "list-heads", &bundle.display().to_string()])?;
+    if heads.stdout.iter().all(u8::is_ascii_whitespace) {
+        return Err(TriggerError::BadArchive(
+            "the git bundle contains no refs, so there is nothing to check out. \
+             It passed `git bundle verify`, which reports a ref-less bundle as \
+             complete — check that the client packed a branch and not a bare \
+             commit."
+                .to_string(),
+        ));
+    }
+
+    let out = git(&[
+        // A hooks path that cannot exist, so nothing in the submitted history
+        // can arrange to be executed by the clone.
+        "-c",
+        "core.hooksPath=/nonexistent",
+        "clone",
+        "--quiet",
+        &bundle.display().to_string(),
+        &root.display().to_string(),
+    ])?;
+    if !out.status.success() {
+        return Err(TriggerError::BadArchive(format!(
+            "cloning the submitted bundle failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(())
 }
 
 /// Extract a gzipped tar, refusing any entry that would write outside `root`.
@@ -320,9 +489,17 @@ pub enum TriggerError {
     UnsupportedFormat(String),
     BadArchive(String),
     EscapingEntry(String),
-    ArchiveTooLarge { bytes: usize, max: usize },
-    Io { path: PathBuf, reason: String },
+    ArchiveTooLarge {
+        bytes: usize,
+        max: usize,
+    },
+    Io {
+        path: PathBuf,
+        reason: String,
+    },
     NoWorkflows(String),
+    /// `git` is not on the orchestrator's PATH, so a bundle cannot be read.
+    NoGit,
 }
 
 impl TriggerError {
@@ -375,6 +552,12 @@ impl fmt::Display for TriggerError {
             Self::NoWorkflows(pattern) => write!(
                 f,
                 "no workflow files matched {pattern:?} in the submitted tree"
+            ),
+            Self::NoGit => write!(
+                f,
+                "this submit is a git bundle, but `git` is not on this server's PATH. \
+                 Install git on the orchestrator, or submit with `git submit --archive` \
+                 to send a plain tree instead."
             ),
         }
     }
@@ -474,7 +657,8 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         Workspace {
             root: base.join("tree"),
-            archive: base.join("source.tar.gz"),
+            tarball: base.join("source.tar.gz"),
+            bundle: base.join("source.bundle"),
         }
     }
 
@@ -492,10 +676,14 @@ mod tests {
             "version = 3"
         );
         assert!(
-            ws.archive.exists(),
+            ws.tarball.exists(),
             "the original archive is kept for the guest"
         );
-        assert_eq!(std::fs::read(&ws.archive).unwrap(), gz);
+        assert_eq!(std::fs::read(&ws.tarball).unwrap(), gz);
+        assert_eq!(
+            ws.stored_source().map(|(f, _)| f),
+            Some(SourceFormat::TarGz)
+        );
         std::fs::remove_dir_all(ws.root.parent().unwrap()).ok();
     }
 
@@ -612,6 +800,172 @@ mod tests {
         assert!(err.to_string().contains("CI_MAX_SOURCE_BYTES"), "{err}");
         assert_eq!(err.status(), 413);
         std::fs::remove_dir_all(ws.root.parent().unwrap()).ok();
+    }
+
+    // ---- git bundles -----------------------------------------------------
+
+    /// Build a real bundle the way the client does: a throwaway bare repo whose
+    /// object store is borrowed through `alternates`, so the fixture repository
+    /// never gains a ref.
+    fn bundle_of(entries: &[(&str, &str)]) -> (Vec<u8>, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("ci-bundle-{}", crate::vm::new_id()));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "t"]);
+        for (name, body) in entries {
+            let path = repo.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, body).unwrap();
+        }
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "fixture"]);
+
+        let bundle = base.join("source.bundle");
+        git(
+            &repo,
+            &["bundle", "create", &bundle.display().to_string(), "--all"],
+        );
+        (std::fs::read(&bundle).unwrap(), base)
+    }
+
+    fn bundle_source(bytes: &[u8]) -> SourceArchive {
+        SourceArchive {
+            format: "git-bundle".into(),
+            content_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        }
+    }
+
+    /// The point of the format: the workspace is a real repository, not a bare
+    /// tree, so a step can run `git describe` — and the bundle itself is kept
+    /// for shipping to the guest.
+    #[test]
+    fn a_bundle_clones_into_a_working_tree_with_history() {
+        let (bytes, base) = bundle_of(&[
+            ("Cargo.lock", "version = 3"),
+            (".ci/workflows/build.yml", "name: build"),
+        ]);
+        let ws = workspace();
+
+        let n = materialize(&bundle_source(&bytes), &ws, 1 << 22).unwrap();
+        assert_eq!(n, bytes.len());
+        assert_eq!(
+            std::fs::read_to_string(ws.root.join("Cargo.lock")).unwrap(),
+            "version = 3"
+        );
+        assert!(
+            ws.root.join(".git").exists(),
+            "a bundle must produce a repository, which is the whole reason to send one"
+        );
+        assert_eq!(
+            ws.stored_source().map(|(f, _)| f),
+            Some(SourceFormat::GitBundle)
+        );
+        assert_eq!(std::fs::read(&ws.bundle).unwrap(), bytes);
+
+        // And the tree is readable by the same workflow discovery a tarball gets.
+        let found = find_workflows(&ws.root, ".ci/workflows/*.yml").unwrap();
+        assert_eq!(found.len(), 1, "{found:?}");
+
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(ws.root.parent().unwrap()).ok();
+    }
+
+    /// Re-submitting the same run in the other format must not leave the old
+    /// one behind: `stored_source` picks by what exists, so a stale file would
+    /// make the executor ship the wrong bytes.
+    #[test]
+    fn switching_format_removes_the_previous_source() {
+        let ws = workspace();
+        materialize(&source(&tarball(&[("a.txt", b"1")])), &ws, 1 << 20).unwrap();
+        assert!(ws.tarball.exists());
+
+        let (bytes, base) = bundle_of(&[("a.txt", "2")]);
+        materialize(&bundle_source(&bytes), &ws, 1 << 22).unwrap();
+        assert!(ws.bundle.exists());
+        assert!(
+            !ws.tarball.exists(),
+            "the previous format's bytes must not survive to be shipped"
+        );
+        assert_eq!(
+            ws.stored_source().map(|(f, _)| f),
+            Some(SourceFormat::GitBundle)
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(ws.root.parent().unwrap()).ok();
+    }
+
+    /// The failure that made the client design what it did: a bundle that does
+    /// not reach a root commit clones with "Repository lacks these prerequisite
+    /// commits". Catching it at `verify` turns a confusing empty checkout into a
+    /// refused submit.
+    #[test]
+    fn a_bundle_that_cannot_stand_alone_is_refused_at_submit() {
+        let ws = workspace();
+        // Not a bundle at all is the same class of failure and needs no fixture
+        // repository to produce.
+        let err = materialize(&bundle_source(b"not a bundle"), &ws, 1 << 20).unwrap_err();
+        match &err {
+            TriggerError::BadArchive(m) => {
+                assert!(m.contains("not usable on its own"), "{m}")
+            }
+            TriggerError::NoGit => return, // no git here; nothing to assert
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(err.status(), 400);
+        std::fs::remove_dir_all(ws.root.parent().unwrap()).ok();
+    }
+
+    /// Regression for a trap `git bundle verify` walks straight into: a file
+    /// that is only the bundle header passes it — "is okay", "0 refs",
+    /// "records a complete history" — and clones into an empty repository. The
+    /// submitter would then be told no workflow files matched, which points at
+    /// the wrong thing entirely.
+    #[test]
+    fn a_bundle_with_no_refs_is_refused_rather_than_cloning_empty() {
+        let ws = workspace();
+        let header_only = b"# v2 git bundle\n".to_vec();
+        let err = match materialize(&bundle_source(&header_only), &ws, 1 << 20) {
+            Err(TriggerError::NoGit) => return, // no git here; nothing to assert
+            Err(e) => e,
+            Ok(_) => panic!("a ref-less bundle must not be accepted"),
+        };
+        let message = err.to_string();
+        assert!(message.contains("no refs"), "{message}");
+        assert!(
+            !ws.root.join(".git").exists() || std::fs::read_dir(&ws.root).unwrap().count() <= 1,
+            "nothing usable should have been produced"
+        );
+        std::fs::remove_dir_all(ws.root.parent().unwrap()).ok();
+    }
+
+    /// Both formats are named in the payload, so an unknown one is a rejected
+    /// value rather than a corrupt unpack.
+    #[test]
+    fn source_formats_round_trip_through_their_wire_names() {
+        assert_eq!(SourceFormat::parse("tar.gz"), Some(SourceFormat::TarGz));
+        assert_eq!(
+            SourceFormat::parse("git-bundle"),
+            Some(SourceFormat::GitBundle)
+        );
+        assert_eq!(SourceFormat::parse("zip"), None);
+        assert_eq!(SourceFormat::TarGz.as_str(), "tar.gz");
+        assert_eq!(SourceFormat::GitBundle.as_str(), "git-bundle");
     }
 
     #[test]

@@ -2,10 +2,11 @@
 //!
 //! GitHub Actions' shape, with two deliberate departures.
 //!
-//! **`uses:` on a job selects a network and a runner**, where GitHub has
-//! `runs-on:` selecting a label. That is the point of the whole system: a job
-//! names the heyvm network and the host it wants, and membership of that network
-//! is what makes a host eligible.
+//! **`uses:` on a job places it**, where GitHub has `runs-on:` selecting a
+//! label. That is the point of the whole system: a job names the heyvm network
+//! and the machine it wants, and membership of that network is what makes a host
+//! eligible. The grammar is `default`, `<network>`, `<network>/<node>` or
+//! `<network>/<node>/<vm>` — see [`Target`].
 //!
 //! **`vm:` on a job describes the machine to build.** GitHub gives you an opaque
 //! runner image; here the workflow author declares the driver, image, size and
@@ -23,59 +24,132 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-/// Which network and host a job wants.
+/// The literal `uses:` value meaning "the host this orchestrator runs on".
+pub const DEFAULT_NODE: &str = "default";
+
+/// Where a job runs, as `uses:` spells it.
+///
+/// **`uses:` carries everything needed to place the job**, which is what makes
+/// the third form worth having: a sandbox does not record which host it is on
+/// (`SandboxInfo` has no daemon field, and there is no cloud-proxied exec), so
+/// without the node in the path the orchestrator would have to interrogate every
+/// host in the network to find one VM.
+///
+/// ```text
+/// default                     the host this orchestrator runs on
+/// <network>                   any online host in that network
+/// <network>/*                 the same, written explicitly
+/// <network>/<node>            that host; the `vm:` block builds a VM on it
+/// <network>/<node>/<vm>       that existing VM on that host; `vm:` is unused
+///                             and every step is an exec into it
+/// absent                      the repository's assigned network, any host
+/// ```
+///
+/// Kept as a struct with defaulted fields rather than an enum, because a
+/// `JobPlan` — this included — is persisted as JSONB on `ci_job` and replayed on
+/// a JetStream redelivery. An enum would change that shape and strand every job
+/// queued across the deploy that introduced it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
-    /// `None` means "the network the workflow object names".
+    /// `None` means the repository's assigned network — or, with `local`, no
+    /// network at all.
     pub network: Option<String>,
-    /// `None` means any online host in that network.
-    pub runner: Option<String>,
+    /// The host machine, by daemon id or name. `None` means any online host in
+    /// the network.
+    ///
+    /// Aliased to `runner` so a plan written by an older build still
+    /// deserializes: that is the field name jobs queued before this change
+    /// carry, and a redelivery has to route them the same way.
+    #[serde(alias = "runner")]
+    pub node: Option<String>,
+    /// An existing sandbox on that node. When set, the `vm:` block is unused and
+    /// every step execs into this VM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm: Option<String>,
+    /// `uses: default` — resolve to the orchestrator's own host, whatever
+    /// network it is in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
 }
 
 impl Target {
     /// Parse the `uses:` value.
-    ///
-    /// - `prod-runners/bigbox` — that network, that host
-    /// - `prod-runners/*` or `prod-runners` — that network, any host
-    /// - absent — the workflow object's network, any host
     pub fn parse(raw: &str) -> Result<Self, WorkflowError> {
         let raw = raw.trim();
         if raw.is_empty() {
             return Err(WorkflowError::EmptyUses);
         }
-        let (network, runner) = match raw.split_once('/') {
-            Some((n, r)) => (n.trim(), Some(r.trim())),
-            None => (raw, None),
-        };
+        if raw.eq_ignore_ascii_case(DEFAULT_NODE) {
+            return Ok(Self {
+                network: None,
+                node: None,
+                vm: None,
+                local: true,
+            });
+        }
+
+        let parts: Vec<&str> = raw.split('/').map(str::trim).collect();
+        if parts.len() > 3 {
+            return Err(WorkflowError::UsesTooDeep(raw.to_string()));
+        }
+        let network = parts[0];
         if network.is_empty() {
             return Err(WorkflowError::EmptyUses);
         }
-        let runner = match runner {
+
+        // `*` means "unspecified" only in the node position. A `*` network would
+        // be "any network at all", which is not a placement anybody means, and a
+        // `*` VM cannot be exec'd into.
+        let node = match parts.get(1).copied() {
             None | Some("*") => None,
             Some("") => return Err(WorkflowError::EmptyRunner(raw.to_string())),
-            Some(r) => Some(r.to_string()),
+            Some(n) => Some(n.to_string()),
         };
+        let vm = match parts.get(2).copied() {
+            None => None,
+            Some("") | Some("*") => return Err(WorkflowError::EmptyRunner(raw.to_string())),
+            Some(v) => Some(v.to_string()),
+        };
+        // `<network>/*/<vm>` names a VM without saying which host holds it,
+        // which is precisely the lookup this grammar exists to avoid.
+        if vm.is_some() && node.is_none() {
+            return Err(WorkflowError::VmWithoutNode(raw.to_string()));
+        }
+
         Ok(Self {
             network: Some(network.to_string()),
-            runner,
+            node,
+            vm,
+            local: false,
         })
     }
 
     pub fn any() -> Self {
         Self {
             network: None,
-            runner: None,
+            node: None,
+            vm: None,
+            local: false,
         }
+    }
+
+    /// Whether steps exec into an existing VM rather than one built from the
+    /// `vm:` block.
+    pub fn is_existing_vm(&self) -> bool {
+        self.vm.is_some()
     }
 }
 
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (&self.network, &self.runner) {
-            (Some(n), Some(r)) => write!(f, "{n}/{r}"),
-            (Some(n), None) => write!(f, "{n}/*"),
-            (None, Some(r)) => write!(f, "*/{r}"),
-            (None, None) => write!(f, "*"),
+        if self.local {
+            return write!(f, "{DEFAULT_NODE}");
+        }
+        let network = self.network.as_deref().unwrap_or("*");
+        match (&self.node, &self.vm) {
+            (Some(n), Some(v)) => write!(f, "{network}/{n}/{v}"),
+            (Some(n), None) => write!(f, "{network}/{n}"),
+            (None, _) => write!(f, "{network}/*"),
         }
     }
 }
@@ -473,6 +547,10 @@ pub enum WorkflowError {
     },
     EmptyUses,
     EmptyRunner(String),
+    /// `uses:` had more than the three segments the grammar defines.
+    UsesTooDeep(String),
+    /// A VM named without the host that holds it.
+    VmWithoutNode(String),
     UnknownNeed {
         job: String,
         need: String,
@@ -514,8 +592,21 @@ impl fmt::Display for WorkflowError {
             ),
             Self::EmptyRunner(raw) => write!(
                 f,
-                "`uses: {raw}` has an empty runner; write `<network>` or `<network>/*` \
-                 for any host in that network"
+                "`uses: {raw}` has an empty segment; write `<network>`, \
+                 `<network>/<node>`, or `<network>/<node>/<vm>`"
+            ),
+            Self::UsesTooDeep(raw) => write!(
+                f,
+                "`uses: {raw}` has more than three segments. The deepest form is \
+                 `<network>/<node>/<vm>`, which names an existing VM on a host; \
+                 `default` names the host this CI runs on."
+            ),
+            Self::VmWithoutNode(raw) => write!(
+                f,
+                "`uses: {raw}` names a VM but not the host holding it. A sandbox \
+                 does not record its host, so write `<network>/<node>/<vm>` — \
+                 otherwise every host in the network has to be interrogated to \
+                 find it."
             ),
             Self::UnknownNeed { job, need } => write!(
                 f,
@@ -586,6 +677,45 @@ jobs:
         Workflow::parse(".ci/workflows/build.yml", yaml)
     }
 
+    /// This repository's own `.ci/workflows/*.yml`, parsed and planned from
+    /// disk.
+    ///
+    /// Everywhere else a workflow is a string in a test. These files are the
+    /// real thing: they are submitted to a live orchestrator, where a typo is a
+    /// rejected submit somebody is waiting on rather than a compile error — and
+    /// `deny_unknown_fields` means a misspelling like `stpes:` is a hard parse
+    /// failure. This repository also builds itself, so its own workflow being
+    /// wrong breaks its own CI. Reading them here moves that failure into
+    /// `cargo test`, where it costs seconds.
+    #[test]
+    fn this_repositorys_own_workflows_parse_and_plan() {
+        let dir = std::path::Path::new(".ci/workflows");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir)
+            .expect(".ci/workflows exists")
+            .flatten()
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("readable");
+            let wf = Workflow::parse(&path.display().to_string(), &text)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(
+                wf.on.iter().any(|t| t == "submit"),
+                "{} does not trigger on `submit`, so a submit would silently \
+                 skip it and report that nothing matched",
+                path.display()
+            );
+            crate::plan::Plan::build(&wf).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            checked += 1;
+        }
+        // Without this the test passes by finding nothing, which is exactly what
+        // happens if the directory is ever renamed.
+        assert!(checked > 0, "no workflow files found in {}", dir.display());
+    }
+
     #[test]
     fn the_sample_workflow_parses() {
         let wf = parse(SAMPLE).expect("parses");
@@ -605,30 +735,122 @@ jobs:
     }
 
     #[test]
-    fn uses_selects_a_network_and_a_runner() {
+    fn uses_names_a_network_a_node_and_optionally_a_vm() {
         assert_eq!(
             Target::parse("prod-runners/bigbox").unwrap(),
             Target {
                 network: Some("prod-runners".into()),
-                runner: Some("bigbox".into())
+                node: Some("bigbox".into()),
+                vm: None,
+                local: false,
             }
         );
+        // Three segments: an existing VM on a named host. The `vm:` block is
+        // unused and every step execs into it.
+        let existing = Target::parse("prod-runners/bigbox/sb-1a34").unwrap();
+        assert_eq!(
+            existing,
+            Target {
+                network: Some("prod-runners".into()),
+                node: Some("bigbox".into()),
+                vm: Some("sb-1a34".into()),
+                local: false,
+            }
+        );
+        assert!(existing.is_existing_vm());
+        assert!(
+            !Target::parse("prod-runners/bigbox")
+                .unwrap()
+                .is_existing_vm()
+        );
+
         // Both spellings of "any host in this network".
         for raw in ["prod-runners", "prod-runners/*"] {
             assert_eq!(
                 Target::parse(raw).unwrap(),
                 Target {
                     network: Some("prod-runners".into()),
-                    runner: None
+                    node: None,
+                    vm: None,
+                    local: false,
                 },
                 "{raw}"
             );
         }
+
         assert_eq!(Target::parse("  ").unwrap_err(), WorkflowError::EmptyUses);
         assert!(matches!(
             Target::parse("net/").unwrap_err(),
             WorkflowError::EmptyRunner(_)
         ));
+    }
+
+    /// `default` is the one form that names no network: it is whatever host
+    /// this orchestrator is running on.
+    #[test]
+    fn default_names_the_orchestrators_own_host() {
+        for raw in ["default", "DEFAULT", "  default  "] {
+            let t = Target::parse(raw).unwrap_or_else(|e| panic!("{raw:?}: {e}"));
+            assert!(t.local, "{raw}");
+            assert_eq!(t.network, None);
+            assert_eq!(t.node, None);
+            assert_eq!(t.vm, None);
+            assert_eq!(t.to_string(), "default");
+        }
+        // Absent `uses:` is a different thing: the repository's assigned
+        // network, any host. Conflating the two would send every unpinned job
+        // to the orchestrator's own machine.
+        assert!(!Target::any().local);
+    }
+
+    /// The grammar exists so `uses:` alone can place a job. A VM without its
+    /// host would put the lookup back, since a sandbox does not record one.
+    #[test]
+    fn a_vm_must_be_named_with_its_host() {
+        assert!(matches!(
+            Target::parse("prod-runners/*/sb-1").unwrap_err(),
+            WorkflowError::VmWithoutNode(_)
+        ));
+        let e = Target::parse("prod-runners/*/sb-1")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("does not record its host"), "{e}");
+
+        assert!(matches!(
+            Target::parse("a/b/c/d").unwrap_err(),
+            WorkflowError::UsesTooDeep(_)
+        ));
+        // A `*` in the VM position cannot be exec'd into, so it is refused
+        // rather than quietly meaning "build one".
+        assert!(matches!(
+            Target::parse("net/node/*").unwrap_err(),
+            WorkflowError::EmptyRunner(_)
+        ));
+    }
+
+    /// Every form has to survive the round trip through `ci_job.plan`, and a
+    /// plan written before `node` existed still has to route.
+    #[test]
+    fn targets_round_trip_through_the_stored_plan() {
+        for raw in [
+            "default",
+            "prod-runners",
+            "prod-runners/bigbox",
+            "prod-runners/bigbox/sb-1a34",
+        ] {
+            let t = Target::parse(raw).unwrap();
+            let json = serde_json::to_string(&t).unwrap();
+            let back: Target = serde_json::from_str(&json).unwrap();
+            assert_eq!(t, back, "{raw} -> {json}");
+        }
+
+        // The compatibility that matters on deploy day: a job queued by an
+        // older build spells the host `runner`.
+        let old: Target =
+            serde_json::from_str(r#"{"network":"prod-runners","runner":"bigbox"}"#).unwrap();
+        assert_eq!(old.node.as_deref(), Some("bigbox"));
+        assert_eq!(old.vm, None);
+        assert!(!old.local);
     }
 
     /// An absent `uses:` inherits the workflow object's network.

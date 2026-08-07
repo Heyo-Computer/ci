@@ -58,6 +58,19 @@ const DEFAULT_WORKDIR: &str = "/workspace";
 /// the sandbox id by parsing it as hex.
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
+/// Where one job runs, resolved from its `uses:` against the live pool.
+///
+/// `node: None` is the only case that goes on a network's shared queue; every
+/// other form pins, and a pinned job waits for its host rather than migrating.
+#[derive(Debug)]
+struct Placement<'a> {
+    network: &'a crate::runners::RunnerSet,
+    node: Option<&'a crate::runners::Runner>,
+    /// An existing sandbox on `node`. When set, the `vm:` block is unused and
+    /// steps exec into this VM rather than one built for the job.
+    vm: Option<&'a str>,
+}
+
 pub struct Dispatcher {
     pub config: Arc<Config>,
     pub store: Store,
@@ -421,16 +434,29 @@ impl Dispatcher {
     ) -> Result<(), DispatchError> {
         let pool = self.runners.snapshot();
         for job in &mut plan.jobs {
+            // `uses: default` names no network on purpose — it is wherever this
+            // orchestrator's host happens to be — so the repository's assignment
+            // must not be written over it.
             if job.target.network.is_none()
+                && !job.target.local
                 && let Some(net) = default_network
             {
                 job.target.network = Some(net.to_string());
             }
-            // Resolve to the canonical name so the stored plan and the job row
-            // both say what the dashboard says, rather than whichever of an id
-            // and a name somebody typed.
-            let set = Self::network_of(&pool, job)?;
-            job.target.network = Some(set.network_name.clone());
+            // Resolve the whole placement, not just the network: a `uses:` that
+            // names a host or a VM this instance cannot reach is refused here,
+            // at the client, rather than becoming a run whose jobs sit on a
+            // queue nobody consumes.
+            let placement = Self::place(&pool, job)?;
+            // Canonical names, so the stored plan and the job row say what the
+            // dashboard says rather than whichever of an id and a name somebody
+            // typed.
+            let network = placement.network.network_name.clone();
+            let node = placement.node.map(|n| n.name.clone());
+            job.target.network = Some(network);
+            if let Some(node) = node {
+                job.target.node = Some(node);
+            }
         }
         Ok(())
     }
@@ -465,6 +491,74 @@ impl Dispatcher {
         }
     }
 
+    /// Where a job actually runs: a network, optionally a pinned host, and
+    /// optionally an existing VM on it.
+    ///
+    /// One function for all four `uses:` forms, because the four differ only in
+    /// how much of the answer the author supplied — and because routing, runner
+    /// selection and submit-time validation must agree. Three call sites reading
+    /// `target` separately is how they drift.
+    fn place<'a>(
+        pool: &'a crate::runners::Pool,
+        plan: &'a JobPlan,
+    ) -> Result<Placement<'a>, DispatchError> {
+        // `uses: default` names no network: it is whichever served network holds
+        // this orchestrator's own host.
+        if plan.target.local {
+            if pool.default_node_id.is_empty() {
+                return Err(DispatchError::NoDefaultNode);
+            }
+            let (network, node) = pool.locate(&pool.default_node_id).ok_or_else(|| {
+                DispatchError::DefaultNodeUnserved {
+                    node: pool.default_node_id.clone(),
+                    served: pool.served_names(),
+                }
+            })?;
+            return Ok(Placement {
+                network,
+                node: Some(node),
+                vm: plan.target.vm.as_deref(),
+            });
+        }
+
+        let network = Self::network_of(pool, plan)?;
+        let Some(wanted) = plan.target.node.as_deref() else {
+            return Ok(Placement {
+                network,
+                node: None,
+                vm: None,
+            });
+        };
+
+        match network.find(wanted) {
+            Some(node) => Ok(Placement {
+                network,
+                node: Some(node),
+                vm: plan.target.vm.as_deref(),
+            }),
+            // `fallback: any` cannot apply to a job that named a VM: the VM
+            // exists on one host, and "any host" would run the steps somewhere
+            // that does not have it.
+            None if plan.fallback == Fallback::Any && plan.target.vm.is_none() => {
+                tracing::warn!(
+                    node = wanted,
+                    network = network.network_name,
+                    "no such node in this network; falling back to any host \
+                     because the job set `fallback: any`"
+                );
+                Ok(Placement {
+                    network,
+                    node: None,
+                    vm: None,
+                })
+            }
+            None => Err(DispatchError::UnknownRunner {
+                wanted: wanted.to_string(),
+                network: network.network_name.clone(),
+            }),
+        }
+    }
+
     /// Which queue a job goes on.
     ///
     /// A pinned job goes to its host's queue **even when that host is offline**,
@@ -473,31 +567,18 @@ impl Dispatcher {
     /// for. The job waits in that host's queue and the dashboard shows why.
     async fn route_for(&self, plan: &JobPlan) -> Result<Route, DispatchError> {
         let pool = self.runners.snapshot();
-        let set = Self::network_of(&pool, plan)?;
+        let placement = Self::place(&pool, plan)?;
 
-        if let Some(wanted) = &plan.target.runner {
-            match set.find(wanted) {
-                Some(r) => return Ok(Route::Runner(r.id.clone())),
-                None if plan.fallback == Fallback::Any => {
-                    tracing::warn!(
-                        runner = wanted,
-                        network = set.network_name,
-                        "no such runner in this network; falling back to any host \
-                         because the job set `fallback: any`"
-                    );
-                }
-                None => {
-                    return Err(DispatchError::UnknownRunner {
-                        wanted: wanted.clone(),
-                        network: set.network_name.clone(),
-                    });
-                }
-            }
+        // A resolved node is a pinned queue, whatever put it there — `uses:
+        // default`, an explicit node, or a named VM. Only "any host in this
+        // network" goes on the network's shared queue.
+        if let Some(node) = placement.node {
+            return Ok(Route::Runner(node.id.clone()));
         }
-        if set.network_id.is_empty() {
+        if placement.network.network_id.is_empty() {
             return Err(DispatchError::NoNetwork);
         }
-        Ok(Route::Network(set.network_id.clone()))
+        Ok(Route::Network(placement.network.network_id.clone()))
     }
 
     // ---- execution ------------------------------------------------------
@@ -585,24 +666,24 @@ impl Dispatcher {
     /// Resolve the plan's target to a concrete, online runner in its network.
     async fn pick_runner(&self, plan: &JobPlan) -> Result<String, DispatchError> {
         let pool = self.runners.snapshot();
-        let set = Self::network_of(&pool, plan)?;
-        if let Some(wanted) = &plan.target.runner
-            && let Some(r) = set.find(wanted)
-        {
-            if !r.status.is_dispatchable() {
+        let placement = Self::place(&pool, plan)?;
+        if let Some(node) = placement.node {
+            if !node.status.is_dispatchable() {
                 return Err(DispatchError::RunnerOffline {
-                    runner: r.name.clone(),
-                    status: r.status.as_str(),
+                    runner: node.name.clone(),
+                    status: node.status.as_str(),
                 });
             }
-            return Ok(r.id.clone());
+            return Ok(node.id.clone());
         }
         // Least-recently-used across the online set would need per-runner load;
         // for now the first online host wins, which is stable and predictable.
-        set.dispatchable()
+        placement
+            .network
+            .dispatchable()
             .next()
             .map(|r| r.id.clone())
-            .ok_or_else(|| DispatchError::NoOnlineRunner(set.network_name.clone()))
+            .ok_or_else(|| DispatchError::NoOnlineRunner(placement.network.network_name.clone()))
     }
 
     /// A VM for this job: an inherited one if the fingerprint matches, else new.
@@ -706,12 +787,27 @@ impl Dispatcher {
         self.store.start_step(&sid, &sid).await?;
         let log_path = self.store.log_path(&msg.run_id, &plan.key, -1, &sid);
 
-        let archive = crate::trigger::Workspace::for_run(&self.config, &msg.run_id).archive;
+        let workspace = crate::trigger::Workspace::for_run(&self.config, &msg.run_id);
+        let Some((format, archive)) = workspace.stored_source() else {
+            let detail = format!(
+                "no submitted source is on disk for run {} under {}",
+                msg.run_id,
+                self.config.workspace_dir.display()
+            );
+            self.store
+                .append_log(&sid, &log_path, &format!("[ci] {detail}\n"))
+                .await?;
+            self.store
+                .finish_step(&sid, StepStatus::Failure, Some(1), Some(&detail))
+                .await?;
+            return Err(DispatchError::Checkout(detail));
+        };
+        let archive = archive.to_path_buf();
         let bytes = match tokio::fs::read(&archive).await {
             Ok(b) => b,
             Err(e) => {
                 let detail = format!(
-                    "the submitted source archive is missing at {}: {e}",
+                    "the submitted source is missing at {}: {e}",
                     archive.display()
                 );
                 self.store
@@ -729,20 +825,52 @@ impl Dispatcher {
             .working_directory
             .clone()
             .unwrap_or_else(|| DEFAULT_WORKDIR.to_string());
-        let remote = format!("{}/.ci-source.tar.gz", workdir.trim_end_matches('/'));
+        let wd = workdir.trim_end_matches('/');
+        let remote = match format {
+            crate::trigger::SourceFormat::TarGz => format!("{wd}/.ci-source.tar.gz"),
+            crate::trigger::SourceFormat::GitBundle => format!("{wd}/.ci-source.bundle"),
+        };
 
         let result = async {
             vm.upload_bytes(&sid, &remote, &bytes).await?;
-            // `--strip-components` is deliberately absent: `git archive` writes
-            // paths relative to the repository root already, and stripping would
-            // silently drop a top-level file.
-            let script = format!(
-                "set -e; mkdir -p {wd}; find {wd} -mindepth 1 -maxdepth 1 \
-                 ! -name .ci-source.tar.gz -exec rm -rf {{}} +; \
-                 tar -xzf {tgz} -C {wd}; rm -f {tgz}; ls -a {wd} | head -50",
-                wd = shell_quote(&workdir),
-                tgz = shell_quote(&remote),
-            );
+            let script = match format {
+                // `--strip-components` is deliberately absent: `git archive`
+                // writes paths relative to the repository root already, and
+                // stripping would silently drop a top-level file.
+                crate::trigger::SourceFormat::TarGz => format!(
+                    "set -e; mkdir -p {wd}; find {wd} -mindepth 1 -maxdepth 1 \
+                     ! -name .ci-source.tar.gz -exec rm -rf {{}} +; \
+                     tar -xzf {src} -C {wd}; rm -f {src}; ls -a {wd} | head -50",
+                    wd = shell_quote(&workdir),
+                    src = shell_quote(&remote),
+                ),
+                // Cloned into a scratch directory and then moved into place,
+                // because `git clone` refuses a destination that already has
+                // anything in it — and the destination here is the mount the
+                // bundle was just uploaded into. The bundle is removed after,
+                // so a step never sees it as repository content.
+                //
+                // `git` in the guest is a hard requirement of this format;
+                // `command -v` turns its absence into one line naming the fix
+                // rather than a bare `not found` from a subshell.
+                crate::trigger::SourceFormat::GitBundle => format!(
+                    "set -e; \
+                     command -v git >/dev/null 2>&1 || {{ \
+                       echo '[ci] this run submitted a git bundle, but the guest image \
+has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.' >&2; \
+                       exit 127; }}; \
+                     mkdir -p {wd}; rm -rf {tmp}; \
+                     git -c core.hooksPath=/nonexistent clone --quiet {src} {tmp}; \
+                     find {wd} -mindepth 1 -maxdepth 1 ! -name .ci-clone ! -name .ci-source.bundle \
+                       -exec rm -rf {{}} +; \
+                     tar -C {tmp} -cf - . | tar -C {wd} -xf -; \
+                     rm -rf {tmp} {src}; \
+                     git -C {wd} log --oneline -1; ls -a {wd} | head -50",
+                    wd = shell_quote(&workdir),
+                    tmp = shell_quote(&format!("{wd}/.ci-clone")),
+                    src = shell_quote(&remote),
+                ),
+            };
             vm.exec(
                 &format!("{sid}.x"),
                 &script,
@@ -1147,11 +1275,14 @@ async fn copy_tree(
     from: &crate::trigger::Workspace,
     to: &crate::trigger::Workspace,
 ) -> Result<(), DispatchError> {
-    let bytes = tokio::fs::read(&from.archive)
+    let (format, path) = from
+        .stored_source()
+        .ok_or_else(|| DispatchError::Checkout("the first run's source is gone".into()))?;
+    let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| DispatchError::Checkout(e.to_string()))?;
     let source = crate::trigger::SourceArchive {
-        format: "tar.gz".to_string(),
+        format: format.as_str().to_string(),
         content_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
     };
     crate::trigger::materialize(&source, to, usize::MAX)?;
@@ -1403,6 +1534,13 @@ pub enum DispatchError {
     },
     NoOnlineRunner(String),
     NoNetwork,
+    /// `uses: default` with no resolvable local daemon.
+    NoDefaultNode,
+    /// The local daemon is known but is in no network this instance serves.
+    DefaultNodeUnserved {
+        node: String,
+        served: Vec<String>,
+    },
     /// The network exists on the account but this instance does not serve it.
     UnservedNetwork {
         wanted: String,
@@ -1471,6 +1609,20 @@ impl std::fmt::Display for DispatchError {
                 f,
                 "the runner pool has not resolved a network yet; check CI_NETWORK \
                  and the heyvm control plane"
+            ),
+            Self::NoDefaultNode => write!(
+                f,
+                "`uses: default` means the host this orchestrator runs on, and that \
+                 host could not be identified. Set CI_DEFAULT_NODE to its daemon id \
+                 or name — heyvmd reports its own id only when BACKEND_SERVER_ID is \
+                 set in its environment, so it is often not discoverable."
+            ),
+            Self::DefaultNodeUnserved { node, served } => write!(
+                f,
+                "`uses: default` resolved to daemon {node:?}, but that host is in no \
+                 network this orchestrator serves. Join it to one with \
+                 `heyvm network add-host`. Currently serving: {}",
+                or_none(served)
             ),
             Self::UnservedNetwork { wanted, served } => write!(
                 f,
@@ -1558,6 +1710,7 @@ mod tests {
             unjoined: vec![],
             last_error: None,
             default_network_id: "net-1".into(),
+            default_node_id: "hd-1".into(),
         }
     }
 
@@ -1624,6 +1777,82 @@ mod tests {
             "{err:?}"
         );
         assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    /// `uses: default` resolves to the orchestrator's own host, and pins — the
+    /// whole point is "this machine", so it must not land on the network's
+    /// shared queue.
+    #[test]
+    fn default_places_the_job_on_this_orchestrators_host() {
+        let pool = test_pool();
+        let plan = plan_targeting(Some("default"));
+        assert!(
+            plan.target.local,
+            "the fixture must exercise the local form"
+        );
+
+        let placed = Dispatcher::place(&pool, &plan).expect("resolves");
+        assert_eq!(placed.network.network_id, "net-1");
+        assert_eq!(placed.node.map(|n| n.id.as_str()), Some("hd-1"));
+        assert!(placed.vm.is_none());
+    }
+
+    /// The two ways `default` fails, told apart: nothing identified the host at
+    /// all, versus a host that is known but in no network we serve. One is
+    /// CI_DEFAULT_NODE, the other is `heyvm network add-host`.
+    #[test]
+    fn an_unresolvable_default_names_which_fix_applies() {
+        let plan = plan_targeting(Some("default"));
+
+        let mut pool = test_pool();
+        pool.default_node_id = String::new();
+        let err = Dispatcher::place(&pool, &plan).unwrap_err();
+        assert!(matches!(err, DispatchError::NoDefaultNode), "{err:?}");
+        assert!(err.to_string().contains("CI_DEFAULT_NODE"), "{err}");
+
+        // Known, but its only network is one this instance does not serve.
+        let mut pool = test_pool();
+        pool.default_node_id = "hd-2".into();
+        let err = Dispatcher::place(&pool, &plan).unwrap_err();
+        assert!(
+            matches!(err, DispatchError::DefaultNodeUnserved { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("heyvm network add-host"), "{err}");
+    }
+
+    /// The three-segment form: a named VM on a named host. The host pins the
+    /// queue and the VM rides along for the executor.
+    #[test]
+    fn naming_a_vm_pins_its_host_and_carries_the_vm() {
+        let pool = test_pool();
+        let plan = plan_targeting(Some("prod-runners/hd-1/sb-1a34"));
+
+        let placed = Dispatcher::place(&pool, &plan).expect("resolves");
+        assert_eq!(placed.node.map(|n| n.id.as_str()), Some("hd-1"));
+        assert_eq!(placed.vm, Some("sb-1a34"));
+        assert!(plan.target.is_existing_vm());
+    }
+
+    /// `fallback: any` moves a job to another host when the pinned one is gone.
+    /// It must not do that for a job that named a VM — the VM lives on one host,
+    /// and "any host" would run the steps somewhere it does not exist.
+    #[test]
+    fn fallback_any_does_not_relocate_a_job_that_named_a_vm() {
+        let pool = test_pool();
+
+        let mut plan = plan_targeting(Some("prod-runners/nosuchhost"));
+        plan.fallback = Fallback::Any;
+        let placed = Dispatcher::place(&pool, &plan).expect("falls back");
+        assert!(placed.node.is_none(), "an unpinned fallback is the network");
+
+        let mut plan = plan_targeting(Some("prod-runners/nosuchhost/sb-1a34"));
+        plan.fallback = Fallback::Any;
+        let err = Dispatcher::place(&pool, &plan).unwrap_err();
+        assert!(
+            matches!(err, DispatchError::UnknownRunner { .. }),
+            "{err:?}"
+        );
     }
 
     /// A pool that has resolved nothing must refuse rather than pick, or a
@@ -1889,6 +2118,18 @@ jobs:
           echo "greeting=hi" >> "$CI_OUTPUT"
       - name: Use the step output
         run: echo "greeting was ${{ steps.greet.outputs.greeting }}"
+      # The only coverage `ci/upload-artifact` has. It reads out of the guest
+      # through exec and base64, which is a different transport from every
+      # `run:` step above — the guest has to have `tar` and `base64`, the output
+      # has to end with a newline or the serial path hangs forever, and the
+      # bytes have to survive the round trip. None of that is exercised by a
+      # workflow made only of `run:` steps, which is what this was.
+      - name: Produce something to upload
+        run: mkdir -p dist && echo "artifact-body" > dist/hello.txt
+      - uses: ci/upload-artifact
+        with:
+          name: e2e-dist
+          path: dist
   after:
     needs: [build]
     vm:
@@ -1972,6 +2213,21 @@ jobs:
             log1.contains("greeting was hi"),
             "a step output must reach the next step: {log1:?}"
         );
+
+        // `ci/upload-artifact` goes out through a different transport from every
+        // `run:` step — exec + tar + base64 — so a green run above proves
+        // nothing about it. The row has to exist and the bytes have to be real.
+        let artifacts = d.store.artifacts_of(&run1).await.unwrap();
+        let uploaded = artifacts
+            .iter()
+            .find(|a| a.name == "e2e-dist")
+            .unwrap_or_else(|| panic!("no e2e-dist artifact; got {artifacts:?}"));
+        assert!(
+            uploaded.size_bytes > 0,
+            "an artifact recorded with no bytes is a report that something was \
+             stored when it was not: {uploaded:?}"
+        );
+        assert_eq!(named("ci/upload-artifact").status, "success");
 
         let vm1 = build.sandbox_id.clone().expect("a sandbox was used");
         let fp1 = build.fingerprint.clone().expect("a fingerprint");

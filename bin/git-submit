@@ -7,11 +7,17 @@
 # answers to `git ci` instead; it is the same script and names itself after
 # however it was invoked.
 #
-# What it sends is a `git archive` tarball of the tree you asked for. That means
-# no repository credential exists on the server or in a build VM — you already
-# had read access, so nothing else needs it. It also means what runs is exactly
-# what you submitted, rather than whatever a ref resolved to by the time the
-# server got around to cloning it.
+# What it sends is a `git bundle` of the branch, or a `git archive` tarball of
+# the tree with --archive. Either way no repository credential exists on the
+# server or in a build VM — you already had read access, so nothing else needs
+# it. It also means what runs is exactly what you submitted, rather than
+# whatever a ref resolved to by the time the server got around to cloning it.
+#
+# A bundle clones in the guest into a real repository, so `git describe` and
+# friends work in a step. It carries history to a root commit, because a bundle
+# that clones on its own has to — `git bundle create --depth` does not exist and
+# a partial slice is refused at clone time. For a repository with long history
+# and no need for `.git`, `--archive` sends one tree instead.
 #
 # ## Two credentials, and you want the first one
 #
@@ -31,7 +37,7 @@
 #   CI_WEBHOOK_SECRET / git config ci.secret     the shared HMAC secret
 set -euo pipefail
 
-GIT_SUBMIT_VERSION="0.2.0"
+GIT_SUBMIT_VERSION="0.3.0"
 
 # `git-submit` invoked as `git submit`, `git-ci` invoked as `git ci`. Only used
 # in messages, but a script that tells you to run a command that does not exist
@@ -50,6 +56,8 @@ started.
 
 Options:
   --dirty          include uncommitted tracked changes
+  --archive        send a tree-only tarball instead of a git bundle (no .git in
+                   the guest, but a payload that does not carry history)
   --ref <rev>      submit some other commit (default HEAD)
   --workflow <id>  name the workflow object this run belongs to
   --dry-run        print what would be sent, send nothing
@@ -68,10 +76,12 @@ EOF
 rev="HEAD"
 dirty=0
 dry_run=0
+archive=0
 workflow=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dirty)    dirty=1; shift ;;
+    --archive)  archive=1; shift ;;
     --dry-run)  dry_run=1; shift ;;
     --ref)      rev="${2:?--ref needs a revision}"; shift 2 ;;
     --workflow) workflow="${2:?--workflow needs an id}"; shift 2 ;;
@@ -140,35 +150,68 @@ cleanup() { rm -rf "$work"; }
 trap cleanup EXIT
 
 tarball="$work/source.tar.gz"
+bundle="$work/source.bundle"
 
+# Resolve the one commit to send. `--dirty` builds a throwaway commit from the
+# index plus the worktree, so uncommitted tracked changes travel without
+# touching the real index or HEAD — the separate GIT_INDEX_FILE is what keeps
+# it from staging anything in the user's repository. The commit object is left
+# unreferenced and `git gc` collects it in due course.
 if [ "$dirty" -eq 1 ]; then
-  # Build a throwaway commit from the index plus the worktree, so uncommitted
-  # tracked changes are included without touching the real index or HEAD. The
-  # separate GIT_INDEX_FILE is what keeps `--dirty` from staging anything in the
-  # user's actual repository.
   export GIT_INDEX_FILE="$work/index"
   git read-tree "$sha"
   git add -u
   tree="$(git write-tree)"
   unset GIT_INDEX_FILE
-  git archive --format=tar.gz -o "$tarball" "$tree"
+  send_sha="$(git commit-tree "$tree" -p "$sha" -m 'git submit --dirty')"
   sha="$sha-dirty"
 else
-  git archive --format=tar.gz -o "$tarball" "$sha"
+  send_sha="$sha"
 fi
 
-size="$(wc -c < "$tarball" | tr -d ' ')"
+if [ "$archive" -eq 1 ]; then
+  format="tar.gz"
+  payload_file="$tarball"
+  git archive --format=tar.gz -o "$tarball" "$send_sha"
+else
+  format="git-bundle"
+  payload_file="$bundle"
+  # `git bundle create` refuses a bare sha — "Refusing to create empty bundle" —
+  # so the commit needs a ref. Rather than write one into the user's repository
+  # and hope to clean it up, a throwaway bare repo borrows their object store
+  # through `alternates` and carries the ref instead. Nothing in the real
+  # repository is touched, including on a failed submit.
+  pack="$work/pack.git"
+  git init -q --bare "$pack"
+  printf '%s/objects\n' "$(git rev-parse --absolute-git-dir)" \
+    > "$pack/objects/info/alternates"
+  ref="refs/heads/$branch"
+  [ "$branch" = "detached" ] && ref="refs/heads/ci-submit"
+  git --git-dir="$pack" update-ref "$ref" "$send_sha"
+  git --git-dir="$pack" symbolic-ref HEAD "$ref"
+  # `--all` rather than the ref by name: the bundle then carries HEAD too, and a
+  # bundle without HEAD clones into a repository with nothing checked out.
+  git --git-dir="$pack" bundle create "$bundle" --all >/dev/null 2>&1 \
+    || die "could not pack a git bundle. Retry with --archive to send a tree instead."
+fi
+
+size="$(wc -c < "$payload_file" | tr -d ' ')"
 
 if [ "$dry_run" -eq 1 ]; then
   printf 'would submit to %s\n' "$submit_url"
   printf '  repository %s (%s)\n' "$repo_name" "${repo_url:-no remote}"
   printf '  ref        refs/heads/%s\n' "$branch"
   printf '  commit     %s\n' "$sha"
-  printf '  archive    %s bytes%s\n' "$size" "$([ "$dirty" -eq 1 ] && echo ' (including uncommitted changes)')"
+  printf '  source     %s, %s bytes%s\n' "$format" "$size" \
+    "$([ "$dirty" -eq 1 ] && echo ' (including uncommitted changes)')"
   printf '  credential %s\n' "$([ -n "$token" ] && echo 'repository token (ci.token)' || echo 'shared secret (ci.secret)')"
   [ -n "$workflow" ] && printf '  workflow   %s\n' "$workflow"
+  if [ "$format" = "git-bundle" ]; then
+    printf '  refs:\n'
+    git bundle list-heads "$bundle" | sed 's/^/    /'
+  fi
   printf '  files:\n'
-  tar -tzf "$tarball" | head -20 | sed 's/^/    /'
+  git ls-tree -r --name-only "$send_sha" | head -20 | sed 's/^/    /'
   exit 0
 fi
 
@@ -186,7 +229,7 @@ content="$work/content.b64"
 # `base64 -w0` is GNU; BSD/macOS base64 wraps by default and has no -w. Piping
 # through tr removes the newlines either way, and leaves no trailing newline for
 # --rawfile to pick up.
-base64 < "$tarball" | tr -d '\n' > "$content"
+base64 < "$payload_file" | tr -d '\n' > "$content"
 
 if command -v jq >/dev/null 2>&1; then
   jq -n \
@@ -194,12 +237,12 @@ if command -v jq >/dev/null 2>&1; then
     --arg db "$default_branch" --arg ref "refs/heads/$branch" \
     --arg before "$before" --arg after "$sha" \
     --arg pn "$pusher_name" --arg pe "$pusher_email" \
-    --arg wf "$workflow" --rawfile content "$content" \
+    --arg wf "$workflow" --arg fmt "$format" --rawfile content "$content" \
     '{repository:{id:$id,name:$name,url:$url,defaultBranch:(if $db=="" then null else $db end)},
       ref:$ref, before:$before, after:$after, dryRun:false,
       pusher:{name:$pn,email:$pe},
       workflowId:(if $wf=="" then null else $wf end),
-      source:{format:"tar.gz", contentBase64:$content}}' > "$payload"
+      source:{format:$fmt, contentBase64:$content}}' > "$payload"
 else
   # jq is not universally installed and this payload is simple enough to build
   # by hand. Only the free-text fields need escaping; the rest are shas, refs and
@@ -215,7 +258,7 @@ else
     printf '"pusher":{"name":"%s","email":"%s"},' "$(esc "$pusher_name")" "$(esc "$pusher_email")"
     printf '"workflowId":%s,' \
       "$([ -n "$workflow" ] && printf '"%s"' "$(esc "$workflow")" || printf 'null')"
-    printf '"source":{"format":"tar.gz","contentBase64":"'
+    printf '"source":{"format":"%s","contentBase64":"' "$format"
     cat "$content"
     printf '"}}'
   } > "$payload"

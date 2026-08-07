@@ -1,42 +1,61 @@
-# This repository's own CI, which is also the worked example the README points
-# at. It builds `ci` with `ci`.
+# This repository's own CI, and the worked example the README points at: `ci`
+# building `ci`.
+#
+# One job with one product — the release binary. Checks (fmt, clippy, tests) are
+# deliberately absent for now; see "Adding checks" in the README, which is also
+# where the toolchain caveat that makes them non-trivial is written down.
 name: build
 on: [submit]
 
 jobs:
-  test:
-    # Any online host in the workflow object's network. Pin with
-    # `uses: <network>/<runner>` when a job needs particular hardware.
+  release:
+    # The host this orchestrator is running on. `default` is a *host* node, so
+    # the `vm:` block below still applies — the build runs in a VM built on this
+    # machine, not on the machine itself.
+    #
+    # Deliberate for this repository: it is the one workflow whose failures are
+    # this project's own bug, so it exercises the `default` form on hardware
+    # that is by definition present. Point it elsewhere with
+    # `uses: <network>/<node>`, or drop the line entirely to inherit whatever
+    # network the repository is assigned on /repos.
+    uses: default
     vm:
       driver: firecracker
       image: ubuntu:24.04
       size_class: medium
+      # A release build of this crate carries a `target/` of several GB, and it
+      # is the warm VM's whole value that it survives between runs.
       disk_size_gb: 20
       setup_hooks:
-        - apt-get update && apt-get install -y build-essential curl pkg-config libssl-dev
+        # `git` is required, not a convenience: `git submit` sends a bundle by
+        # default and the checkout step clones it *inside the guest*. Without it
+        # the run fails before the first step, at checkout. (`git submit
+        # --archive` sends a plain tree and needs none of this.)
+        #
+        # `pkg-config` and `libssl-dev` are not optional either: reqwest's
+        # default TLS is native-tls, which links OpenSSL rather than bundling it.
+        - apt-get update && apt-get install -y build-essential curl git pkg-config libssl-dev
         - curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-      # A dependency change is the one thing that must not reuse a warm VM:
-      # the cached `~/.cargo` and `target/` in it were built against the old
-      # lockfile.
+      # A dependency change is the one thing that must not reuse a warm VM: the
+      # cached `~/.cargo` and `target/` in it were built against the old
+      # lockfile. `rust-toolchain.toml` is listed although this repository has
+      # none — a missing file hashes to an explicit marker, so adding one later
+      # busts the pool at the moment it most needs busting.
       cache_key_files:
         - Cargo.lock
         - rust-toolchain.toml
     env:
       CARGO_TERM_COLOR: never
     steps:
-      - name: Format
-        run: . "$HOME/.cargo/env" && cargo fmt --check
-      - name: Clippy
-        run: . "$HOME/.cargo/env" && cargo clippy --all-targets
-      - name: Test
-        # Unit tests only. The integration suite needs Postgres, NATS and a
-        # heyvmd, which is a job for a runner provisioned with them rather than
-        # a default one.
-        run: . "$HOME/.cargo/env" && cargo test --bin ci
-        timeout-minutes: 30
       - name: Build
-        run: . "$HOME/.cargo/env" && cargo build --release
+        # `--locked` because the VM is fingerprinted on `Cargo.lock`: resolving
+        # a different dependency set than the one the fingerprint was taken
+        # from would make the warm VM's cache a claim that is not true.
+        run: . "$HOME/.cargo/env" && cargo build --release --locked
+        # A cold build of ~300 crates is well past the 30-minute default. A warm
+        # VM reuses `target/` and takes a fraction of this.
+        timeout-minutes: 60
       - uses: ci/upload-artifact
         with:
-          name: ci-binary
+          name: ci
           path: target/release/ci

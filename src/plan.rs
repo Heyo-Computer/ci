@@ -159,8 +159,8 @@ fn substitute_matrix(job: &mut JobPlan) {
     if let Some(net) = &job.target.network {
         job.target.network = Some(ctx.substitute(net));
     }
-    if let Some(runner) = &job.target.runner {
-        job.target.runner = Some(ctx.substitute(runner));
+    if let Some(runner) = &job.target.node {
+        job.target.node = Some(ctx.substitute(runner));
     }
     if let Some(image) = &job.vm.image {
         job.vm.image = Some(ctx.substitute(image));
@@ -748,8 +748,7 @@ jobs:
 "#,
         )
         .unwrap();
-        let runners: Vec<Option<&str>> =
-            p.jobs.iter().map(|j| j.target.runner.as_deref()).collect();
+        let runners: Vec<Option<&str>> = p.jobs.iter().map(|j| j.target.node.as_deref()).collect();
         assert_eq!(runners, [Some("bigbox"), Some("smallbox")]);
         assert_eq!(p.jobs[0].vm.image.as_deref(), Some("base-bigbox"));
         assert_eq!(p.jobs[1].vm.image.as_deref(), Some("base-smallbox"));

@@ -54,6 +54,18 @@ use tokio::sync::Mutex;
 /// Membership kind for a daemon host, as the control plane spells it.
 const MEMBER_KIND_HOST: &str = "host";
 
+/// `GET /daemon/name` on a heyvmd, which is the only route that says who a
+/// daemon is. Not in the SDK, so the shape is re-declared here; both fields are
+/// optional because a `heyvm --api` that is not heyvmd answers with an error and
+/// a heyvmd with no `BACKEND_SERVER_ID` answers with a null id.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DaemonNameResponse {
+    #[serde(default)]
+    backend_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunnerStatus {
     /// Heartbeat within the cloud's ~3 minute window.
@@ -164,6 +176,11 @@ pub struct Pool {
     /// Where a run goes when nothing names a network: the first entry of
     /// `CI_NETWORK`, or the account's own default when that is `*`.
     pub default_network_id: String,
+    /// The daemon `uses: default` means — this orchestrator's own host. Empty
+    /// when it could not be worked out, which makes `uses: default` a refused
+    /// job naming `CI_DEFAULT_NODE` rather than one that lands somewhere
+    /// arbitrary.
+    pub default_node_id: String,
 }
 
 impl Pool {
@@ -189,6 +206,25 @@ impl Pool {
     /// Every runner in every served network, for reclaiming pooled VMs.
     pub fn all_runners(&self) -> impl Iterator<Item = &Runner> {
         self.served().flat_map(|n| n.runners.iter())
+    }
+
+    /// The served network holding a given host, and the host itself.
+    ///
+    /// A machine may be a member of several networks, which is legitimate; the
+    /// default network wins so that `uses: default` and an unpinned job land in
+    /// the same place rather than two.
+    pub fn locate(&self, node_id: &str) -> Option<(&RunnerSet, &Runner)> {
+        let mut found: Option<(&RunnerSet, &Runner)> = None;
+        for set in self.served() {
+            if let Some(runner) = set.runners.iter().find(|r| r.id == node_id) {
+                let preferred = set.network_id == self.default_network_id;
+                if preferred {
+                    return Some((set, runner));
+                }
+                found.get_or_insert((set, runner));
+            }
+        }
+        found
     }
 
     /// The names of served networks, for an error that has to say what *is*
@@ -249,6 +285,9 @@ impl Runners {
                     unjoined: prev.unjoined.clone(),
                     last_error: Some(e.to_string()),
                     default_network_id: prev.default_network_id.clone(),
+                    // Carried over with everything else: a cloud blip must not
+                    // turn `uses: default` into a refused job.
+                    default_node_id: prev.default_node_id.clone(),
                 }));
                 Err(e)
             }
@@ -283,6 +322,10 @@ impl Runners {
             unjoined: Vec::new(),
             last_error: None,
             default_network_id: "local".to_string(),
+            // The one case where a synthetic id is safe: local mode drives one
+            // daemon on this machine and talks to no cloud, so nothing else can
+            // be binding the same subject.
+            default_node_id: "hd-local".to_string(),
         }
     }
 
@@ -365,12 +408,100 @@ impl Runners {
         unjoined.sort_by(|a, b| a.name.cmp(&b.name));
 
         let default_network_id = Self::pick_default(&networks, &self.config);
+        let default_node_id = self.resolve_default_node(&daemons).await;
         Ok(Pool {
             networks,
             unjoined,
             last_error: None,
             default_network_id,
+            default_node_id,
         })
+    }
+
+    /// Which daemon `uses: default` means.
+    ///
+    /// The answer has to be a *real* daemon id, because it becomes a NATS
+    /// subject: two orchestrators that both invented `hd-local` would bind
+    /// consumers to the same subject and eat each other's jobs. So a synthetic
+    /// id is never returned outside local-runner mode — an unresolvable default
+    /// is empty, and `uses: default` is then refused by name.
+    ///
+    /// Best-effort and never fatal: the probe is one short request to a daemon
+    /// that may not be there at all, and an installation that never writes
+    /// `uses: default` should not have its pool refresh fail over it.
+    async fn resolve_default_node(&self, daemons: &[DaemonInfo]) -> String {
+        // Configuration wins: it is the only source an operator controls
+        // directly, and the only one that works when the orchestrator is not
+        // co-located with a daemon at all.
+        if let Some(wanted) = self.config.heyvm.default_node.as_deref() {
+            let wanted = wanted.trim();
+            if let Some(d) = daemons
+                .iter()
+                .find(|d| d.id == wanted || d.name.as_deref() == Some(wanted))
+            {
+                return d.id.clone();
+            }
+            tracing::warn!(
+                "CI_DEFAULT_NODE={wanted:?} matches no daemon on this account, so \
+                 `uses: default` will be refused. Registered: {}",
+                daemons
+                    .iter()
+                    .map(|d| d.name.clone().unwrap_or_else(|| d.id.clone()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            return String::new();
+        }
+
+        let Some(probe) = self.probe_local_daemon().await else {
+            return String::new();
+        };
+
+        // `backend_id` is the daemon's own id, but it comes from its
+        // environment (`BACKEND_SERVER_ID`/`HEYVM_BACKEND_ID`) and may be
+        // absent or stale — so it is only believed when the account agrees it
+        // exists. The name is the fallback because a daemon owns its name and
+        // republishes it on every heartbeat.
+        if let Some(id) = probe.backend_id.as_deref().filter(|s| !s.trim().is_empty())
+            && daemons.iter().any(|d| d.id == id)
+        {
+            return id.to_string();
+        }
+        if let Some(name) = probe.name.as_deref().filter(|s| !s.trim().is_empty())
+            && let Some(d) = daemons.iter().find(|d| d.name.as_deref() == Some(name))
+        {
+            return d.id.clone();
+        }
+
+        tracing::warn!(
+            "a daemon answered at {} but neither its backend id nor its name {:?} \
+             matches a daemon on this account, so `uses: default` will be refused. \
+             Set CI_DEFAULT_NODE.",
+            self.config.heyvm.local_daemon_url,
+            probe.name.as_deref().unwrap_or("(unset)")
+        );
+        String::new()
+    }
+
+    /// `GET /daemon/name` on the co-located daemon.
+    async fn probe_local_daemon(&self) -> Option<DaemonNameResponse> {
+        let url = format!("{}/daemon/name", self.config.heyvm.local_daemon_url);
+        let response = reqwest::Client::builder()
+            // Short: nothing here is worth delaying a pool refresh for, and the
+            // common case is that no daemon is listening at all.
+            .timeout(Duration::from_secs(3))
+            .build()
+            .ok()?
+            .get(&url)
+            .bearer_auth(&self.config.heyvm.api_key)
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            tracing::debug!("no local daemon identity from {url}: {}", response.status());
+            return None;
+        }
+        response.json::<DaemonNameResponse>().await.ok()
     }
 
     /// Which served network a run lands in when nothing names one.
@@ -866,6 +997,7 @@ mod tests {
             unjoined: vec![],
             last_error: None,
             default_network_id: "net-1".into(),
+            default_node_id: String::new(),
         };
 
         assert_eq!(pool.served().count(), 1);
@@ -892,6 +1024,7 @@ mod tests {
             unjoined: vec![],
             last_error: None,
             default_network_id: String::new(),
+            default_node_id: String::new(),
         };
         assert!(pool.default_set().is_none());
         assert!(pool.served_names().is_empty());

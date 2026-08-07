@@ -46,20 +46,36 @@ git config ci.token    cis_019fca648a6e-00000002.…
 git submit --dry-run    # show what would be sent
 git submit              # submit HEAD
 git submit --dirty      # include uncommitted tracked changes
+git submit --archive    # send a tree-only tarball instead of a bundle
 ```
 
-`git submit` sends a **`git archive` tarball of the tree**. Two consequences,
-and both are the point:
+`git submit` sends a **`git bundle`**, which clones in the guest into a real
+repository — so `git describe`, `git log` and `git rev-parse` work in a step. Two
+consequences of the submitter packing it rather than the server fetching it, and
+both are the point:
 
 - **No repository credential exists anywhere in this system.** Not on the
   orchestrator, not in a guest. The submitter already had read access — they ran
-  `git archive` — so nothing else needs its own. A CI system that clones for you
+  `git bundle` — so nothing else needs its own. A CI system that clones for you
   is a CI system holding a key to every repository it builds.
 - **The tree is exactly what the submitter meant.** No re-resolving a ref that
   may have moved, no guessing whether dirty work was included.
 
-The cost: the guest gets a tree with no `.git`, so `git describe` does not work
-in a step. The commit and ref arrive as environment variables instead.
+The cost is history. A bundle that clones on its own **must reach a root
+commit**: `git bundle create --depth` does not exist, and a `--max-count` slice
+is refused at clone time with *"Repository lacks these prerequisite commits"*. So
+the payload scales with history rather than with one tree, and `--archive` sends
+the old tree-only tarball for the repository where that is the wrong trade.
+
+Two practical requirements: a bundle needs `git` on the orchestrator **and** in
+the guest image; a tarball needs neither. Each absence is reported by name.
+
+Three shapes of `git bundle` do not work, and the client is built around them:
+it refuses a bare sha (*"Refusing to create empty bundle"*), so `--ref <sha>` and
+`--dirty` pack through a throwaway bare repo that borrows your object store via
+`alternates` rather than writing refs into it; and a bundle carrying **zero
+refs** passes `git bundle verify` as "complete" and clones into an empty
+repository, so the server counts refs itself rather than trusting the verify.
 
 ## Registered repositories, and the token that submits
 
@@ -142,11 +158,28 @@ jobs:
 
 GitHub Actions' shape, with two departures.
 
-**`uses:` selects a network and a runner**, where GitHub has `runs-on:` selecting
-a label. That is the point of the system: a job names the heyvm network and the
-host it wants, and membership of that network is what makes a host eligible.
-`<network>/<runner>` pins; `<network>` or `<network>/*` takes any online host;
-absent inherits the repository's assigned network — see below.
+**`uses:` places the job**, where GitHub has `runs-on:` selecting a label. That
+is the point of the system: a job names the heyvm network and the machine it
+wants, and membership of that network is what makes a host eligible.
+
+```yaml
+uses: default                       # the host this CI is running on
+uses: prod-runners                  # any online host in that network
+uses: prod-runners/bigbox           # that host; `vm:` builds a VM on it
+uses: prod-runners/bigbox/sb-1a34   # that existing VM; `vm:` is unused and
+                                    # every step is an exec into it
+# absent                            # the repository's assigned network, any host
+```
+
+**`uses:` carries everything needed to place the job**, and the third form is
+why that matters. A sandbox does not record which host it is on — `SandboxInfo`
+has no daemon field and there is no cloud-proxied exec — so `<network>/*/<vm>`
+would force the orchestrator to interrogate every host in the network to find one
+VM. Naming the node is refused-if-absent rather than guessed.
+
+`default` is the only form that names no network, and it is not the same as
+omitting `uses:`: absent means the repository's assignment, while `default`
+means this machine regardless.
 
 **A pinned job does not silently migrate.** If its host is offline the job stays
 queued for that host and fails after `CI_RUNNER_WAIT_SECS`, because the warm pool
@@ -160,6 +193,29 @@ the author declares the driver, image, size and setup hooks — and, via
 `deny_unknown_fields` is on throughout, so `stpes:` or `timeout_minutes:`
 (instead of `timeout-minutes:`) is a parse error naming the job, not a field that
 quietly does nothing.
+
+### This repository's own
+
+`.ci/workflows/build.yml` is one job that produces one thing: the release binary,
+uploaded as the `ci` artifact. `cargo test` parses and plans every file in that
+directory, so a typo in it fails here rather than at a submit somebody is waiting
+on.
+
+**Adding checks.** `cargo fmt --check` and `cargo clippy` are not in it, and the
+reason is a trap worth naming: the setup hook installs rustup with
+`--profile minimal`, which ships `rustc`, `cargo` and `rust-std` and **not**
+rustfmt or clippy. A `cargo fmt` step against that toolchain fails with
+`no such command`, which reads as a broken CI rather than a missing component.
+Either drop `--profile minimal`, or add the components explicitly:
+
+```yaml
+- curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+- . "$HOME/.cargo/env" && rustup component add rustfmt clippy
+```
+
+The integration suite is a separate question: it needs Postgres, NATS and a
+`heyvmd`, so it belongs on a runner provisioned with them rather than on a
+default image.
 
 ## Networks
 

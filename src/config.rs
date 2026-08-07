@@ -147,6 +147,18 @@ pub struct HeyvmConfig {
     /// runner pool; every other network on the account is still listed on the
     /// dashboard, marked as one this instance does not serve.
     pub networks: ServedNetworks,
+    /// Which daemon `uses: default` means, when it cannot be worked out.
+    ///
+    /// Resolution order is: this, then the local daemon's own `backend_id`,
+    /// then its name matched against the account's daemons, then `hd-local`
+    /// under `CI_LOCAL_RUNNER`. This exists because `backend_id` is populated
+    /// from the daemon's environment (`BACKEND_SERVER_ID`/`HEYVM_BACKEND_ID`)
+    /// and may simply be absent — and the answer has to be the *real* daemon id,
+    /// since it becomes a NATS subject. Two orchestrators both inventing
+    /// `hd-local` would eat each other's jobs.
+    pub default_node: Option<String>,
+    /// Where the co-located daemon listens, for the `uses: default` probe.
+    pub local_daemon_url: String,
     /// Optional iroh relay override for NAT traversal.
     pub relay: Option<String>,
     /// How often the runner set is re-read from the control plane.
@@ -321,6 +333,11 @@ impl Config {
             base_url: opt("CI_HEYO_BASE_URL"),
             api_key,
             networks,
+            default_node: opt("CI_DEFAULT_NODE"),
+            local_daemon_url: opt("CI_LOCAL_DAEMON_URL")
+                .unwrap_or_else(|| heyo_sdk::DEFAULT_LOCAL_BASE_URL.to_string())
+                .trim_end_matches('/')
+                .to_string(),
             relay: opt("CI_IROH_RELAY"),
             refresh_interval: secs("CI_RUNNER_REFRESH_SECS", 30)?,
             runner_wait: secs("CI_RUNNER_WAIT_SECS", 900)?,

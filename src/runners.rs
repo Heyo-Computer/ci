@@ -116,20 +116,19 @@ impl Runner {
     }
 }
 
-/// An immutable snapshot of the pool, swapped in whole by the refresh loop so
-/// readers never take a lock. The same copy-on-write shape as app-lb's registry.
-#[derive(Debug, Default)]
+/// One network and the hosts in it.
+#[derive(Debug, Default, Clone)]
 pub struct RunnerSet {
     pub network_id: String,
     pub network_name: String,
+    /// heyvm's own "default network" flag. Used to pick a default when
+    /// `CI_NETWORK=*` names none.
+    pub is_default: bool,
+    /// Whether this instance takes work for it. An unserved network is still
+    /// listed — "the network exists but nothing here builds for it" is an
+    /// answer, and an empty page is not.
+    pub served: bool,
     pub runners: Vec<Runner>,
-    /// Daemons the caller owns that are *not* members of the configured
-    /// network. Not usable, but shown on the dashboard so "why isn't my machine
-    /// listed" has an answer that names the fix.
-    pub unjoined: Vec<Runner>,
-    /// `None` when the last refresh succeeded; otherwise why it did not, so a
-    /// stale snapshot is visibly stale rather than quietly wrong.
-    pub last_error: Option<String>,
 }
 
 impl RunnerSet {
@@ -141,12 +140,68 @@ impl RunnerSet {
     pub fn dispatchable(&self) -> impl Iterator<Item = &Runner> {
         self.runners.iter().filter(|r| r.status.is_dispatchable())
     }
+
+    /// Whether `needle` names this network, by id or name.
+    pub fn matches(&self, needle: &str) -> bool {
+        self.network_id == needle || self.network_name.eq_ignore_ascii_case(needle)
+    }
+}
+
+/// An immutable snapshot of every network on the account, swapped in whole by
+/// the refresh loop so readers never take a lock. The same copy-on-write shape
+/// as app-lb's registry.
+#[derive(Debug, Default)]
+pub struct Pool {
+    /// Every network the account has, served or not, sorted by name.
+    pub networks: Vec<RunnerSet>,
+    /// Daemons the caller owns that are members of no network at all. Not
+    /// usable, but shown on the dashboard so "why isn't my machine listed" has
+    /// an answer that names the fix.
+    pub unjoined: Vec<Runner>,
+    /// `None` when the last refresh succeeded; otherwise why it did not, so a
+    /// stale snapshot is visibly stale rather than quietly wrong.
+    pub last_error: Option<String>,
+    /// Where a run goes when nothing names a network: the first entry of
+    /// `CI_NETWORK`, or the account's own default when that is `*`.
+    pub default_network_id: String,
+}
+
+impl Pool {
+    /// The networks this instance takes work for.
+    pub fn served(&self) -> impl Iterator<Item = &RunnerSet> {
+        self.networks.iter().filter(|n| n.served)
+    }
+
+    /// A network by id or name, whether or not it is served.
+    pub fn find(&self, needle: &str) -> Option<&RunnerSet> {
+        let needle = needle.trim();
+        self.networks.iter().find(|n| n.matches(needle))
+    }
+
+    /// The network a job with no `uses:` and no repository assignment runs in.
+    pub fn default_set(&self) -> Option<&RunnerSet> {
+        self.networks
+            .iter()
+            .find(|n| n.served && n.network_id == self.default_network_id)
+            .or_else(|| self.served().next())
+    }
+
+    /// Every runner in every served network, for reclaiming pooled VMs.
+    pub fn all_runners(&self) -> impl Iterator<Item = &Runner> {
+        self.served().flat_map(|n| n.runners.iter())
+    }
+
+    /// The names of served networks, for an error that has to say what *is*
+    /// available.
+    pub fn served_names(&self) -> Vec<String> {
+        self.served().map(|n| n.network_name.clone()).collect()
+    }
 }
 
 /// Pool discovery plus the per-runner tunnel cache.
 pub struct Runners {
     config: Arc<Config>,
-    snapshot: ArcSwap<RunnerSet>,
+    snapshot: ArcSwap<Pool>,
     /// One client per runner, each owning its iroh tunnel. Keyed on daemon id.
     ///
     /// A `Mutex` rather than a lock-free map because establishing a tunnel is a
@@ -159,12 +214,12 @@ impl Runners {
     pub fn new(config: Arc<Config>) -> Self {
         Self {
             config,
-            snapshot: ArcSwap::from_pointee(RunnerSet::default()),
+            snapshot: ArcSwap::from_pointee(Pool::default()),
             tunnels: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn snapshot(&self) -> Arc<RunnerSet> {
+    pub fn snapshot(&self) -> Arc<Pool> {
         self.snapshot.load_full()
     }
 
@@ -183,18 +238,17 @@ impl Runners {
     /// every queued job for the duration of a blip.
     pub async fn refresh(&self) -> Result<(), RunnerError> {
         match self.load().await {
-            Ok(set) => {
-                self.snapshot.store(Arc::new(set));
+            Ok(pool) => {
+                self.snapshot.store(Arc::new(pool));
                 Ok(())
             }
             Err(e) => {
                 let prev = self.snapshot.load();
-                self.snapshot.store(Arc::new(RunnerSet {
-                    network_id: prev.network_id.clone(),
-                    network_name: prev.network_name.clone(),
-                    runners: prev.runners.clone(),
+                self.snapshot.store(Arc::new(Pool {
+                    networks: prev.networks.clone(),
                     unjoined: prev.unjoined.clone(),
                     last_error: Some(e.to_string()),
+                    default_network_id: prev.default_network_id.clone(),
                 }));
                 Err(e)
             }
@@ -205,52 +259,144 @@ impl Runners {
     ///
     /// Named `local` and given the id `hd-local`, which is a valid subject token
     /// and so routes like any other host.
-    fn local_set(url: &str) -> RunnerSet {
-        RunnerSet {
-            network_id: "local".to_string(),
-            network_name: format!("local ({url})"),
-            runners: vec![Runner {
-                id: "hd-local".to_string(),
-                name: "local".to_string(),
-                status: RunnerStatus::Online,
-                last_seen_at: None,
+    ///
+    /// The network is named plainly `local`, **not** `local (<url>)`. A network
+    /// name has to be spellable in `uses: <network>/<runner>`, which splits on
+    /// the first `/` — so a name carrying a URL cannot be addressed by the one
+    /// syntax that addresses networks. The daemon's URL is in the startup
+    /// summary instead, where it is a configuration detail rather than an
+    /// identifier.
+    fn local_pool() -> Pool {
+        Pool {
+            networks: vec![RunnerSet {
+                network_id: "local".to_string(),
+                network_name: "local".to_string(),
+                is_default: true,
+                served: true,
+                runners: vec![Runner {
+                    id: "hd-local".to_string(),
+                    name: "local".to_string(),
+                    status: RunnerStatus::Online,
+                    last_seen_at: None,
+                }],
             }],
             unjoined: Vec::new(),
             last_error: None,
+            default_network_id: "local".to_string(),
         }
     }
 
-    async fn load(&self) -> Result<RunnerSet, RunnerError> {
+    /// Read every network on the account, and the hosts in each.
+    ///
+    /// **Members are read per network, concurrently.** The control plane has no
+    /// "all members everywhere" route and `NetworkInfo` carries no member count,
+    /// so N+1 reads is the only shape available. Running them together makes the
+    /// refresh one round trip's worth of latency rather than N, which is what
+    /// matters on a `CI_RUNNER_REFRESH_SECS` ticker.
+    ///
+    /// Unserved networks are read too, because the dashboard's whole job here is
+    /// to answer "which network should this repository build in" — and a list of
+    /// names with no hosts under them does not answer it.
+    async fn load(&self) -> Result<Pool, RunnerError> {
         // Local mode short-circuits every cloud call: no account, no network,
         // no tunnel.
-        if let Some(url) = &self.config.heyvm.local_runner {
-            return Ok(Self::local_set(url));
+        if self.config.heyvm.local_runner.is_some() {
+            return Ok(Self::local_pool());
         }
-        let opts = self.client_options();
-        let info = self.resolve_network(&opts).await?;
 
-        let network = Network::get(&info.id, self.client_options())
-            .await
-            .map_err(|e| RunnerError::ControlPlane(format!("GET /networks/{}: {e}", info.id)))?;
-        let members = network
-            .list_members()
-            .await
-            .map_err(|e| RunnerError::ControlPlane(format!("list members: {e}")))?;
+        let infos = self.list_networks().await?;
         let daemons = Daemons::list(self.client_options())
             .await
             .map_err(|e| RunnerError::ControlPlane(format!("GET /me/daemons: {e}")))?;
 
-        let (runners, unjoined) = Self::project(&members, &daemons);
-        Ok(RunnerSet {
-            network_id: info.id,
-            network_name: info.name,
-            runners,
+        let reads = infos.iter().map(|info| {
+            let opts = self.client_options();
+            async move {
+                let network = Network::get(&info.id, opts).await.map_err(|e| {
+                    RunnerError::ControlPlane(format!("GET /networks/{}: {e}", info.id))
+                })?;
+                let members = network.list_members().await.map_err(|e| {
+                    RunnerError::ControlPlane(format!("members of {}: {e}", info.name))
+                })?;
+                Ok::<_, RunnerError>(members)
+            }
+        });
+        let member_lists = futures::future::join_all(reads).await;
+
+        let mut networks = Vec::with_capacity(infos.len());
+        let mut joined: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (info, members) in infos.iter().zip(member_lists) {
+            // One unreadable network must not empty the others — the pool is
+            // per-network, so the honest result is that network with no hosts
+            // and a logged reason.
+            let members = match members {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("could not read members of {}: {e}", info.name);
+                    Vec::new()
+                }
+            };
+            let (runners, in_network) = Self::project(&members, &daemons);
+            joined.extend(in_network);
+            networks.push(RunnerSet {
+                network_id: info.id.clone(),
+                network_name: info.name.clone(),
+                is_default: info.is_default,
+                served: self.config.heyvm.networks.includes(&info.id, &info.name),
+                runners,
+            });
+        }
+        networks.sort_by(|a, b| a.network_name.cmp(&b.network_name));
+
+        // A daemon in *no* network at all, which is the commonest "why is
+        // nothing running" cause. Computed across every network rather than one,
+        // so a host that joined a network this instance does not serve is not
+        // reported as homeless.
+        let mut unjoined: Vec<Runner> = daemons
+            .iter()
+            .filter(|d| !joined.contains(&d.id))
+            .map(|d| Runner {
+                id: d.id.clone(),
+                name: d.name.clone().unwrap_or_else(|| d.id.clone()),
+                status: RunnerStatus::from(d.status),
+                last_seen_at: Some(d.last_seen_at.clone()),
+            })
+            .collect();
+        unjoined.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let default_network_id = Self::pick_default(&networks, &self.config);
+        Ok(Pool {
+            networks,
             unjoined,
             last_error: None,
+            default_network_id,
         })
     }
 
-    /// Join the two control-plane reads into the pool and the leftovers.
+    /// Which served network a run lands in when nothing names one.
+    ///
+    /// The first entry of `CI_NETWORK`, because that is the one a person wrote
+    /// first. Under `CI_NETWORK=*` there is no such entry, so the account's own
+    /// default network is used — and failing that, the first served network by
+    /// name, which at least does not change from one refresh to the next.
+    fn pick_default(networks: &[RunnerSet], config: &Config) -> String {
+        if let Some(wanted) = config.heyvm.networks.preferred()
+            && let Some(set) = networks.iter().find(|n| n.served && n.matches(wanted))
+        {
+            return set.network_id.clone();
+        }
+        networks
+            .iter()
+            .find(|n| n.served && n.is_default)
+            .or_else(|| networks.iter().find(|n| n.served))
+            .map(|n| n.network_id.clone())
+            .unwrap_or_default()
+    }
+
+    /// Join the two control-plane reads into one network's hosts.
+    ///
+    /// Returns the runners and the set of daemon ids that are members, so the
+    /// caller can work out which daemons belong to no network at all.
     ///
     /// Pure, so the filtering that decides what counts as a runner is testable
     /// without a control plane. That filtering is the part most likely to be
@@ -260,17 +406,17 @@ impl Runners {
     fn project(
         members: &[heyo_sdk::NetworkMember],
         daemons: &[DaemonInfo],
-    ) -> (Vec<Runner>, Vec<Runner>) {
+    ) -> (Vec<Runner>, Vec<String>) {
         let by_id: HashMap<&str, &DaemonInfo> =
             daemons.iter().map(|d| (d.id.as_str(), d)).collect();
 
         let mut runners = Vec::new();
-        let mut joined = std::collections::HashSet::new();
+        let mut joined = Vec::new();
         for m in members
             .iter()
             .filter(|m| m.sandbox_kind == MEMBER_KIND_HOST)
         {
-            joined.insert(m.sandbox_ref.clone());
+            joined.push(m.sandbox_ref.clone());
             let daemon = by_id.get(m.sandbox_ref.as_str());
             runners.push(Runner {
                 id: m.sandbox_ref.clone(),
@@ -291,55 +437,52 @@ impl Runners {
             });
         }
         runners.sort_by(|a, b| a.name.cmp(&b.name));
-
-        let mut unjoined: Vec<Runner> = daemons
-            .iter()
-            .filter(|d| !joined.contains(&d.id))
-            .map(|d| Runner {
-                id: d.id.clone(),
-                name: d.name.clone().unwrap_or_else(|| d.id.clone()),
-                status: RunnerStatus::from(d.status),
-                last_seen_at: Some(d.last_seen_at.clone()),
-            })
-            .collect();
-        unjoined.sort_by(|a, b| a.name.cmp(&b.name));
-
-        (runners, unjoined)
+        (runners, joined)
     }
 
-    /// Resolve `CI_NETWORK` — which may be an id or a name — to one network.
+    /// Every network on the account, with `CI_NETWORK`'s entries validated.
     ///
-    /// An ambiguous name is an error rather than a first-match, because the two
-    /// candidates would have different runner pools and picking one silently is
-    /// how a job lands on a machine nobody expected.
-    async fn resolve_network(&self, opts: &HeyoClientOptions) -> Result<NetworkInfo, RunnerError> {
-        let wanted = self.config.heyvm.network.trim();
-        let networks = Network::list(HeyoClientOptions {
-            api_key: opts.api_key.clone(),
-            base_url: opts.base_url.clone(),
-            timeout: opts.timeout,
-        })
-        .await
-        .map_err(|e| RunnerError::ControlPlane(format!("GET /networks: {e}")))?;
+    /// A name in `CI_NETWORK` that matches nothing, or matches two networks, is
+    /// an error rather than a silent omission: the two candidates have different
+    /// runner pools, and picking one — or quietly serving neither — is how a job
+    /// lands on a machine nobody expected, or on none at all.
+    async fn list_networks(&self) -> Result<Vec<NetworkInfo>, RunnerError> {
+        let networks = Network::list(self.client_options())
+            .await
+            .map_err(|e| RunnerError::ControlPlane(format!("GET /networks: {e}")))?;
 
-        if let Some(exact) = networks.iter().find(|n| n.id == wanted) {
-            return Ok(exact.clone());
+        if let crate::config::ServedNetworks::Named(wanted) = &self.config.heyvm.networks {
+            for name in wanted {
+                let name = name.trim();
+                if networks.iter().any(|n| n.id == name) {
+                    continue;
+                }
+                let by_name = networks
+                    .iter()
+                    .filter(|n| n.name.eq_ignore_ascii_case(name))
+                    .count();
+                match by_name {
+                    1 => {}
+                    0 => {
+                        return Err(RunnerError::UnknownNetwork {
+                            wanted: name.to_string(),
+                            available: networks.iter().map(|n| n.name.clone()).collect(),
+                        });
+                    }
+                    _ => {
+                        return Err(RunnerError::AmbiguousNetwork {
+                            wanted: name.to_string(),
+                            ids: networks
+                                .iter()
+                                .filter(|n| n.name.eq_ignore_ascii_case(name))
+                                .map(|n| n.id.clone())
+                                .collect(),
+                        });
+                    }
+                }
+            }
         }
-        let by_name: Vec<&NetworkInfo> = networks
-            .iter()
-            .filter(|n| n.name.eq_ignore_ascii_case(wanted))
-            .collect();
-        match by_name.len() {
-            1 => Ok(by_name[0].clone()),
-            0 => Err(RunnerError::UnknownNetwork {
-                wanted: wanted.to_string(),
-                available: networks.iter().map(|n| n.name.clone()).collect(),
-            }),
-            _ => Err(RunnerError::AmbiguousNetwork {
-                wanted: wanted.to_string(),
-                ids: by_name.iter().map(|n| n.id.clone()).collect(),
-            }),
-        }
+        Ok(networks)
     }
 
     /// A client whose `base_url` is a live tunnel into `runner_id`'s daemon.
@@ -660,25 +803,117 @@ mod tests {
         }
     }
 
+    fn set(id: &str, name: &str, served: bool, runners: Vec<Runner>) -> RunnerSet {
+        RunnerSet {
+            network_id: id.into(),
+            network_name: name.into(),
+            is_default: false,
+            served,
+            runners,
+        }
+    }
+
     #[test]
     fn a_set_finds_by_either_spelling_and_filters_to_dispatchable() {
-        let set = RunnerSet {
-            network_id: "net-1".into(),
-            network_name: "prod-runners".into(),
-            runners: vec![
+        let set = set(
+            "net-1",
+            "prod-runners",
+            true,
+            vec![
                 runner("hd-1", "bigbox", RunnerStatus::Online),
                 runner("hd-2", "oldbox", RunnerStatus::Stale),
                 runner("hd-3", "ghost", RunnerStatus::Orphaned),
             ],
-            unjoined: vec![],
-            last_error: None,
-        };
+        );
         assert_eq!(set.find("bigbox").unwrap().id, "hd-1");
         assert_eq!(set.find("hd-2").unwrap().name, "oldbox");
         assert!(set.find("nope").is_none());
 
         let live: Vec<&str> = set.dispatchable().map(|r| r.id.as_str()).collect();
         assert_eq!(live, ["hd-1"]);
+    }
+
+    /// A network is addressed by name or id, the same two spellings `uses:` and
+    /// a repository assignment may use.
+    #[test]
+    fn a_network_is_addressable_by_id_or_by_name() {
+        let s = set("net-1", "prod-runners", true, vec![]);
+        assert!(s.matches("net-1"));
+        assert!(s.matches("prod-runners"));
+        assert!(s.matches("PROD-Runners"), "names are case-insensitive");
+        assert!(!s.matches("net-2"));
+    }
+
+    /// The pool's job: hand back only what this instance may dispatch to, while
+    /// still knowing about the rest so the dashboard can explain the difference.
+    #[test]
+    fn a_pool_separates_served_networks_from_the_ones_it_only_knows_about() {
+        let pool = Pool {
+            networks: vec![
+                set(
+                    "net-1",
+                    "prod",
+                    true,
+                    vec![runner("hd-1", "big", RunnerStatus::Online)],
+                ),
+                set(
+                    "net-2",
+                    "lab",
+                    false,
+                    vec![runner("hd-2", "bench", RunnerStatus::Online)],
+                ),
+            ],
+            unjoined: vec![],
+            last_error: None,
+            default_network_id: "net-1".into(),
+        };
+
+        assert_eq!(pool.served().count(), 1);
+        assert_eq!(pool.served_names(), ["prod"]);
+        assert_eq!(pool.default_set().unwrap().network_id, "net-1");
+        // `find` sees every network — the caller decides what an unserved one
+        // means, because "exists but not served" is a different message from
+        // "no such network".
+        assert!(pool.find("lab").is_some());
+        assert!(!pool.find("lab").unwrap().served);
+        assert!(pool.find("nope").is_none());
+        // Only served runners are reclaimable: a VM on a host this instance does
+        // not dispatch to belongs to whichever instance does.
+        let ours: Vec<&str> = pool.all_runners().map(|r| r.id.as_str()).collect();
+        assert_eq!(ours, ["hd-1"]);
+    }
+
+    /// With no network served there is nothing to default to, and saying so is
+    /// what turns "my build is stuck" into "CI_NETWORK matches nothing".
+    #[test]
+    fn a_pool_with_nothing_served_has_no_default() {
+        let pool = Pool {
+            networks: vec![set("net-2", "lab", false, vec![])],
+            unjoined: vec![],
+            last_error: None,
+            default_network_id: String::new(),
+        };
+        assert!(pool.default_set().is_none());
+        assert!(pool.served_names().is_empty());
+    }
+
+    /// The default falls back rather than vanishing: `CI_NETWORK=*` names no
+    /// first entry, so the account's own default network is used.
+    #[test]
+    fn the_default_network_falls_back_to_the_accounts_own() {
+        let mut lab = set("net-2", "lab", true, vec![]);
+        lab.is_default = true;
+        let networks = vec![set("net-1", "prod", true, vec![]), lab];
+
+        unsafe { std::env::set_var("CI_NETWORK", "*") };
+        let config = test_config();
+        assert_eq!(Runners::pick_default(&networks, &config), "net-2");
+
+        // A named first entry wins over the account default.
+        unsafe { std::env::set_var("CI_NETWORK", "prod") };
+        let config = test_config();
+        assert_eq!(Runners::pick_default(&networks, &config), "net-1");
+        unsafe { std::env::set_var("CI_NETWORK", "test-net") };
     }
 
     /// A member of kind `host` with no daemon row is the "unregistered but
@@ -754,12 +989,12 @@ mod tests {
                  "lastSeenAt":"2026-08-03T23:39:00Z","createdAt":"2026-07-16T14:04:00Z"}]"#,
         );
 
-        let (runners, unjoined) = Runners::project(&m, &d);
+        let (runners, joined) = Runners::project(&m, &d);
         assert_eq!(runners.len(), 1, "only the host member is a runner");
         assert_eq!(runners[0].id, "hd-e_QxrdQOWUsfINWO");
         assert_eq!(runners[0].name, "pop-os");
         assert_eq!(runners[0].status, RunnerStatus::Online);
-        assert!(unjoined.is_empty());
+        assert_eq!(joined, ["hd-e_QxrdQOWUsfINWO"]);
     }
 
     /// The live account on 2026-08-03: members present, but every one of them
@@ -771,23 +1006,41 @@ mod tests {
                  "registered_at":"2026-08-03T20:06:39.420241Z",
                  "sandbox_kind":"deployed","sandbox_ref":"dep-d9426372"}]"#,
         );
-        let (runners, unjoined) = Runners::project(&m, &[]);
+        let (runners, joined) = Runners::project(&m, &[]);
         assert!(runners.is_empty());
-        assert!(unjoined.is_empty());
+        assert!(joined.is_empty());
     }
 
-    /// A daemon that never joined is the commonest "why is nothing running"
-    /// cause, so it has to come back separately rather than be dropped.
+    /// A network name has to be spellable in `uses: <network>/<runner>`, which
+    /// splits on the first `/`. The local-mode network once carried its daemon
+    /// URL in its name, which made it the one network no workflow could name.
     #[test]
-    fn a_registered_daemon_outside_the_network_is_reported_as_unjoined() {
+    fn the_local_networks_name_is_addressable_by_uses() {
+        let pool = Runners::local_pool();
+        let name = &pool.networks[0].network_name;
+        assert!(!name.contains('/'), "{name:?} cannot be spelled in `uses:`");
+
+        let target = crate::workflow::Target::parse(name).expect("uses: accepts it");
+        assert_eq!(target.network.as_deref(), Some(name.as_str()));
+        assert!(pool.find(name).is_some(), "and it resolves back");
+    }
+
+    /// A daemon in no network is the commonest "why is nothing running" cause.
+    /// `project` reports membership per network; whether a daemon belongs to
+    /// *none* is the caller's join across all of them, and this pins the half
+    /// that makes that possible.
+    #[test]
+    fn a_daemon_in_no_network_is_absent_from_every_membership_list() {
         let d = daemons(
             r#"[{"id":"hd-laptop","name":"laptop","status":"online",
                  "lastSeenAt":"2026-08-03T23:39:00Z","createdAt":"2026-07-16T14:04:00Z"}]"#,
         );
-        let (runners, unjoined) = Runners::project(&[], &d);
+        let (runners, joined) = Runners::project(&[], &d);
         assert!(runners.is_empty());
-        assert_eq!(unjoined.len(), 1);
-        assert_eq!(unjoined[0].name, "laptop");
+        assert!(
+            joined.is_empty(),
+            "it joined nothing, so it is nobody's member"
+        );
     }
 
     /// A host member with no daemon row was unregistered but left behind. It
@@ -839,6 +1092,15 @@ mod tests {
             available: vec![],
         };
         assert!(e.to_string().contains("this account has none"), "{e}");
+    }
+
+    fn test_config() -> Config {
+        unsafe {
+            std::env::set_var("CI_HEYO_API_KEY", "test-key");
+            std::env::set_var("CI_DATABASE_URL", "postgres://localhost/ci_test");
+            std::env::set_var("CI_WEBHOOK_SECRET", "0123456789abcdef");
+        }
+        Config::from_env().expect("test config resolves")
     }
 
     fn test_runners(allow_unauthenticated: bool) -> Runners {

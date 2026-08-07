@@ -72,15 +72,81 @@ pub struct ArtifactsConfig {
     pub token: Option<String>,
 }
 
-/// The heyvm control-plane connection and the network whose hosts are runners.
+/// Which of the account's networks this instance takes work for.
+///
+/// Not "every network the account has", by default, and the reason is
+/// JetStream: jobs are sharded onto one durable consumer per runner and per
+/// network precisely so several orchestrators can run at once **as long as they
+/// own disjoint sets**. An instance that silently served everything would steal
+/// another's work, so what it serves is configuration rather than discovery.
+///
+/// `*` opts into serving everything, which is the right answer for the single
+/// instance most installations run — and is a decision that has been made rather
+/// than one that happened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServedNetworks {
+    /// Every network on the account, including ones created after startup.
+    All,
+    /// Only these, by name or id. The first is the default for a repository
+    /// that names none.
+    Named(Vec<String>),
+}
+
+impl ServedNetworks {
+    fn parse(raw: &str) -> Self {
+        if raw.trim() == "*" {
+            return Self::All;
+        }
+        Self::Named(
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
+    /// Whether a network is one this instance takes work for.
+    ///
+    /// Matched on id *or* name, because `CI_NETWORK` is written by a person and
+    /// the dashboard shows both.
+    pub fn includes(&self, id: &str, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Named(names) => names
+                .iter()
+                .any(|n| n == id || n.eq_ignore_ascii_case(name)),
+        }
+    }
+
+    /// The network a repository with no assignment falls back to, when the
+    /// configuration names one. `All` defers to the account's own default.
+    pub fn preferred(&self) -> Option<&str> {
+        match self {
+            Self::All => None,
+            Self::Named(names) => names.first().map(String::as_str),
+        }
+    }
+
+    pub fn as_str(&self) -> String {
+        match self {
+            Self::All => "*".to_string(),
+            Self::Named(names) => names.join(","),
+        }
+    }
+}
+
+/// The heyvm control-plane connection and the networks whose hosts are runners.
 #[derive(Debug, Clone)]
 pub struct HeyvmConfig {
     /// Cloud base URL. `None` uses the SDK default (`https://server.heyo.computer`).
     pub base_url: Option<String>,
     /// Bearer for the cloud *and* for each runner daemon.
     pub api_key: String,
-    /// Network name or id whose `host` members are the runner pool.
-    pub network: String,
+    /// Which networks this instance takes work for. Their `host` members are the
+    /// runner pool; every other network on the account is still listed on the
+    /// dashboard, marked as one this instance does not serve.
+    pub networks: ServedNetworks,
     /// Optional iroh relay override for NAT traversal.
     pub relay: Option<String>,
     /// How often the runner set is re-read from the control plane.
@@ -155,8 +221,22 @@ pub struct Config {
     pub app_lb_url: Option<String>,
     pub app_lb_token: Option<String>,
 
-    /// Shared secret the `git ci` client HMACs its payload with.
+    /// Shared secret the `git submit` client HMACs its payload with, when it
+    /// has no repository token.
+    ///
+    /// Still required, because it is the credential that works before any
+    /// repository has been registered — and the one that keeps an existing
+    /// installation working across this upgrade.
     pub webhook_secret: String,
+    /// Refuse the shared-secret path entirely, leaving only per-repository
+    /// tokens.
+    ///
+    /// Off by default so registering repositories is something an installation
+    /// migrates to rather than something an upgrade forces. Turn it on once
+    /// every repository has a token: a shared secret cannot be revoked for one
+    /// repository, cannot say which repository is submitting, and a leaked copy
+    /// is a leak of the whole system.
+    pub require_repo_token: bool,
     /// Glob for workflow files inside a submitted tree.
     ///
     /// A workflow object will override this per repository; until then it is the
@@ -221,15 +301,26 @@ impl Config {
                           (HEYO_API_KEY is also accepted)",
             })?;
 
-        let network = opt("CI_NETWORK").ok_or(ConfigError::Missing {
+        let network_raw = opt("CI_NETWORK").ok_or(ConfigError::Missing {
             var: "CI_NETWORK",
-            purpose: "the heyvm network whose `host` members are the runner pool",
+            purpose: "the heyvm network (or comma-separated networks, or `*` for all) \
+                      whose `host` members are the runner pool",
         })?;
+        let networks = ServedNetworks::parse(&network_raw);
+        if matches!(&networks, ServedNetworks::Named(n) if n.is_empty()) {
+            return Err(ConfigError::BadValue {
+                var: "CI_NETWORK",
+                value: network_raw,
+                reason: "names no network. Give one name or id, several separated by \
+                         commas, or `*` to serve every network on the account"
+                    .to_string(),
+            });
+        }
 
         let heyvm = HeyvmConfig {
             base_url: opt("CI_HEYO_BASE_URL"),
             api_key,
-            network,
+            networks,
             relay: opt("CI_IROH_RELAY"),
             refresh_interval: secs("CI_RUNNER_REFRESH_SECS", 30)?,
             runner_wait: secs("CI_RUNNER_WAIT_SECS", 900)?,
@@ -315,7 +406,8 @@ impl Config {
 
         let webhook_secret = opt("CI_WEBHOOK_SECRET").ok_or(ConfigError::Missing {
             var: "CI_WEBHOOK_SECRET",
-            purpose: "the HMAC-SHA256 secret `git ci` signs its payload with",
+            purpose: "the HMAC-SHA256 secret `git submit` signs its payload with when it \
+                          has no per-repository token",
         })?;
         if webhook_secret.len() < 16 {
             return Err(ConfigError::BadValue {
@@ -364,6 +456,7 @@ impl Config {
             app_lb_url: opt("CI_APP_LB_URL").map(|u| u.trim_end_matches('/').to_string()),
             app_lb_token: opt("CI_APP_LB_TOKEN"),
             webhook_secret,
+            require_repo_token: flag("CI_REQUIRE_REPO_TOKEN", false)?,
             default_workflow_path: opt("CI_WORKFLOW_PATH")
                 .unwrap_or_else(|| ".ci/workflows/*.yml".to_string()),
             max_source_bytes: bytes("CI_MAX_SOURCE_BYTES", 64 * 1024 * 1024)?,
@@ -383,14 +476,14 @@ impl Config {
     pub fn summary(&self) -> String {
         format!(
             "listen={} public={} network={} nats={} prefix={} sink={} logs={} \
-             heyosecret={} app-lb={} admins={}",
+             heyosecret={} app-lb={} admins={} submit={}",
             self.listen_addr,
             self.public_url,
             self.heyvm
                 .local_runner
                 .as_deref()
                 .map(|u| format!("local:{u}"))
-                .unwrap_or_else(|| self.heyvm.network.clone()),
+                .unwrap_or_else(|| self.heyvm.networks.as_str()),
             self.nats.redacted(),
             self.nats_prefix,
             self.artifact_sink.as_str(),
@@ -398,6 +491,11 @@ impl Config {
             self.heyosecret_url.as_deref().unwrap_or("unset"),
             self.app_lb_url.as_deref().unwrap_or("unset"),
             self.admin_emails.len(),
+            if self.require_repo_token {
+                "repo-token-only"
+            } else {
+                "repo-token-or-shared-secret"
+            },
         )
     }
 }
@@ -547,6 +645,58 @@ mod tests {
             Some(ArtifactSinkKind::Artifacts)
         );
         assert_eq!(ArtifactSinkKind::parse("gcs"), None);
+    }
+
+    #[test]
+    fn one_network_several_networks_and_all_of_them_all_parse() {
+        assert_eq!(
+            ServedNetworks::parse("prod-runners"),
+            ServedNetworks::Named(vec!["prod-runners".into()])
+        );
+        assert_eq!(
+            ServedNetworks::parse(" prod , lab ,, "),
+            ServedNetworks::Named(vec!["prod".into(), "lab".into()]),
+            "whitespace and empty entries are noise, not networks"
+        );
+        assert_eq!(ServedNetworks::parse("*"), ServedNetworks::All);
+        assert_eq!(ServedNetworks::parse(" * "), ServedNetworks::All);
+    }
+
+    /// `CI_NETWORK` is written by a person, and the dashboard shows both a
+    /// network's id and its name — so either spelling has to be accepted.
+    #[test]
+    fn a_served_network_is_matched_by_id_or_name() {
+        let named = ServedNetworks::parse("prod-runners,net-9");
+        assert!(named.includes("net-1", "prod-runners"));
+        assert!(named.includes("net-1", "PROD-Runners"), "case-insensitive");
+        assert!(named.includes("net-9", "whatever"), "by id");
+        assert!(!named.includes("net-2", "lab"));
+
+        assert!(ServedNetworks::All.includes("net-2", "lab"));
+    }
+
+    /// The first entry is the default, because it is the one somebody wrote
+    /// first. `*` names none, and defers to the account's own default network.
+    #[test]
+    fn the_preferred_network_is_the_first_named_one() {
+        assert_eq!(ServedNetworks::parse("prod,lab").preferred(), Some("prod"));
+        assert_eq!(ServedNetworks::All.preferred(), None);
+    }
+
+    /// A `CI_NETWORK` of only separators names nothing, and an instance serving
+    /// nothing would accept submits it can never run.
+    #[test]
+    fn a_network_list_that_names_nothing_is_refused_at_startup() {
+        unsafe {
+            std::env::set_var("CI_HEYO_API_KEY", "k");
+            std::env::set_var("CI_DATABASE_URL", "postgres://localhost/ci");
+            std::env::set_var("CI_WEBHOOK_SECRET", "0123456789abcdef");
+            std::env::set_var("CI_NETWORK", " , , ");
+        }
+        let err = Config::from_env().expect_err("must not start");
+        assert!(err.to_string().contains("CI_NETWORK"), "{err}");
+        assert!(err.to_string().contains("names no network"), "{err}");
+        unsafe { std::env::set_var("CI_NETWORK", "test-net") };
     }
 
     /// The prefix reaches a subject and a durable consumer name verbatim, so a

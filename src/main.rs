@@ -20,6 +20,7 @@ mod nats_auth;
 mod objects;
 mod plan;
 mod pool;
+mod repos;
 mod runners;
 mod secrets;
 mod store;
@@ -78,14 +79,37 @@ async fn main() {
     // will pick the pool up when it recovers.
     match runners.refresh().await {
         Ok(()) => {
-            let set = runners.snapshot();
-            tracing::info!(
-                "network {} ({}) has {} runner(s), {} online",
-                set.network_name,
-                set.network_id,
-                set.runners.len(),
-                set.dispatchable().count(),
-            );
+            let pool = runners.snapshot();
+            for set in pool.served() {
+                tracing::info!(
+                    "serving network {} ({}): {} runner(s), {} online{}",
+                    set.network_name,
+                    set.network_id,
+                    set.runners.len(),
+                    set.dispatchable().count(),
+                    if set.network_id == pool.default_network_id {
+                        " — the default for a repository that names none"
+                    } else {
+                        ""
+                    },
+                );
+            }
+            // Named, because "I assigned that network and nothing built" is
+            // otherwise answered only by reading a page nobody thought to open.
+            let unserved: Vec<&str> = pool
+                .networks
+                .iter()
+                .filter(|n| !n.served)
+                .map(|n| n.network_name.as_str())
+                .collect();
+            if !unserved.is_empty() {
+                tracing::info!(
+                    "not serving {} other network(s) on this account: {}. Add one to \
+                     CI_NETWORK, or set CI_NETWORK=*, to build for it.",
+                    unserved.len(),
+                    unserved.join(", ")
+                );
+            }
         }
         Err(e @ (RunnerError::UnknownNetwork { .. } | RunnerError::AmbiguousNetwork { .. })) => {
             eprintln!("ci: refusing to start — {e}");
@@ -137,6 +161,17 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // Said once, at startup, because it is the one configuration where the
+    // repositories page has no gate of its own — and minting a submit token is
+    // minting the right to run code on a runner.
+    if config.admin_emails.is_empty() {
+        tracing::warn!(
+            "CI_ADMIN_EMAILS is empty, so /repos accepts a request that carries no app-lb \
+             identity: on a deployment reachable by anyone, anyone can register a \
+             repository and mint a submit token. Set CI_ADMIN_EMAILS."
+        );
+    }
+
     if !secrets_client.is_configured() {
         tracing::warn!(
             "heyosecret is not configured, so `${{{{ secrets.* }}}}` will resolve empty. \

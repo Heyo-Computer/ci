@@ -273,10 +273,82 @@ pub struct ArtifactRow {
     pub uri: String,
 }
 
+/// A registered repository.
+#[derive(Debug, Clone)]
+pub struct Repo {
+    pub id: String,
+    pub url: String,
+    pub normalized: String,
+    pub name: String,
+    /// Overrides `CI_WORKFLOW_PATH` for this repository. A workflow object,
+    /// where one exists, still wins.
+    pub workflow_path: Option<String>,
+    /// The heyvm network this repository's builds run in, by name. `None` is the
+    /// installation default; a workflow's `uses:` still overrides it per job.
+    pub network: Option<String>,
+    pub enabled: bool,
+    pub created_email: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Repo {
+    fn from_row(r: &PgRow) -> Self {
+        Self {
+            id: r.get("id"),
+            url: r.get("url"),
+            normalized: r.get("normalized"),
+            name: r.get("name"),
+            workflow_path: r.get("workflow_path"),
+            network: r.get("network"),
+            enabled: r.get("enabled"),
+            created_email: r.get("created_email"),
+            created_at: r.get("created_at"),
+        }
+    }
+}
+
+/// One submit token, as everything except the authentication path sees it.
+///
+/// **There is deliberately no `secret_hash` field.** The digest is read by one
+/// query, compared, and dropped; keeping it on the struct that the dashboard
+/// renders would make leaking it a matter of one careless `(token.hash)` in a
+/// template.
+#[derive(Debug, Clone)]
+pub struct RepoToken {
+    pub id: String,
+    pub repo_id: String,
+    pub name: String,
+    pub created_email: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl RepoToken {
+    fn from_row(r: &PgRow) -> Self {
+        Self {
+            id: r.get("id"),
+            repo_id: r.get("repo_id"),
+            name: r.get("name"),
+            created_email: r.get("created_email"),
+            created_at: r.get("created_at"),
+            last_used_at: r.get("last_used_at"),
+            revoked_at: r.get("revoked_at"),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.revoked_at.is_none()
+    }
+}
+
 /// What a run is being started for.
 #[derive(Debug, Clone, Default)]
 pub struct RunRequest {
     pub workflow_id: String,
+    /// The registration this submit authenticated as, when it authenticated as
+    /// one. `None` for the shared-secret path, which cannot say.
+    pub repo_id: Option<String>,
     pub repo_url: String,
     pub git_ref: String,
     pub sha: String,
@@ -456,8 +528,8 @@ impl Store {
         sqlx::query(
             "INSERT INTO ci_run (id, workflow_id, workflow_path, workflow_name, repo_url,
                                  git_ref, sha, before_sha, actor_subject, actor_email,
-                                 source, status)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued')",
+                                 source, status, repo_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued',$12)",
         )
         .bind(run_id)
         .bind(&req.workflow_id)
@@ -474,6 +546,7 @@ impl Store {
         } else {
             &req.source
         })
+        .bind(&req.repo_id)
         .execute(&mut *tx)
         .await
         .map_err(StoreError::sql)?;
@@ -889,6 +962,247 @@ impl Store {
                 uri: r.get("uri"),
             })
             .collect())
+    }
+
+    // ---- registered repositories ----------------------------------------
+
+    /// Register a repository, or update the one already registered at that URL.
+    ///
+    /// Upsert rather than insert, keyed on the normalized URL: someone
+    /// registering `git@github.com:me/app.git` when
+    /// `https://github.com/me/app` is already registered means to edit that
+    /// registration, not to create a second one that competes with it for the
+    /// same submits. Existing tokens keep working, which is the point — the
+    /// alternative is that fixing a typo in a display name invalidates
+    /// everyone's credential.
+    pub async fn register_repo(
+        &self,
+        url: &str,
+        name: &str,
+        workflow_path: Option<&str>,
+        network: Option<&str>,
+        actor: Option<(&str, &str)>,
+    ) -> Result<Repo, StoreError> {
+        let row = sqlx::query(
+            "INSERT INTO ci_repo (id, url, normalized, name, workflow_path, network,
+                                  created_by, created_email)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+             ON CONFLICT (normalized) DO UPDATE
+                SET url = EXCLUDED.url,
+                    name = EXCLUDED.name,
+                    workflow_path = EXCLUDED.workflow_path,
+                    network = EXCLUDED.network
+             RETURNING *",
+        )
+        .bind(crate::vm::new_id())
+        .bind(url)
+        .bind(crate::repos::normalize(url))
+        .bind(name)
+        .bind(workflow_path)
+        .bind(network)
+        .bind(actor.map(|a| a.0))
+        .bind(actor.map(|a| a.1))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok(Repo::from_row(&row))
+    }
+
+    /// Point a repository at a heyvm network, or back at the default.
+    ///
+    /// Its own route rather than a re-registration, because reassigning a
+    /// network is the thing an operator does most often here — moving a
+    /// repository onto new hardware — and making that go through a form that
+    /// also rewrites the name and the workflow path invites clobbering both.
+    ///
+    /// Takes effect on the next submit. Jobs already scheduled keep the network
+    /// stamped into their stored plan, so a build in flight is not rerouted onto
+    /// hardware it did not warm a VM on.
+    pub async fn set_repo_network(
+        &self,
+        repo_id: &str,
+        network: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query("UPDATE ci_repo SET network = $2 WHERE id = $1")
+            .bind(repo_id)
+            .bind(network.map(str::trim).filter(|n| !n.is_empty()))
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::sql)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn repos(&self) -> Result<Vec<Repo>, StoreError> {
+        let rows = sqlx::query("SELECT * FROM ci_repo ORDER BY name, normalized")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(StoreError::sql)?;
+        Ok(rows.iter().map(Repo::from_row).collect())
+    }
+
+    pub async fn get_repo(&self, id: &str) -> Result<Option<Repo>, StoreError> {
+        let row = sqlx::query("SELECT * FROM ci_repo WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StoreError::sql)?;
+        Ok(row.as_ref().map(Repo::from_row))
+    }
+
+    /// The registration for a clone URL, in any of its spellings.
+    pub async fn repo_by_url(&self, url: &str) -> Result<Option<Repo>, StoreError> {
+        let row = sqlx::query("SELECT * FROM ci_repo WHERE normalized = $1")
+            .bind(crate::repos::normalize(url))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StoreError::sql)?;
+        Ok(row.as_ref().map(Repo::from_row))
+    }
+
+    /// Stop, or resume, a repository submitting.
+    ///
+    /// Separate from revoking tokens because it answers a different question. A
+    /// repository that should not be building right now — a migration, an
+    /// incident, a repository that was archived — is not a repository whose
+    /// tokens are compromised, and making the operator revoke and re-mint every
+    /// one to pause it teaches them to leave it running instead.
+    pub async fn set_repo_enabled(&self, id: &str, enabled: bool) -> Result<bool, StoreError> {
+        let result = sqlx::query("UPDATE ci_repo SET enabled = $2 WHERE id = $1")
+            .bind(id)
+            .bind(enabled)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::sql)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Remove a registration and every token it issued.
+    ///
+    /// Its runs survive with a null `repo_id` — deleting the registration must
+    /// not delete the history of what it built.
+    pub async fn delete_repo(&self, id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query("DELETE FROM ci_repo WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(StoreError::sql)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Mint a token for a repository and return it in plaintext — once.
+    ///
+    /// The plaintext is returned and not stored. There is no route that can
+    /// show it again, because there is nothing left to show it from.
+    pub async fn create_repo_token(
+        &self,
+        repo_id: &str,
+        name: &str,
+        actor: Option<(&str, &str)>,
+    ) -> Result<(RepoToken, String), StoreError> {
+        let minted = crate::repos::mint(&crate::vm::new_id());
+        let row = sqlx::query(
+            "INSERT INTO ci_repo_token (id, repo_id, name, secret_hash, created_by, created_email)
+             VALUES ($1,$2,$3,$4,$5,$6)
+             RETURNING *",
+        )
+        .bind(&minted.key_id)
+        .bind(repo_id)
+        .bind(name)
+        .bind(&minted.secret_hash)
+        .bind(actor.map(|a| a.0))
+        .bind(actor.map(|a| a.1))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok((RepoToken::from_row(&row), minted.plaintext))
+    }
+
+    pub async fn repo_tokens(&self, repo_id: &str) -> Result<Vec<RepoToken>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT * FROM ci_repo_token WHERE repo_id = $1
+              ORDER BY revoked_at IS NOT NULL, created_at DESC",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok(rows.iter().map(RepoToken::from_row).collect())
+    }
+
+    /// Stop a token working, without forgetting it existed.
+    ///
+    /// Idempotent, and `revoked_at` is only ever set once: revoking twice must
+    /// not rewrite when access actually ended.
+    pub async fn revoke_repo_token(&self, token_id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE ci_repo_token SET revoked_at = now()
+              WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(token_id)
+        .execute(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Resolve a presented submit token to the repository it may submit for.
+    ///
+    /// `Ok(None)` covers every way of not being a valid credential —
+    /// malformed, unknown key id, wrong secret, revoked, or a registration that
+    /// has been disabled. The caller reports one message for all of them, for
+    /// the same reason [`crate::trigger::TriggerError`] gives: telling a caller
+    /// *which* part of their credential was wrong tells an attacker how far
+    /// they got.
+    ///
+    /// A malformed presentation never reaches the database — this route is
+    /// unauthenticated and on the open internet.
+    pub async fn authenticate_repo_token(
+        &self,
+        presented: &str,
+    ) -> Result<Option<Repo>, StoreError> {
+        let Some((key_id, secret)) = crate::repos::parse(presented) else {
+            return Ok(None);
+        };
+
+        let row = sqlx::query(
+            "SELECT t.secret_hash AS secret_hash, r.*
+               FROM ci_repo_token t
+               JOIN ci_repo r ON r.id = t.repo_id
+              WHERE t.id = $1 AND t.revoked_at IS NULL AND r.enabled",
+        )
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+
+        let Some(row) = row else { return Ok(None) };
+        let stored: String = row.get("secret_hash");
+        if !crate::repos::secret_matches(secret, &stored) {
+            return Ok(None);
+        }
+
+        // Best-effort: a submit that ran is not undone by failing to record
+        // that its token was used.
+        if let Err(e) = sqlx::query("UPDATE ci_repo_token SET last_used_at = now() WHERE id = $1")
+            .bind(key_id)
+            .execute(&self.pool)
+            .await
+        {
+            tracing::warn!("could not record use of submit token {key_id}: {e}");
+        }
+
+        Ok(Some(Repo::from_row(&row)))
+    }
+
+    /// The most recent run of a registered repository, for the dashboard.
+    pub async fn last_run_of_repo(&self, repo_id: &str) -> Result<Option<Run>, StoreError> {
+        let row =
+            sqlx::query("SELECT * FROM ci_run WHERE repo_id = $1 ORDER BY created_at DESC LIMIT 1")
+                .bind(repo_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(StoreError::sql)?;
+        Ok(row.as_ref().map(Run::from_row))
     }
 
     // ---- users ----------------------------------------------------------
@@ -1396,6 +1710,279 @@ jobs:
                 .expect("repeatable");
         }
         assert_eq!(store.steps_of(&jid).await.unwrap().len(), 1);
+    }
+
+    // ---- registered repositories ----------------------------------------
+
+    /// A URL unique to this test run, so the tests are safe to run against a
+    /// database that already has registrations and safe to run concurrently.
+    fn test_repo_url() -> String {
+        format!("git@github.com:test/{}.git", crate::vm::new_id())
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_token_authenticates_for_its_own_repository_and_nothing_else() {
+        let store = test_store().await;
+        let a = store
+            .register_repo(&test_repo_url(), "a", None, None, None)
+            .await
+            .expect("registers");
+        let b = store
+            .register_repo(&test_repo_url(), "b", None, None, None)
+            .await
+            .expect("registers");
+
+        let (token_row, plaintext) = store
+            .create_repo_token(&a.id, "laptop", Some(("sub-1", "sam@sarocu.com")))
+            .await
+            .expect("mints");
+
+        let resolved = store
+            .authenticate_repo_token(&plaintext)
+            .await
+            .unwrap()
+            .expect("the token resolves");
+        assert_eq!(resolved.id, a.id);
+        assert_ne!(resolved.id, b.id);
+
+        // The plaintext is not recoverable from anything that is stored.
+        let listed = store.repo_tokens(&a.id).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, token_row.id);
+        assert!(listed[0].last_used_at.is_some(), "use is recorded");
+        assert!(!format!("{listed:?}").contains(&plaintext));
+
+        store.delete_repo(&a.id).await.unwrap();
+        store.delete_repo(&b.id).await.unwrap();
+    }
+
+    /// The one thing revocation has to actually do.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_revoked_token_stops_authenticating_but_stays_listed() {
+        let store = test_store().await;
+        let repo = store
+            .register_repo(&test_repo_url(), "app", None, None, None)
+            .await
+            .unwrap();
+        let (token, plaintext) = store.create_repo_token(&repo.id, "ci", None).await.unwrap();
+
+        assert!(
+            store
+                .authenticate_repo_token(&plaintext)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.revoke_repo_token(&token.id).await.unwrap());
+        assert!(
+            store
+                .authenticate_repo_token(&plaintext)
+                .await
+                .unwrap()
+                .is_none(),
+            "a revoked token must not submit"
+        );
+        assert!(
+            !store.revoke_repo_token(&token.id).await.unwrap(),
+            "revoking twice must not rewrite when access ended"
+        );
+
+        let listed = store.repo_tokens(&repo.id).await.unwrap();
+        assert_eq!(listed.len(), 1, "still nameable after it stopped working");
+        assert!(!listed[0].is_active());
+
+        store.delete_repo(&repo.id).await.unwrap();
+    }
+
+    /// Pausing a repository has to stop its existing tokens, or it is not a
+    /// pause — it is a label.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_paused_repository_refuses_a_valid_token() {
+        let store = test_store().await;
+        let repo = store
+            .register_repo(&test_repo_url(), "app", None, None, None)
+            .await
+            .unwrap();
+        let (_, plaintext) = store.create_repo_token(&repo.id, "ci", None).await.unwrap();
+
+        assert!(store.set_repo_enabled(&repo.id, false).await.unwrap());
+        assert!(
+            store
+                .authenticate_repo_token(&plaintext)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.set_repo_enabled(&repo.id, true).await.unwrap());
+        assert!(
+            store
+                .authenticate_repo_token(&plaintext)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        store.delete_repo(&repo.id).await.unwrap();
+    }
+
+    /// A wrong or forged token must be refused, and a malformed one must not
+    /// even reach a query — this is checked on a public route.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_forged_or_malformed_token_resolves_to_nothing() {
+        let store = test_store().await;
+        let repo = store
+            .register_repo(&test_repo_url(), "app", None, None, None)
+            .await
+            .unwrap();
+        let (token, plaintext) = store.create_repo_token(&repo.id, "ci", None).await.unwrap();
+
+        // The right key id with the wrong secret is the interesting forgery:
+        // the lookup succeeds and only the digest comparison stops it.
+        let forged = format!("{}{}.{}", crate::repos::TOKEN_PREFIX, token.id, "not-it");
+        assert!(
+            store
+                .authenticate_repo_token(&forged)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        for bad in ["", "garbage", "cis_nosuchkey.secret", &plaintext[..20]] {
+            assert!(
+                store.authenticate_repo_token(bad).await.unwrap().is_none(),
+                "{bad:?} must not authenticate"
+            );
+        }
+
+        store.delete_repo(&repo.id).await.unwrap();
+    }
+
+    /// Registering a URL that is already registered in another spelling must
+    /// edit that registration rather than making a second one — and must not
+    /// invalidate the tokens already issued for it.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn re_registering_the_other_spelling_updates_and_keeps_tokens() {
+        let store = test_store().await;
+        let name = crate::vm::new_id();
+        let ssh = format!("git@github.com:test/{name}.git");
+        let https = format!("https://github.com/test/{name}");
+
+        let first = store
+            .register_repo(&ssh, "app", None, None, None)
+            .await
+            .unwrap();
+        let (_, plaintext) = store
+            .create_repo_token(&first.id, "ci", None)
+            .await
+            .unwrap();
+
+        let second = store
+            .register_repo(&https, "app (renamed)", Some("ci/*.yml"), None, None)
+            .await
+            .unwrap();
+        assert_eq!(second.id, first.id, "one repository, not two");
+        assert_eq!(second.name, "app (renamed)");
+        assert_eq!(second.workflow_path.as_deref(), Some("ci/*.yml"));
+        assert_eq!(second.url, https, "the newer spelling is what is shown");
+
+        assert!(
+            store
+                .authenticate_repo_token(&plaintext)
+                .await
+                .unwrap()
+                .is_some(),
+            "fixing a name must not invalidate everyone's credential"
+        );
+
+        // And either spelling finds it.
+        assert_eq!(
+            store.repo_by_url(&ssh).await.unwrap().map(|r| r.id),
+            Some(first.id.clone())
+        );
+
+        store.delete_repo(&first.id).await.unwrap();
+    }
+
+    /// The assignment this whole column exists for: a repository points at a
+    /// network, and reassigning it is one write rather than a re-registration
+    /// that also rewrites the name and the workflow path.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_repository_can_be_pointed_at_a_network_and_back_at_the_default() {
+        let store = test_store().await;
+        let repo = store
+            .register_repo(&test_repo_url(), "app", None, Some("prod-runners"), None)
+            .await
+            .unwrap();
+        assert_eq!(repo.network.as_deref(), Some("prod-runners"));
+
+        assert!(store.set_repo_network(&repo.id, Some("lab")).await.unwrap());
+        assert_eq!(
+            store.get_repo(&repo.id).await.unwrap().unwrap().network,
+            Some("lab".to_string())
+        );
+
+        // Back to the installation default, and a blank is that rather than a
+        // network named "  ".
+        assert!(store.set_repo_network(&repo.id, Some("  ")).await.unwrap());
+        assert_eq!(
+            store.get_repo(&repo.id).await.unwrap().unwrap().network,
+            None
+        );
+
+        assert!(
+            !store
+                .set_repo_network("no-such-repo", Some("lab"))
+                .await
+                .unwrap(),
+            "assigning a network to nothing must report that it did nothing"
+        );
+
+        store.delete_repo(&repo.id).await.unwrap();
+    }
+
+    /// Removing a registration must not delete the history of what it built.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn deleting_a_repository_keeps_its_runs() {
+        let store = test_store().await;
+        let repo = store
+            .register_repo(&test_repo_url(), "app", None, None, None)
+            .await
+            .unwrap();
+        let run_id = crate::vm::new_id();
+        store
+            .create_run(
+                &run_id,
+                &RunRequest {
+                    repo_id: Some(repo.id.clone()),
+                    repo_url: repo.url.clone(),
+                    ..RunRequest::default()
+                },
+                &test_plan(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .last_run_of_repo(&repo.id)
+                .await
+                .unwrap()
+                .map(|r| r.id),
+            Some(run_id.clone())
+        );
+
+        assert!(store.delete_repo(&repo.id).await.unwrap());
+        assert!(
+            store.get_run(&run_id).await.unwrap().is_some(),
+            "the run survives its registration"
+        );
     }
 
     /// Being on the admin list promotes, but dropping off it must not demote —

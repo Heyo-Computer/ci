@@ -6,12 +6,17 @@
 //! spoofed. This module reads them and never re-implements a login.
 //!
 //! One consequence shapes every route below: **an app-lb gate admits browsers
-//! and nothing else.** The split is `Accept: text/html`, so curl, `git ci`, and
-//! a page's own `EventSource` all get `401 {"error":"authentication
+//! and nothing else.** The split is `Accept: text/html`, so curl, `git submit`,
+//! and a page's own `EventSource` all get `401 {"error":"authentication
 //! required"}`. Machine routes therefore live under `/api` and are listed in the
 //! deployment's `public_paths`, each carrying its own credential — the submit
-//! endpoint an HMAC, the log stream a short-TTL run-scoped token minted by the
-//! page that opens it.
+//! endpoint a repository token or an HMAC, the log stream a short-TTL
+//! run-scoped token minted by the page that opens it.
+//!
+//! The repository-management routes are the mirror image: they are *not* in
+//! `public_paths`, precisely because minting a submit token is minting the right
+//! to run code on a runner. They are for browsers, they run behind the gate, and
+//! they check an admin role on top of it.
 
 pub mod identity;
 pub mod pages;
@@ -19,17 +24,21 @@ pub mod stream;
 
 use crate::config::Config;
 use crate::dispatch::Dispatcher;
+use crate::repos;
 use crate::runners::Runners;
-use crate::store::Store;
+use crate::store::{Repo, Store};
 use crate::trigger;
+use axum::Form;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use identity::Identity;
+use pages::{RepoFlash, RepoView};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -70,8 +79,24 @@ pub fn router(
         .route("/", get(runs_page))
         .route("/runs/{run_id}", get(run_page))
         .route("/runs/{run_id}/jobs/{job_key}", get(job_page))
-        .route("/runners", get(runners_page))
+        // `/runners` was this page's name when there was one network to show.
+        // Kept because it is in people's history and in the README of a running
+        // deployment; both render the same page.
+        .route("/networks", get(networks_page))
+        .route("/runners", get(networks_page))
         .route("/workflows", get(workflows_page))
+        // Behind the gate on purpose, and admin-only on top of it: a submit
+        // token is the right to run code on a runner, so minting one is not a
+        // read.
+        .route("/repos", get(repos_page).post(register_repo))
+        .route("/repos/{repo_id}/tokens", post(create_repo_token))
+        .route(
+            "/repos/{repo_id}/tokens/{token_id}/revoke",
+            post(revoke_repo_token),
+        )
+        .route("/repos/{repo_id}/enabled", post(set_repo_enabled))
+        .route("/repos/{repo_id}/network", post(set_repo_network))
+        .route("/repos/{repo_id}/delete", post(delete_repo))
         // In `public_paths`, because an `EventSource` sends
         // `Accept: text/event-stream` and app-lb's gate admits only
         // `text/html`. It carries its own run-scoped token instead.
@@ -83,44 +108,174 @@ pub fn router(
         .with_state(state)
 }
 
-/// `POST /api/submit` — what `git ci` calls.
+/// How a submit proved it may start a build.
+enum Credential {
+    /// A per-repository token, and the registration it is scoped to.
+    Repo(Box<Repo>),
+    /// The installation-wide `CI_WEBHOOK_SECRET`, HMAC'd over the raw body.
+    /// Says nothing about which repository is submitting, which is the reason
+    /// the other one exists.
+    Shared,
+}
+
+/// The `Bearer` a submit token arrives as.
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?.trim();
+    // Case-insensitive on the scheme, per RFC 7235; curl and every client
+    // library spell it `Bearer`, but a shell script pasting `bearer` should not
+    // fail with "not signed correctly".
+    let (scheme, token) = value.split_once(' ')?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then(|| token.trim())
+        .filter(|t| !t.is_empty())
+}
+
+/// Decide whether a submit may proceed, before its body is parsed.
 ///
-/// Takes `Bytes`, not `Json<SubmitRequest>`, and that ordering is the point: the
-/// signature is verified over the raw body **before** anything parses it. With a
-/// `Json` extractor, axum would deserialize an unauthenticated body first, and
-/// the signature check would be guarding a decision already made.
+/// The ordering is the security property: a `Json` extractor would deserialize
+/// an unauthenticated body first, and the credential check would then be
+/// guarding a decision already made.
+async fn authenticate_submit(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Credential, axum::response::Response> {
+    if let Some(token) = bearer(headers) {
+        return match state.store.authenticate_repo_token(token).await {
+            Ok(Some(repo)) => Ok(Credential::Repo(Box::new(repo))),
+            // One message for malformed, unknown, wrong, revoked and disabled
+            // alike: saying which one it was tells an attacker how far they got.
+            Ok(None) => {
+                tracing::debug!("rejected a submit token that resolves to no repository");
+                Err(error(
+                    StatusCode::UNAUTHORIZED,
+                    &format!(
+                        "that submit token is not valid for any registered repository. \
+                         Register the repository at {}/repos, then \
+                         `git config ci.token <token>`.",
+                        state.config.public_url
+                    ),
+                ))
+            }
+            Err(e) => {
+                // A database failure is ours, not the caller's, and it must not
+                // read as a rejected credential — that sends someone to rotate
+                // a token that was fine.
+                tracing::error!("could not check a submit token: {e}");
+                Err(error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "could not check that submit token; the database is unreachable",
+                ))
+            }
+        };
+    }
+
+    if state.config.require_repo_token {
+        tracing::debug!("rejected a shared-secret submit; CI_REQUIRE_REPO_TOKEN is set");
+        return Err(error(
+            StatusCode::UNAUTHORIZED,
+            &format!(
+                "this server accepts only per-repository submit tokens \
+                 (CI_REQUIRE_REPO_TOKEN is set). Register the repository at \
+                 {}/repos, then `git config ci.token <token>`.",
+                state.config.public_url
+            ),
+        ));
+    }
+
+    let signature = headers
+        .get(trigger::SIGNATURE_HEADER)
+        .and_then(|v| v.to_str().ok());
+    match trigger::verify_signature(&state.config.webhook_secret, body, signature) {
+        Ok(()) => Ok(Credential::Shared),
+        Err(e) => {
+            // Logged at debug, not warn: an unauthenticated public endpoint gets
+            // scanned, and a warn per probe is how a log becomes unreadable.
+            tracing::debug!("rejected an unsigned submit: {e}");
+            Err(error(e.status(), &e.to_string()))
+        }
+    }
+}
+
+/// `POST /api/submit` — what `git submit` calls.
 async fn submit(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let signature = headers
-        .get(trigger::SIGNATURE_HEADER)
-        .and_then(|v| v.to_str().ok());
-
-    if let Err(e) = trigger::verify_signature(&state.config.webhook_secret, &body, signature) {
-        // Logged at debug, not warn: an unauthenticated public endpoint gets
-        // scanned, and a warn per probe is how a log becomes unreadable.
-        tracing::debug!("rejected an unsigned submit: {e}");
-        return error(e.status(), &e.to_string());
-    }
+    let credential = match authenticate_submit(&state, &headers, &body).await {
+        Ok(c) => c,
+        Err(response) => return response,
+    };
 
     let req: trigger::SubmitRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return error(StatusCode::BAD_REQUEST, &format!("malformed submit: {e}")),
     };
 
-    // Present only when a browser reached this through app-lb's gate; `git ci`
-    // arrives with the HMAC and no identity, so the payload's `pusher` is the
-    // fallback.
+    // The shared secret cannot say which repository it is for, but the payload
+    // can, and a registration matching it still decides the workflow glob and
+    // gives the run a home on the repositories page. This is not a privilege
+    // grant: whoever holds the installation-wide secret may already submit as
+    // anything, which is the weakness the token path exists to fix.
+    let matched;
+    let repo = match &credential {
+        Credential::Repo(r) => Some(r.as_ref()),
+        Credential::Shared if !req.repository.url.trim().is_empty() => {
+            matched = state
+                .store
+                .repo_by_url(&req.repository.url)
+                .await
+                .unwrap_or_else(|e| {
+                    tracing::warn!("could not look up {:?}: {e}", req.repository.url);
+                    None
+                })
+                .filter(|r| r.enabled);
+            matched.as_ref()
+        }
+        Credential::Shared => None,
+    };
+
+    // A token is scoped to one repository, and this is where that is worth
+    // anything: without it, a token issued for a repository somebody may push to
+    // would build any repository at all, which is a build of *their* workflow
+    // file with *this* repository's secrets.
+    if let Some(repo) = repo
+        && !req.repository.url.trim().is_empty()
+        && !repos::same_repo(&repo.url, &req.repository.url)
+    {
+        tracing::warn!(
+            "refused a submit for {:?} with a token for {:?}",
+            req.repository.url,
+            repo.url
+        );
+        return error(
+            StatusCode::FORBIDDEN,
+            &format!(
+                "this submit token is registered to {}, but the submit is for {}. \
+                 Use the token minted for that repository.",
+                repo.url, req.repository.url
+            ),
+        );
+    }
+
+    // Present only when a browser reached this through app-lb's gate; `git
+    // submit` arrives with a token and no identity, so the payload's `pusher` is
+    // the fallback.
     let who = Identity::from_headers(&headers);
 
-    match state.dispatcher.submit(&req, who.as_ref()).await {
+    match state.dispatcher.submit(&req, who.as_ref(), repo).await {
         Ok(run_ids) => {
             tracing::info!(
-                "accepted a submit for {} ({}): {} run(s)",
-                req.repository.name,
+                "accepted a submit for {} ({}) via {}: {} run(s)",
+                repo.map(|r| r.name.as_str())
+                    .unwrap_or(&req.repository.name),
                 req.branch(),
+                match repo {
+                    Some(r) => format!("a token for {}", r.name),
+                    None => "the shared secret".to_string(),
+                },
                 run_ids.len()
             );
             (
@@ -253,6 +408,496 @@ async fn workflows_page(State(state): State<AppState>, headers: HeaderMap) -> im
     }
 }
 
+// ---- registered repositories --------------------------------------------
+
+/// Who may register a repository and mint a token for it.
+///
+/// Two admissible cases, and the second one is a deliberate trade:
+///
+/// - **A gated deployment.** app-lb forwards an identity, and the person behind
+///   it must hold the `admin` role in `ci_user`, seeded from `CI_ADMIN_EMAILS`.
+/// - **A deployment that forwards no identity at all and names no admins.**
+///   That is the local loop: no gate, no accounts, and anyone who can reach the
+///   dashboard can already read every build log. Refusing here would leave the
+///   page unusable in the one configuration it is developed in.
+///
+/// The moment `CI_ADMIN_EMAILS` names anybody, an anonymous request is refused —
+/// an installation that has declared who its admins are has said that "nobody in
+/// particular" is not one of them.
+async fn may_manage(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<Identity>, axum::response::Response> {
+    check_origin(state, headers)?;
+
+    let who = Identity::from_headers(headers);
+    let Some(who) = who else {
+        if state.config.admin_emails.is_empty() {
+            return Ok(None);
+        }
+        return Err(refused(
+            state,
+            None,
+            StatusCode::UNAUTHORIZED,
+            "This request carries no identity, and this installation names its admins in \
+             CI_ADMIN_EMAILS. Reach this page through the app-lb gate that forwards \
+             x-auth-request-user.",
+        ));
+    };
+
+    match state
+        .store
+        .upsert_user(
+            &who.subject,
+            &who.email,
+            who.name.as_deref(),
+            &state.config.admin_emails,
+        )
+        .await
+    {
+        Ok(role) if role == "admin" => Ok(Some(who)),
+        Ok(_) => Err(refused(
+            state,
+            Some(&who),
+            StatusCode::FORBIDDEN,
+            "Registering a repository mints a credential that can run code on a runner, \
+             so it is admin-only. Ask someone on CI_ADMIN_EMAILS to add you.",
+        )),
+        Err(e) => {
+            tracing::error!("could not resolve a role: {e}");
+            Err(page_error(state, Some(&who), &e.to_string()))
+        }
+    }
+}
+
+/// Refuse a request that a different site made on a logged-in browser's behalf.
+///
+/// These routes are POST forms authenticated by an app-lb session cookie, which
+/// a cross-site form submission carries just as happily as the real page does.
+/// Without this, a page anywhere could delete a registration — or register one —
+/// on behalf of whoever is signed in. It could not *read* the minted token back,
+/// so this is vandalism rather than credential theft, but it is still somebody
+/// else deciding what this installation builds.
+///
+/// **Absent `Origin` passes**, which is the deliberate limit. A browser sends it
+/// on every cross-origin form POST, so the attack this defends against always
+/// carries one; `curl` and a scripted client send none, and a cross-site request
+/// cannot forge one. It is checked on GET too — a navigation carries no `Origin`
+/// and a same-origin fetch carries a matching one, so nothing legitimate is
+/// caught.
+fn check_origin(state: &AppState, headers: &HeaderMap) -> Result<(), axum::response::Response> {
+    let Some(origin) = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|o| !o.is_empty() && *o != "null")
+    else {
+        return Ok(());
+    };
+
+    if origin.trim_end_matches('/') == state.config.public_url {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        "refused a repositories request from origin {origin:?}; this app is {:?}",
+        state.config.public_url
+    );
+    Err(refused(
+        state,
+        None,
+        StatusCode::FORBIDDEN,
+        "This request came from another site. If it came from this dashboard, \
+         CI_PUBLIC_URL does not match the address the browser is using — set it to \
+         the URL people actually visit.",
+    ))
+}
+
+fn refused(
+    state: &AppState,
+    who: Option<&Identity>,
+    status: StatusCode,
+    message: &str,
+) -> axum::response::Response {
+    (
+        status,
+        pages::layout(
+            &state.config.name,
+            "repos",
+            who.map(|i| i.display()),
+            maud::html! {
+                div .banner { (message) }
+                p { a href="/" { "Back to runs" } }
+            },
+        ),
+    )
+        .into_response()
+}
+
+/// Render `/repos`, optionally with the outcome of the POST that produced it.
+async fn render_repos(
+    state: &AppState,
+    who: Option<&Identity>,
+    flash: RepoFlash,
+) -> axum::response::Response {
+    let repos = match state.store.repos().await {
+        Ok(r) => r,
+        Err(e) => return page_error(state, who, &e.to_string()),
+    };
+
+    let mut views = Vec::with_capacity(repos.len());
+    for repo in repos {
+        // A failure to read one repository's tokens must not blank the page;
+        // an empty token list is visibly wrong in a way a 500 is not fixable
+        // from.
+        let tokens = state.store.repo_tokens(&repo.id).await.unwrap_or_default();
+        let last_run = state.store.last_run_of_repo(&repo.id).await.ok().flatten();
+        views.push(RepoView {
+            repo,
+            tokens,
+            last_run,
+        });
+    }
+
+    pages::repos_page(
+        &state.config.name,
+        who.map(|i| i.display()),
+        &views,
+        &state.config.public_url,
+        state.config.require_repo_token,
+        &state.runners.snapshot(),
+        &flash,
+    )
+    .into_response()
+}
+
+async fn repos_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let who = match may_manage(&state, &headers).await {
+        Ok(w) => w,
+        Err(response) => return response,
+    };
+    render_repos(&state, who.as_ref(), RepoFlash::default()).await
+}
+
+#[derive(serde::Deserialize)]
+struct RegisterForm {
+    url: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    workflow_path: String,
+    #[serde(default)]
+    network: String,
+}
+
+async fn register_repo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<RegisterForm>,
+) -> impl IntoResponse {
+    let who = match may_manage(&state, &headers).await {
+        Ok(w) => w,
+        Err(response) => return response,
+    };
+
+    let url = form.url.trim();
+    if url.is_empty() {
+        return render_repos(
+            &state,
+            who.as_ref(),
+            RepoFlash::failed("A clone URL is required; it is what a submit is matched against."),
+        )
+        .await;
+    }
+
+    let name = match form.name.trim() {
+        "" => repos::name_from_url(url),
+        given => given.to_string(),
+    };
+    let workflow_path = Some(form.workflow_path.trim()).filter(|p| !p.is_empty());
+    let actor = who.as_ref().map(|w| (w.subject.as_str(), w.email.as_str()));
+
+    // The picker only offers served networks, so anything else arrived from
+    // somewhere other than this page. Resolved to the canonical name rather than
+    // stored verbatim, so an id typed into the form still reads as a name later.
+    let pool = state.runners.snapshot();
+    let network = match form.network.trim() {
+        "" => None,
+        name => match pool.find(name).filter(|s| s.served) {
+            Some(set) => Some(set.network_name.clone()),
+            None => {
+                return render_repos(
+                    &state,
+                    who.as_ref(),
+                    RepoFlash::failed(format!(
+                        "This orchestrator does not serve a network named {name:?}. \
+                         See Networks for what it does serve."
+                    )),
+                )
+                .await;
+            }
+        },
+    };
+
+    match state
+        .store
+        .register_repo(url, &name, workflow_path, network.as_deref(), actor)
+        .await
+    {
+        Ok(repo) => {
+            tracing::info!(
+                "registered repository {} ({}) on network {:?} by {}",
+                repo.name,
+                repo.normalized,
+                repo.network.as_deref().unwrap_or("(default)"),
+                who.as_ref().map(|w| w.display()).unwrap_or("anonymous")
+            );
+            render_repos(
+                &state,
+                who.as_ref(),
+                RepoFlash::done(format!(
+                    "{} is registered. Mint a token for it below.",
+                    repo.name
+                )),
+            )
+            .await
+        }
+        Err(e) => render_repos(&state, who.as_ref(), RepoFlash::failed(e.to_string())).await,
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct TokenForm {
+    #[serde(default)]
+    name: String,
+}
+
+/// Mint a token, and render the page that shows it.
+///
+/// A redirect would be the conventional answer to a POST, but the token can only
+/// be shown once and a redirect would have to carry it in the URL — where it
+/// lands in browser history, in a `Referer`, and in every access log between
+/// here and the browser. So the POST renders its own result.
+async fn create_repo_token(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<TokenForm>,
+) -> impl IntoResponse {
+    let who = match may_manage(&state, &headers).await {
+        Ok(w) => w,
+        Err(response) => return response,
+    };
+
+    let repo = match state.store.get_repo(&repo_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return render_repos(
+                &state,
+                who.as_ref(),
+                RepoFlash::failed("That repository is not registered any more."),
+            )
+            .await;
+        }
+        Err(e) => return page_error(&state, who.as_ref(), &e.to_string()),
+    };
+
+    let name = match form.name.trim() {
+        "" => who
+            .as_ref()
+            .map(|w| w.email.clone())
+            .unwrap_or_else(|| "unnamed".to_string()),
+        given => given.to_string(),
+    };
+    let actor = who.as_ref().map(|w| (w.subject.as_str(), w.email.as_str()));
+
+    match state.store.create_repo_token(&repo.id, &name, actor).await {
+        Ok((token, plaintext)) => {
+            tracing::info!(
+                "minted submit token {} for {} by {}",
+                token.id,
+                repo.name,
+                who.as_ref().map(|w| w.display()).unwrap_or("anonymous")
+            );
+            render_repos(
+                &state,
+                who.as_ref(),
+                RepoFlash::minted(repo.name.clone(), plaintext),
+            )
+            .await
+        }
+        Err(e) => render_repos(&state, who.as_ref(), RepoFlash::failed(e.to_string())).await,
+    }
+}
+
+async fn revoke_repo_token(
+    State(state): State<AppState>,
+    Path((_repo_id, token_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let who = match may_manage(&state, &headers).await {
+        Ok(w) => w,
+        Err(response) => return response,
+    };
+
+    let flash = match state.store.revoke_repo_token(&token_id).await {
+        Ok(true) => {
+            tracing::info!(
+                "revoked submit token {token_id} by {}",
+                who.as_ref().map(|w| w.display()).unwrap_or("anonymous")
+            );
+            RepoFlash::done("That token no longer works. Any build already running is unaffected.")
+        }
+        Ok(false) => RepoFlash::done("That token was already revoked."),
+        Err(e) => RepoFlash::failed(e.to_string()),
+    };
+    render_repos(&state, who.as_ref(), flash).await
+}
+
+#[derive(serde::Deserialize)]
+struct NetworkForm {
+    /// Empty means "the installation default", which is a real choice and so is
+    /// an option in the select rather than an absent field.
+    #[serde(default)]
+    network: String,
+}
+
+/// Point a repository at a heyvm network.
+///
+/// The chosen network is checked against the pool *now*, so a typo or an
+/// unserved network is refused while somebody is looking at the page — rather
+/// than at the next submit, by whoever is waiting on a build.
+async fn set_repo_network(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<NetworkForm>,
+) -> impl IntoResponse {
+    let who = match may_manage(&state, &headers).await {
+        Ok(w) => w,
+        Err(response) => return response,
+    };
+
+    let wanted = form.network.trim();
+    let pool = state.runners.snapshot();
+    let chosen = match wanted {
+        "" => None,
+        name => match pool.find(name) {
+            Some(set) if set.served => Some(set.network_name.clone()),
+            Some(set) => {
+                return render_repos(
+                    &state,
+                    who.as_ref(),
+                    RepoFlash::failed(format!(
+                        "Network {} exists but this orchestrator does not take work for it. \
+                         Add it to CI_NETWORK, or set CI_NETWORK=*.",
+                        set.network_name
+                    )),
+                )
+                .await;
+            }
+            None => {
+                return render_repos(
+                    &state,
+                    who.as_ref(),
+                    RepoFlash::failed(format!("No heyvm network is named {name:?}.")),
+                )
+                .await;
+            }
+        },
+    };
+
+    let flash = match state
+        .store
+        .set_repo_network(&repo_id, chosen.as_deref())
+        .await
+    {
+        Ok(true) => {
+            tracing::info!(
+                "assigned repository {repo_id} to network {:?} by {}",
+                chosen.as_deref().unwrap_or("(default)"),
+                who.as_ref().map(|w| w.display()).unwrap_or("anonymous")
+            );
+            RepoFlash::done(match &chosen {
+                Some(n) => format!(
+                    "New builds of this repository run in {n}. A job with its own \
+                     `uses:` still goes where the workflow says, and anything already \
+                     queued keeps the network it was scheduled for."
+                ),
+                None => "This repository is back on the installation default network.".to_string(),
+            })
+        }
+        Ok(false) => RepoFlash::failed("That repository is not registered."),
+        Err(e) => RepoFlash::failed(e.to_string()),
+    };
+    render_repos(&state, who.as_ref(), flash).await
+}
+
+#[derive(serde::Deserialize)]
+struct EnabledForm {
+    enabled: bool,
+}
+
+/// Pause or resume a repository.
+///
+/// The desired state is submitted rather than flipped, so two admins clicking
+/// at once converge instead of toggling each other's decision away.
+async fn set_repo_enabled(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+    headers: HeaderMap,
+    Form(form): Form<EnabledForm>,
+) -> impl IntoResponse {
+    let who = match may_manage(&state, &headers).await {
+        Ok(w) => w,
+        Err(response) => return response,
+    };
+
+    let flash = match state.store.set_repo_enabled(&repo_id, form.enabled).await {
+        Ok(true) if form.enabled => RepoFlash::done("That repository can submit again."),
+        Ok(true) => RepoFlash::done(
+            "That repository is paused. Its tokens still exist, and every submit with one \
+             is refused until it is resumed. The shared CI_WEBHOOK_SECRET is not affected \
+             — it belongs to no repository, so nothing about one can stop it.",
+        ),
+        Ok(false) => RepoFlash::failed("That repository is not registered."),
+        Err(e) => RepoFlash::failed(e.to_string()),
+    };
+    tracing::info!(
+        "set repository {repo_id} enabled={} by {}",
+        form.enabled,
+        who.as_ref().map(|w| w.display()).unwrap_or("anonymous")
+    );
+    render_repos(&state, who.as_ref(), flash).await
+}
+
+async fn delete_repo(
+    State(state): State<AppState>,
+    Path(repo_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let who = match may_manage(&state, &headers).await {
+        Ok(w) => w,
+        Err(response) => return response,
+    };
+
+    let flash = match state.store.delete_repo(&repo_id).await {
+        Ok(true) => {
+            tracing::info!(
+                "removed repository registration {repo_id} by {}",
+                who.as_ref().map(|w| w.display()).unwrap_or("anonymous")
+            );
+            RepoFlash::done(
+                "The registration and its tokens are gone. Its runs are kept, and a \
+                 submit with one of those tokens is now refused.",
+            )
+        }
+        Ok(false) => RepoFlash::failed("That repository is not registered."),
+        Err(e) => RepoFlash::failed(e.to_string()),
+    };
+    render_repos(&state, who.as_ref(), flash).await
+}
+
 /// Tail a job's step logs.
 ///
 /// Emits **rendered text appended to a specific step**, not a JSON model the
@@ -354,9 +999,9 @@ fn not_found(state: &AppState, who: Option<&Identity>, message: &str) -> axum::r
         .into_response()
 }
 
-async fn runners_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+async fn networks_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let who = Identity::from_headers(&headers);
-    pages::runners_page(
+    pages::networks_page(
         &state.config.name,
         who.as_ref().map(|i| i.display()),
         &state.runners.snapshot(),
@@ -425,6 +1070,29 @@ mod tests {
         router(config, runners, store, dispatcher)
     }
 
+    /// The token half of the submit credential, without a database: what does
+    /// and does not count as a `Bearer` presentation.
+    #[test]
+    fn a_bearer_is_recognised_however_it_is_spelled_and_not_otherwise() {
+        let headers = |v: &str| {
+            let mut h = HeaderMap::new();
+            if !v.is_empty() {
+                h.insert(AUTHORIZATION, v.parse().unwrap());
+            }
+            h
+        };
+        assert_eq!(bearer(&headers("Bearer cis_k.s")), Some("cis_k.s"));
+        assert_eq!(bearer(&headers("bearer cis_k.s")), Some("cis_k.s"));
+        assert_eq!(bearer(&headers("Bearer   cis_k.s  ")), Some("cis_k.s"));
+
+        // A credential for something else must fall through to the HMAC path
+        // rather than being taken as a failed submit token.
+        assert_eq!(bearer(&headers("Basic dXNlcjpwdw==")), None);
+        assert_eq!(bearer(&headers("Bearer")), None);
+        assert_eq!(bearer(&headers("Bearer ")), None);
+        assert_eq!(bearer(&headers("")), None);
+    }
+
     #[tokio::test]
     #[ignore = "needs CI_TEST_DATABASE_URL"]
     async fn healthz_answers_without_a_credential() {
@@ -441,27 +1109,77 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
     }
 
-    /// The pool page must render before the first refresh lands, because that
-    /// is exactly when someone is looking at it — a cold start with a cloud
-    /// that has not answered yet.
+    /// The networks page must render before the first refresh lands, because
+    /// that is exactly when someone is looking at it — a cold start with a
+    /// cloud that has not answered yet.
+    ///
+    /// Both spellings, because `/runners` is what this page was called and is
+    /// in people's history.
     #[tokio::test]
     #[ignore = "needs CI_TEST_DATABASE_URL"]
-    async fn the_runners_page_renders_with_an_empty_pool() {
+    async fn the_networks_page_renders_with_an_empty_pool() {
+        for uri in ["/networks", "/runners"] {
+            let app = test_router().await;
+            let res = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{uri}");
+            let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let html = String::from_utf8(body.to_vec()).unwrap();
+            assert!(html.contains("heyvm network create"), "{uri}: {html}");
+        }
+    }
+
+    /// A cross-site form POST carries the session cookie; without this check it
+    /// would also carry the decision.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_repository_post_from_another_origin_is_refused() {
         let app = test_router().await;
         let res = app
             .oneshot(
                 Request::builder()
-                    .uri("/runners")
-                    .body(Body::empty())
+                    .method("POST")
+                    .uri("/repos")
+                    .header("origin", "https://evil.example.com")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("url=git@github.com:evil/app.git"))
                     .unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// And the page's own form still works. `CI_PUBLIC_URL` defaults to
+    /// `http://<listen addr>` in the test config, which is what the browser
+    /// would send.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_repository_post_from_this_app_is_allowed() {
+        let config = test_config();
+        let app = test_router().await;
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/repos")
+                    .header("origin", &config.public_url)
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from("url=&name=&workflow_path="))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Rejected for the empty URL, not for the origin — which is the point.
         assert_eq!(res.status(), StatusCode::OK);
         let body = axum::body::to_bytes(res.into_body(), 1 << 20)
             .await
             .unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert!(html.contains("No host has joined this network"), "{html}");
+        assert!(html.contains("A clone URL is required"), "{html}");
     }
 }

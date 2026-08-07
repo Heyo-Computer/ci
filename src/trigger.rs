@@ -1,4 +1,4 @@
-//! The submit endpoint: `git ci` posts here.
+//! The submit endpoint: `git submit` posts here.
 //!
 //! The client sends a **`git archive` tarball of the tree it wants built**,
 //! signed with HMAC-SHA256. Two consequences follow from that choice, and both
@@ -20,7 +20,7 @@
 //! ## The signature is the whole security boundary
 //!
 //! This route is in the deployment's `public_paths`, because an app-lb gate
-//! admits browsers only and `git ci` is not a browser. So the HMAC is what
+//! admits browsers only and `git submit` is not a browser. So a credential here is
 //! stands between the open internet and arbitrary code execution on a runner.
 //! It is compared in constant time, over the raw body, before the body is
 //! parsed — a JSON parse on unauthenticated input is a decision, not a default.
@@ -71,7 +71,7 @@ pub struct SourceArchive {
     pub content_base64: String,
 }
 
-/// What `git ci` posts.
+/// What `git submit` posts.
 ///
 /// Field names follow the existing `git submit` payload so the two clients stay
 /// recognisably related.
@@ -348,14 +348,16 @@ impl fmt::Display for TriggerError {
             Self::MissingSignature | Self::MalformedSignature | Self::BadSignature => {
                 write!(
                     f,
-                    "the request is not signed correctly. `git ci` signs with \
-                     CI_WEBHOOK_SECRET; check that the client and the server agree."
+                    "the request carries no usable credential. Register the repository \
+                     on /repos and set `git config ci.token`, or sign with the shared \
+                     CI_WEBHOOK_SECRET and check that the client and the server agree \
+                     on it."
                 )
             }
             Self::UnsupportedFormat(fmt) => write!(
                 f,
                 "source archive format {fmt:?} is not supported; this server \
-                 understands `tar.gz`. Upgrade `git ci`."
+                 understands `tar.gz`. Upgrade `git submit`."
             ),
             Self::BadArchive(e) => write!(f, "the source archive could not be read: {e}"),
             Self::EscapingEntry(p) => write!(

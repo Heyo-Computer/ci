@@ -37,17 +37,19 @@ the variable to fix. See `deploy/supervisor/ci.conf` for the full set.
 ## Submitting a build
 
 ```bash
-./install-git-ci.sh                      # installs `git-ci` onto PATH
-git config ci.endpoint https://ci.us2.heyo.work
-git config ci.secret   <the server's CI_WEBHOOK_SECRET>
+./install-git-submit.sh                  # installs `git-submit` onto PATH
 
-git ci --dry-run    # show what would be sent
-git ci              # submit HEAD
-git ci --dirty      # include uncommitted tracked changes
+# From the dashboard's /repos page, which mints these two lines for you:
+git config ci.endpoint https://ci.us2.heyo.work
+git config ci.token    cis_019fca648a6e-00000002.…
+
+git submit --dry-run    # show what would be sent
+git submit              # submit HEAD
+git submit --dirty      # include uncommitted tracked changes
 ```
 
-`git ci` sends a **`git archive` tarball of the tree**, signed with HMAC-SHA256.
-Two consequences, and both are the point:
+`git submit` sends a **`git archive` tarball of the tree**. Two consequences,
+and both are the point:
 
 - **No repository credential exists anywhere in this system.** Not on the
   orchestrator, not in a guest. The submitter already had read access — they ran
@@ -58,6 +60,45 @@ Two consequences, and both are the point:
 
 The cost: the guest gets a tree with no `.git`, so `git describe` does not work
 in a step. The commit and ref arrive as environment variables instead.
+
+## Registered repositories, and the token that submits
+
+```bash
+# On the dashboard: /repos → register a clone URL → Mint.
+# It shows the token exactly once, with the two `git config` lines above.
+```
+
+A submit endpoint on the open internet is arbitrary code execution on a runner,
+so what stands in front of it matters more than anything else here. There are two
+credentials and the difference is not strength, it is **scope**.
+
+`CI_WEBHOOK_SECRET` is one shared secret, HMAC'd over the body, handed to
+everyone who submits from anywhere. It cannot be revoked for one repository, and
+it cannot say *which* repository is submitting — so a submit's `repository` field
+is something the server takes on trust.
+
+A **repository token** is minted per registration, revocable on its own, and
+*is* the statement of which repository the submit is for. A submit whose payload
+names a different repository than its token is refused, which is what stops a
+token for a repository somebody can push to from building any repository at all
+— with this installation's secrets.
+
+- **Stored as a SHA-256 digest, and shown once.** Verifying an HMAC would need
+  the server to hold every key, and one read of that table is every repository's
+  credential. A bearer inside TLS reverses the trade: the secret transits, and
+  what is at rest cannot submit.
+- **`ci_repo.workflow_path`** overrides `CI_WORKFLOW_PATH` for one repository. A
+  workflow object still wins, being the more specific statement.
+- **Pausing** a registration refuses its tokens without destroying them. The
+  shared secret is unaffected — it belongs to no repository, so nothing about one
+  can stop it. `CI_REQUIRE_REPO_TOKEN=true` turns it off entirely, which is where
+  an installation lands once every repository has a token.
+
+`/repos` is deliberately **not** in `public_paths`: it is a browser page behind
+app-lb's gate, and admin-only on top of it. With `CI_ADMIN_EMAILS` unset it also
+accepts a request carrying no identity at all — that is the local loop, where
+there is no gate and no accounts — and startup warns about exactly what that
+means.
 
 ## A workflow
 
@@ -105,7 +146,7 @@ GitHub Actions' shape, with two departures.
 a label. That is the point of the system: a job names the heyvm network and the
 host it wants, and membership of that network is what makes a host eligible.
 `<network>/<runner>` pins; `<network>` or `<network>/*` takes any online host;
-absent inherits the workflow object's network.
+absent inherits the repository's assigned network — see below.
 
 **A pinned job does not silently migrate.** If its host is offline the job stays
 queued for that host and fails after `CI_RUNNER_WAIT_SECS`, because the warm pool
@@ -119,6 +160,60 @@ the author declares the driver, image, size and setup hooks — and, via
 `deny_unknown_fields` is on throughout, so `stpes:` or `timeout_minutes:`
 (instead of `timeout-minutes:`) is a parse error naming the job, not a field that
 quietly does nothing.
+
+## Networks
+
+```bash
+CI_NETWORK=prod-runners          # serve one
+CI_NETWORK=prod-runners,lab      # serve two; the first is the default
+CI_NETWORK='*'                   # serve every network on the account
+```
+
+`/networks` lists **every** heyvm network on the account with the hosts in each,
+whether or not this instance builds for it, plus the daemons that joined no
+network at all. That last list is there because "my runner isn't picking up
+jobs" is otherwise a dead end: a registered daemon that never joined looks
+exactly like one that was never registered.
+
+**What an instance serves is configuration, not discovery.** Jobs are sharded
+onto one durable JetStream consumer per runner and per network precisely so
+several orchestrators can run at once *as long as they own disjoint sets*. An
+instance that silently served everything would eat another's work. `*` opts into
+serving everything, which is right for the single instance most installations
+run — as a decision that was made rather than one that happened.
+
+Members are read per network, concurrently: the control plane has no
+"all members everywhere" route and `NetworkInfo` carries no member count, so N+1
+reads is the only shape available. Running them together makes a refresh one
+round trip's worth of latency instead of N.
+
+### Assigning one to a repository
+
+A registered repository (`/repos`) can name the network its builds run in, stored
+in `ci_repo.network`. The order of precedence, most specific first:
+
+1. the job's own `uses: <network>/<runner>`
+2. the workflow object's `network`, where app-lb has one
+3. the repository's assigned network
+4. the installation default — the first entry of `CI_NETWORK`, or the account's
+   default network under `*`
+
+The resolved network is **stamped into the stored job plan at submit time**, not
+looked up when the job runs. A redelivery therefore runs where the job was
+scheduled, and reassigning a repository mid-build does not move work onto
+hardware that never warmed a VM for it — the same reason the expanded plan is
+stored rather than recomputed.
+
+**A submit naming a network this instance does not serve is refused at the
+client**, with the network and the served list in the message. The alternative is
+a run that exists, jobs on a queue nobody consumes, and no answer to "why is my
+build stuck" short of reading a table.
+
+The assignment is stored as the network's **name**, not its id: a name is what
+`heyvm network create` took, what `uses:` spells, and what the dashboard shows,
+so a hand-written query stays readable. The cost is that renaming a network in
+heyvm orphans the assignment — which surfaces as a refused submit and a warning
+on `/repos`, rather than as a build that quietly moves.
 
 ## The warm VM pool
 
@@ -155,7 +250,7 @@ Stored by app-lb, polled by `ci`. An object points at a repository and a path
 glob — the workflow itself lives in the repository it builds, versioned with the
 code, so the object is a pointer rather than a copy that can drift.
 
-Objects are matched on the **repository**, because `git ci` knows what it is a
+Objects are matched on the **repository**, because `git submit` knows what it is a
 clone of but not what somebody named the object; `git@github.com:me/app.git` and
 `https://github.com/me/app` match. Several objects may name one repository —
 `build` and `nightly` with different globs is legitimate — and each gets its own
@@ -198,7 +293,7 @@ the primary key), `-email`, `-name`. app-lb strips those unconditionally before
 setting them, so they are trustworthy — but only on a gated deployment.
 
 **An app-lb gate admits browsers and nothing else.** The split is
-`Accept: text/html`, so curl, `git ci`, *and a page's own `EventSource`* all get
+`Accept: text/html`, so curl, `git submit`, *and a page's own `EventSource`* all get
 `401 {"error":"authentication required"}`. Hence `public_paths` covers
 `/api/submit` (which verifies its own HMAC) and `/api/stream/` (which carries a
 short-lived, job-scoped token minted by the page that opens it — and that page
@@ -318,7 +413,7 @@ CI_TEST_STREAM_PREFIXES=citest cargo test -- --ignored delete_leftover
 ## Status
 
 Working: workflow parsing and planning (matrix, `needs`, `if`, `max-parallel`),
-runner discovery, the VM pool, the job queue, `git ci`, secrets with masking,
+runner discovery, the VM pool, the job queue, `git submit` with per-repository tokens, secrets with masking,
 disk and `artifacts` sinks, the dashboard with live logs, and workflow objects.
 
 Not built yet:

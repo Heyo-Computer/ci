@@ -23,6 +23,7 @@
 //! this parse.
 
 use crate::config::Config;
+use crate::repos::same_repo;
 use arc_swap::ArcSwap;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -83,39 +84,16 @@ impl WorkflowSet {
 
     /// Every workflow that should build a given repository.
     ///
-    /// Matched on the repository rather than the id, because `git ci` knows what
-    /// repository it is in but not what somebody named the object.
+    /// Matched on the repository rather than the id, because `git submit` knows
+    /// what repository it is in but not what somebody named the object. The
+    /// comparison is [`crate::repos::same_repo`], the same one a submit token is
+    /// scoped by, so "which workflows build this" and "which repository is this
+    /// token for" can never disagree about what one repository is.
     pub fn for_repo<'a>(&'a self, repo: &'a str) -> impl Iterator<Item = &'a Workflow> {
         self.workflows
             .iter()
             .filter(move |w| w.enabled && same_repo(&w.repo, repo))
     }
-}
-
-/// Whether two clone URLs name the same repository.
-///
-/// `git@github.com:me/app.git` and `https://github.com/me/app` are the same
-/// repository written two ways, and a user who registers one and pushes from a
-/// clone of the other should not get "no workflow matched". Compared on the
-/// host-and-path tail with the `.git` suffix and any credentials removed.
-fn same_repo(a: &str, b: &str) -> bool {
-    normalize_repo(a) == normalize_repo(b)
-}
-
-fn normalize_repo(url: &str) -> String {
-    let mut s = url.trim().trim_end_matches('/');
-    // Strip a scheme, then any `user@` — an SSH URL carries one and an HTTPS
-    // clone URL may carry a token.
-    if let Some(idx) = s.find("://") {
-        s = &s[idx + 3..];
-    }
-    if let Some(idx) = s.rfind('@') {
-        s = &s[idx + 1..];
-    }
-    // `github.com:me/app` and `github.com/me/app` are the SSH and HTTPS
-    // spellings of one path.
-    let s = s.replacen(':', "/", 1);
-    s.trim_end_matches(".git").to_ascii_lowercase()
 }
 
 /// Polls app-lb and caches the result.
@@ -286,45 +264,9 @@ mod tests {
         );
     }
 
-    /// The same repository written the SSH way and the HTTPS way must match, or
-    /// a user who registers one spelling and pushes from the other is told no
-    /// workflow exists.
-    #[test]
-    fn the_two_spellings_of_a_clone_url_are_the_same_repository() {
-        for (a, b) in [
-            ("git@github.com:me/app.git", "https://github.com/me/app"),
-            (
-                "https://github.com/me/app.git",
-                "https://github.com/me/app/",
-            ),
-            ("git@github.com:Me/App.git", "https://github.com/me/app"),
-            (
-                // A token in an HTTPS clone URL must not defeat the match.
-                "https://x-token:abc123@github.com/me/app.git",
-                "git@github.com:me/app.git",
-            ),
-        ] {
-            assert!(same_repo(a, b), "{a} should match {b}");
-        }
-    }
-
-    #[test]
-    fn different_repositories_do_not_match() {
-        assert!(!same_repo(
-            "git@github.com:me/app.git",
-            "git@github.com:me/other.git"
-        ));
-        assert!(!same_repo(
-            "git@github.com:me/app.git",
-            "git@gitlab.com:me/app.git"
-        ));
-        // A prefix is not a match: `app` must not match `app2`.
-        assert!(!same_repo(
-            "git@github.com:me/app.git",
-            "git@github.com:me/app2.git"
-        ));
-    }
-
+    /// The two spellings of one clone URL are matched by
+    /// [`crate::repos::same_repo`], which has its own tests; what this asserts
+    /// is that `for_repo` actually uses it, and honours `enabled`.
     #[test]
     fn a_disabled_workflow_is_not_offered_for_its_repository() {
         let set = WorkflowSet {

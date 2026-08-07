@@ -86,10 +86,17 @@ impl Dispatcher {
     /// several matching workflow files produces one run per file, because two
     /// workflows in one repository are two independent answers to "did this
     /// commit pass".
+    ///
+    /// `repo` is the registration the submit token authenticated as, when it
+    /// used one. It is *authority*, not a hint: the caller has already refused
+    /// a payload naming a different repository, so the URL a run is recorded
+    /// against comes from the registration rather than from a field the client
+    /// filled in.
     pub async fn submit(
         &self,
         req: &crate::trigger::SubmitRequest,
         actor: Option<&crate::web::identity::Identity>,
+        repo: Option<&crate::store::Repo>,
     ) -> Result<Vec<String>, DispatchError> {
         let run_seed = crate::vm::new_id();
         let workspace = crate::trigger::Workspace::for_run(&self.config, &run_seed);
@@ -100,14 +107,23 @@ impl Dispatcher {
         let size =
             crate::trigger::materialize(&req.source, &workspace, self.config.max_source_bytes)?;
 
+        // Which repository this is, in one place. A registration's URL is the
+        // canonical spelling and wins over the payload's, which matters for the
+        // client that has no `origin` remote at all: it sends an empty URL, and
+        // without the token nothing downstream could say what was built.
+        let repo_url = match repo {
+            Some(r) => r.url.clone(),
+            None => req.repository.url.clone(),
+        };
+
         // A registered workflow object decides the path glob and the id; without
         // one, the installation-wide default applies. Matching is on the
-        // *repository*, because `git ci` knows what it is a clone of but not
+        // *repository*, because `git submit` knows what it is a clone of but not
         // what somebody named the object.
         let objects = self.objects.snapshot();
         let matched: Vec<crate::objects::Workflow> = match &req.workflow_id {
             Some(id) => objects.find(id).cloned().into_iter().collect(),
-            None => objects.for_repo(&req.repository.url).cloned().collect(),
+            None => objects.for_repo(&repo_url).cloned().collect(),
         };
         if let Some(id) = &req.workflow_id
             && matched.is_empty()
@@ -129,11 +145,29 @@ impl Dispatcher {
         struct Source {
             id: Option<String>,
             pattern: String,
+            /// The network jobs from this source run in when they do not say.
+            network: Option<String>,
         }
         let sources: Vec<Source> = if matched.is_empty() {
             vec![Source {
                 id: None,
-                pattern: self.config.default_workflow_path.clone(),
+                // A registration's assigned network, else the installation
+                // default. This is the whole point of assigning one: a workflow
+                // that says nothing about where it runs still lands somewhere
+                // deliberate rather than wherever this instance happens to
+                // consider first.
+                network: repo
+                    .and_then(|r| r.network.clone())
+                    .filter(|n| !n.trim().is_empty()),
+                // A registration may carry its own glob, for the repository
+                // whose workflows are not where this installation's default
+                // says. A workflow object still wins over it: the object is the
+                // more specific statement, and it is the one that also names a
+                // network and a secrets prefix.
+                pattern: repo
+                    .and_then(|r| r.workflow_path.clone())
+                    .filter(|p| !p.trim().is_empty())
+                    .unwrap_or_else(|| self.config.default_workflow_path.clone()),
             }]
         } else {
             matched
@@ -141,6 +175,13 @@ impl Dispatcher {
                 .map(|w| Source {
                     id: Some(w.id.clone()),
                     pattern: w.path.clone(),
+                    // A workflow object names a network of its own; it is the
+                    // more specific statement, so it wins over the repository's
+                    // assignment, and the assignment fills in when it is blank.
+                    network: Some(w.network.clone())
+                        .filter(|n| !n.trim().is_empty())
+                        .or_else(|| repo.and_then(|r| r.network.clone()))
+                        .filter(|n| !n.trim().is_empty()),
                 })
                 .collect()
         };
@@ -168,8 +209,16 @@ impl Dispatcher {
                     tracing::info!("{path} does not trigger on `submit`; skipping");
                     continue;
                 }
-                let plan = crate::plan::Plan::build(&wf)
+                let mut plan = crate::plan::Plan::build(&wf)
                     .map_err(|e| DispatchError::Workflow(e.to_string()))?;
+
+                // Resolved once, here, and written into every job that did not
+                // name a network with `uses:`. The plan is persisted on the job
+                // row and is what a redelivery executes, so a job runs in the
+                // network it was scheduled for even if the repository is
+                // reassigned mid-build — the same reason the expanded plan is
+                // stored rather than recomputed.
+                self.assign_network(&mut plan, source.network.as_deref())?;
 
                 // The first run reuses the workspace already materialized under
                 // the seed id; the rest get their own copy of the same archive,
@@ -191,8 +240,12 @@ impl Dispatcher {
                                 .id
                                 .clone()
                                 .or_else(|| req.workflow_id.clone())
-                                .unwrap_or_else(|| req.repository.name.clone()),
-                            repo_url: req.repository.url.clone(),
+                                .unwrap_or_else(|| match repo {
+                                    Some(r) => r.name.clone(),
+                                    None => req.repository.name.clone(),
+                                }),
+                            repo_id: repo.map(|r| r.id.clone()),
+                            repo_url: repo_url.clone(),
                             git_ref: req.r#ref.clone(),
                             sha: req.after.clone(),
                             before_sha: req.before.clone(),
@@ -354,6 +407,64 @@ impl Dispatcher {
             .map_err(|e| DispatchError::Condition(e.to_string()))
     }
 
+    /// Stamp the run's network onto every job that does not name one, and refuse
+    /// the submit if the result is a network this instance cannot dispatch to.
+    ///
+    /// Refusing *here* is the point. Without it the run is created, the jobs go
+    /// to a queue nobody consumes, and the answer to "why is my build stuck" is
+    /// a row in a table nobody thinks to look at. A submit that cannot run is an
+    /// error at the client, naming the network and what is actually served.
+    fn assign_network(
+        &self,
+        plan: &mut crate::plan::Plan,
+        default_network: Option<&str>,
+    ) -> Result<(), DispatchError> {
+        let pool = self.runners.snapshot();
+        for job in &mut plan.jobs {
+            if job.target.network.is_none()
+                && let Some(net) = default_network
+            {
+                job.target.network = Some(net.to_string());
+            }
+            // Resolve to the canonical name so the stored plan and the job row
+            // both say what the dashboard says, rather than whichever of an id
+            // and a name somebody typed.
+            let set = Self::network_of(&pool, job)?;
+            job.target.network = Some(set.network_name.clone());
+        }
+        Ok(())
+    }
+
+    /// The network a job runs in, resolved against the served pool.
+    ///
+    /// `plan.target.network` is set by `uses:` or, when the workflow does not
+    /// say, stamped in at submit time from the repository's assignment. So by
+    /// the time a job is routed the network is already decided — this only has
+    /// to find it, and say so clearly when it is not something this instance
+    /// serves.
+    fn network_of<'a>(
+        pool: &'a crate::runners::Pool,
+        plan: &JobPlan,
+    ) -> Result<&'a crate::runners::RunnerSet, DispatchError> {
+        let Some(wanted) = plan.target.network.as_deref().map(str::trim) else {
+            return pool.default_set().ok_or(DispatchError::NoNetwork);
+        };
+        match pool.find(wanted) {
+            Some(set) if set.served => Ok(set),
+            // The distinction is worth the extra variant: a network that exists
+            // but is not served is a `CI_NETWORK` change, while one that does
+            // not exist is a typo or a network somebody deleted.
+            Some(set) => Err(DispatchError::UnservedNetwork {
+                wanted: set.network_name.clone(),
+                served: pool.served_names(),
+            }),
+            None => Err(DispatchError::UnknownNetwork {
+                wanted: wanted.to_string(),
+                served: pool.served_names(),
+            }),
+        }
+    }
+
     /// Which queue a job goes on.
     ///
     /// A pinned job goes to its host's queue **even when that host is offline**,
@@ -361,7 +472,8 @@ impl Dispatcher {
     /// host-local, so silently moving the job discards the cache the pin asked
     /// for. The job waits in that host's queue and the dashboard shows why.
     async fn route_for(&self, plan: &JobPlan) -> Result<Route, DispatchError> {
-        let set = self.runners.snapshot();
+        let pool = self.runners.snapshot();
+        let set = Self::network_of(&pool, plan)?;
 
         if let Some(wanted) = &plan.target.runner {
             match set.find(wanted) {
@@ -369,6 +481,7 @@ impl Dispatcher {
                 None if plan.fallback == Fallback::Any => {
                     tracing::warn!(
                         runner = wanted,
+                        network = set.network_name,
                         "no such runner in this network; falling back to any host \
                          because the job set `fallback: any`"
                     );
@@ -469,9 +582,10 @@ impl Dispatcher {
         Ok(status)
     }
 
-    /// Resolve the plan's target to a concrete, online runner.
+    /// Resolve the plan's target to a concrete, online runner in its network.
     async fn pick_runner(&self, plan: &JobPlan) -> Result<String, DispatchError> {
-        let set = self.runners.snapshot();
+        let pool = self.runners.snapshot();
+        let set = Self::network_of(&pool, plan)?;
         if let Some(wanted) = &plan.target.runner
             && let Some(r) = set.find(wanted)
         {
@@ -1132,12 +1246,13 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route, max_job: Duration) {
 }
 
 impl Dispatcher {
-    /// Keep one consumer task per online runner, plus one for the network's
+    /// Keep one consumer task per online runner, plus one per served network's
     /// unpinned queue.
     ///
     /// Reconciled on a ticker because the runner set changes underneath us: a
-    /// host joins the network, or comes back after a reboot, and its queue needs
-    /// an owner without restarting the process.
+    /// host joins a network, or comes back after a reboot, and its queue needs
+    /// an owner without restarting the process. A network added to the account —
+    /// or brought into `CI_NETWORK=*`'s scope — is picked up the same way.
     pub fn spawn_consumers(self: Arc<Self>) {
         let interval = self.config.heyvm.refresh_interval;
         // The longest job any consumer might see bounds `ack_wait`. Derived from
@@ -1152,15 +1267,20 @@ impl Dispatcher {
 
             loop {
                 ticker.tick().await;
-                let set = self.runners.snapshot();
+                let pool = self.runners.snapshot();
 
-                let mut wanted: Vec<Route> = set
-                    .dispatchable()
-                    .map(|r| Route::Runner(r.id.clone()))
-                    .collect();
-                if !set.network_id.is_empty() {
-                    wanted.push(Route::Network(set.network_id.clone()));
+                let mut wanted: Vec<Route> = Vec::new();
+                for set in pool.served() {
+                    wanted.extend(set.dispatchable().map(|r| Route::Runner(r.id.clone())));
+                    if !set.network_id.is_empty() {
+                        wanted.push(Route::Network(set.network_id.clone()));
+                    }
                 }
+                // A host may be a member of two networks, which is legitimate —
+                // but two consumers on one runner subject would fight over the
+                // same messages.
+                wanted.sort_by_key(|r| format!("{r:?}"));
+                wanted.dedup_by_key(|r| format!("{r:?}"));
 
                 for route in wanted {
                     let key = format!("{route:?}");
@@ -1182,8 +1302,8 @@ impl Dispatcher {
 
     /// Reclaim VMs left claimed by jobs that died with a previous process.
     pub async fn reclaim_pool(&self) -> Result<(), DispatchError> {
-        let set = self.runners.snapshot();
-        let ours: Vec<String> = set.runners.iter().map(|r| r.id.clone()).collect();
+        let pool = self.runners.snapshot();
+        let ours: Vec<String> = pool.all_runners().map(|r| r.id.clone()).collect();
         let released = self.pool.release_orphans(&ours).await?;
         if released > 0 {
             tracing::info!("released {released} VM(s) held by jobs that are no longer running");
@@ -1251,6 +1371,18 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// A comma-separated list, or a phrase saying there is nothing to list.
+///
+/// "Currently serving: " followed by nothing reads as a truncated message, and
+/// an empty served set is exactly the state someone needs told plainly.
+fn or_none(items: &[String]) -> String {
+    if items.is_empty() {
+        "nothing — no network in CI_NETWORK resolved".to_string()
+    } else {
+        items.join(", ")
+    }
+}
+
 #[derive(Debug)]
 pub enum DispatchError {
     Store(crate::store::StoreError),
@@ -1271,6 +1403,16 @@ pub enum DispatchError {
     },
     NoOnlineRunner(String),
     NoNetwork,
+    /// The network exists on the account but this instance does not serve it.
+    UnservedNetwork {
+        wanted: String,
+        served: Vec<String>,
+    },
+    /// No network on the account answers to that name.
+    UnknownNetwork {
+        wanted: String,
+        served: Vec<String>,
+    },
     StepFailed(String),
     Checkout(String),
     Secrets(String),
@@ -1330,6 +1472,19 @@ impl std::fmt::Display for DispatchError {
                 "the runner pool has not resolved a network yet; check CI_NETWORK \
                  and the heyvm control plane"
             ),
+            Self::UnservedNetwork { wanted, served } => write!(
+                f,
+                "network {wanted:?} exists, but this orchestrator does not take work \
+                 for it. Add it to CI_NETWORK (or set CI_NETWORK=*). Currently \
+                 serving: {}",
+                or_none(served)
+            ),
+            Self::UnknownNetwork { wanted, served } => write!(
+                f,
+                "no heyvm network is named {wanted:?}. Check the job's `uses:` or the \
+                 repository's assigned network on /repos. Currently serving: {}",
+                or_none(served)
+            ),
             Self::StepFailed(r) => write!(f, "{r}"),
             Self::Checkout(r) => write!(f, "checkout failed: {r}"),
             Self::Secrets(r) => write!(f, "{r}"),
@@ -1371,6 +1526,124 @@ mod tests {
             stderr: String::new(),
             exit_code: exit,
         }
+    }
+
+    // ---- network resolution ---------------------------------------------
+
+    fn test_pool() -> crate::runners::Pool {
+        use crate::runners::{Runner, RunnerSet, RunnerStatus};
+        let host = |id: &str| Runner {
+            id: id.into(),
+            name: id.into(),
+            status: RunnerStatus::Online,
+            last_seen_at: None,
+        };
+        crate::runners::Pool {
+            networks: vec![
+                RunnerSet {
+                    network_id: "net-1".into(),
+                    network_name: "prod-runners".into(),
+                    is_default: true,
+                    served: true,
+                    runners: vec![host("hd-1")],
+                },
+                RunnerSet {
+                    network_id: "net-2".into(),
+                    network_name: "lab".into(),
+                    is_default: false,
+                    served: false,
+                    runners: vec![host("hd-2")],
+                },
+            ],
+            unjoined: vec![],
+            last_error: None,
+            default_network_id: "net-1".into(),
+        }
+    }
+
+    /// A real one-job plan, built from a workflow rather than hand-assembled,
+    /// so what is asserted about `uses:` is what `uses:` actually produces.
+    fn plan_targeting(network: Option<&str>) -> JobPlan {
+        let uses = match network {
+            Some(n) => format!("    uses: \"{n}\"\n"),
+            None => String::new(),
+        };
+        let yaml = format!(
+            "name: t\njobs:\n  build:\n{uses}    vm: {{ driver: firecracker }}\n    \
+             steps: [{{ run: \"true\" }}]\n"
+        );
+        let wf = crate::workflow::Workflow::parse("t.yml", &yaml).expect("workflow parses");
+        crate::plan::Plan::build(&wf)
+            .expect("plan builds")
+            .jobs
+            .remove(0)
+    }
+
+    /// A job with no network runs in the default one — which is what makes a
+    /// workflow that says nothing about hardware still land somewhere chosen.
+    #[test]
+    fn a_job_naming_no_network_lands_in_the_default() {
+        let pool = test_pool();
+        let set = Dispatcher::network_of(&pool, &plan_targeting(None)).expect("resolves");
+        assert_eq!(set.network_id, "net-1");
+    }
+
+    /// Either spelling, because `uses:` and a repository assignment are both
+    /// written by hand.
+    #[test]
+    fn a_job_naming_a_served_network_by_id_or_name_resolves_to_it() {
+        let pool = test_pool();
+        for spelling in ["prod-runners", "net-1", "PROD-Runners", " prod-runners "] {
+            let set = Dispatcher::network_of(&pool, &plan_targeting(Some(spelling)))
+                .unwrap_or_else(|e| panic!("{spelling:?}: {e}"));
+            assert_eq!(set.network_id, "net-1");
+        }
+    }
+
+    /// The two failures a person actually hits, told apart — one is a
+    /// `CI_NETWORK` change and the other is a typo, and the same message for
+    /// both sends them to the wrong file.
+    #[test]
+    fn an_unserved_network_and_an_unknown_one_are_different_errors() {
+        let pool = test_pool();
+
+        let err = Dispatcher::network_of(&pool, &plan_targeting(Some("lab"))).unwrap_err();
+        assert!(
+            matches!(err, DispatchError::UnservedNetwork { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("CI_NETWORK"), "{err}");
+        assert!(
+            err.to_string().contains("prod-runners"),
+            "names what is served: {err}"
+        );
+
+        let err = Dispatcher::network_of(&pool, &plan_targeting(Some("nope"))).unwrap_err();
+        assert!(
+            matches!(err, DispatchError::UnknownNetwork { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("nope"), "{err}");
+    }
+
+    /// A pool that has resolved nothing must refuse rather than pick, or a
+    /// submit during a cloud outage is accepted onto a queue with no consumer.
+    #[test]
+    fn an_empty_pool_refuses_rather_than_guessing() {
+        let pool = crate::runners::Pool::default();
+        let err = Dispatcher::network_of(&pool, &plan_targeting(None)).unwrap_err();
+        assert!(matches!(err, DispatchError::NoNetwork), "{err:?}");
+
+        // And the "nothing is served" case says so in words rather than
+        // trailing off after a colon.
+        let err = DispatchError::UnservedNetwork {
+            wanted: "lab".into(),
+            served: vec![],
+        };
+        assert!(
+            err.to_string().contains("no network in CI_NETWORK"),
+            "{err}"
+        );
     }
 
     /// The step's own exit code has to survive the trailing `cat`, or every

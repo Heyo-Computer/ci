@@ -10,8 +10,8 @@
 //! later, and a dashboard that needs a CDN is a dashboard that is blank exactly
 //! when someone is debugging.
 
-use crate::runners::{Runner, RunnerSet, RunnerStatus};
-use crate::store::{ArtifactRow, JobRow, Run, StepRow};
+use crate::runners::{Pool, Runner, RunnerSet, RunnerStatus};
+use crate::store::{ArtifactRow, JobRow, Repo, RepoToken, Run, StepRow};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use std::time::Duration;
 
@@ -93,6 +93,37 @@ pre.log:empty::after { content: "(no output)"; color: var(--muted); }
 .dag { display: flex; flex-direction: column; gap: 0.35rem; }
 .dag .wave { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
 .dag .needs { color: var(--muted); font-size: 0.8rem; }
+.notice {
+  padding: 0.7rem 0.9rem; border-radius: 6px; margin-bottom: 1.25rem;
+  background: var(--card); border-left: 3px solid var(--ok); font-size: 0.9rem;
+}
+form.row { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: flex-end; }
+form.row label { display: flex; flex-direction: column; gap: 0.2rem;
+  font-size: 0.8rem; color: var(--muted); }
+input[type=text], select {
+  font: inherit; font-size: 0.85rem; padding: 0.35rem 0.5rem; min-width: 16rem;
+  border: 1px solid var(--line); border-radius: 5px;
+  background: var(--bg); color: var(--fg);
+}
+button {
+  font: inherit; font-size: 0.85rem; padding: 0.38rem 0.8rem; cursor: pointer;
+  border: 1px solid var(--line); border-radius: 5px;
+  background: var(--card); color: var(--fg);
+}
+button:hover { border-color: var(--accent); color: var(--accent); }
+button.quiet { background: none; border-color: transparent; color: var(--muted); }
+button.quiet:hover { color: var(--bad); border-color: var(--line); }
+.repo { border: 1px solid var(--line); border-radius: 6px; padding: 0.9rem 1rem;
+  margin-bottom: 0.9rem; }
+.repo h3 { margin: 0 0 0.15rem; font-size: 0.95rem; font-weight: 650; }
+.repo .head { display: flex; align-items: baseline; gap: 0.6rem; }
+.repo .head form { margin-left: auto; }
+.secret {
+  margin: 0.5rem 0 0; padding: 0.6rem 0.8rem; border-radius: 6px;
+  background: var(--card); border: 1px dashed var(--warn);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.82rem;
+  white-space: pre-wrap; word-break: break-all; user-select: all;
+}
 "#;
 
 /// Chrome shared by every page.
@@ -114,8 +145,9 @@ pub fn layout(app_name: &str, current: &str, who: Option<&str>, body: Markup) ->
                     h1 { (app_name) }
                     nav {
                         a href="/" class=[(current == "runs").then_some("on")] { "Runs" }
-                        a href="/runners" class=[(current == "runners").then_some("on")] { "Runners" }
+                        a href="/networks" class=[(current == "networks").then_some("on")] { "Networks" }
                         a href="/workflows" class=[(current == "workflows").then_some("on")] { "Workflows" }
+                        a href="/repos" class=[(current == "repos").then_some("on")] { "Repositories" }
                     }
                     @if let Some(who) = who {
                         span .who { (who) }
@@ -144,10 +176,65 @@ fn runner_rows(runners: &[Runner]) -> Markup {
     }
 }
 
-/// `GET /runners` — the pool, and why anything missing is missing.
-pub fn runners_page(app_name: &str, who: Option<&str>, set: &RunnerSet) -> Markup {
+fn runner_table(runners: &[Runner]) -> Markup {
+    html! {
+        div .scroll {
+            table {
+                thead { tr { th { "Name" } th { "Daemon" } th { "Status" } th { "Last seen" } } }
+                tbody { (runner_rows(runners)) }
+            }
+        }
+    }
+}
+
+/// One network and the hosts in it.
+fn network_section(set: &RunnerSet, default_id: &str) -> Markup {
+    html! {
+        div .repo {
+            div .head {
+                h3 { (set.network_name) }
+                @if set.served {
+                    span .pill.success { "serving" }
+                } @else {
+                    span .pill.cancelled { "not served" }
+                }
+                @if set.network_id == default_id {
+                    span .pill.queued { "default" }
+                }
+                @if set.is_default {
+                    span .meta { "heyvm default" }
+                }
+            }
+            p .meta {
+                code .mono { (set.network_id) }
+                " · " (set.dispatchable().count()) " of " (set.runners.len())
+                " host(s) can take work"
+            }
+            @if set.runners.is_empty() {
+                p .empty {
+                    "No host has joined this network. On the machine you want to build on, run "
+                    code .mono { "heyvmd" } " and then " code .mono { "heyvm network add-host" } "."
+                }
+            } @else {
+                (runner_table(&set.runners))
+            }
+            @if !set.served {
+                p .meta {
+                    "This orchestrator does not take work for this network, so a repository \
+                     assigned to it would have its submits refused. Add it to "
+                    code .mono { "CI_NETWORK" } ", or set " code .mono { "CI_NETWORK=*" } "."
+                }
+            }
+        }
+    }
+}
+
+/// `GET /networks` — every network on the account, the hosts in each, and which
+/// of them this orchestrator builds for.
+pub fn networks_page(app_name: &str, who: Option<&str>, pool: &Pool) -> Markup {
+    let served = pool.served().count();
     let body = html! {
-        @if let Some(err) = &set.last_error {
+        @if let Some(err) = &pool.last_error {
             div .banner {
                 strong { "The runner pool is stale. " }
                 (err)
@@ -155,63 +242,48 @@ pub fn runners_page(app_name: &str, who: Option<&str>, set: &RunnerSet) -> Marku
         }
 
         section {
-            h2 { "Runners" }
+            h2 { "Networks" }
             p .sub {
-                @if set.network_name.is_empty() {
-                    "No network has been resolved yet."
-                } @else {
-                    "Hosts in network " code .mono { (set.network_name) }
-                    " (" code .mono { (set.network_id) } "). "
-                    (set.dispatchable().count()) " of " (set.runners.len()) " can take work."
+                "Every heyvm network on this account. " (served) " of " (pool.networks.len())
+                " are served by this orchestrator — a job may only run in one that is, and a \
+                 repository is assigned one on "
+                a href="/repos" { "Repositories" } "."
+            }
+            @if pool.networks.is_empty() {
+                p .empty {
+                    "This account has no network. Create one with "
+                    code .mono { "heyvm network create" } ", then join a host to it with "
+                    code .mono { "heyvm network add-host" } "."
                 }
             }
-            @if set.runners.is_empty() {
-                p .empty {
-                    "No host has joined this network. On the machine you want to build on, run "
-                    code .mono { "heyvmd" }
-                    " and then "
-                    code .mono { "heyvm network add-host" }
-                    "."
-                }
-            } @else {
-                div .scroll {
-                    table {
-                        thead { tr { th { "Name" } th { "Daemon" } th { "Status" } th { "Last seen" } } }
-                        tbody { (runner_rows(&set.runners)) }
-                    }
-                }
+            @for set in &pool.networks {
+                (network_section(set, &pool.default_network_id))
             }
         }
 
         // Shown because "my machine isn't in the list" is otherwise a dead end:
-        // a registered daemon that never joined the network looks identical to
-        // one that was never registered at all.
-        @if !set.unjoined.is_empty() {
+        // a registered daemon that never joined a network looks identical to one
+        // that was never registered at all.
+        @if !pool.unjoined.is_empty() {
             section {
-                h2 { "Registered but not in this network" }
+                h2 { "Registered but in no network" }
                 p .sub {
-                    "These daemons belong to this account but have not joined "
-                    code .mono { (set.network_name) }
-                    ", so they cannot take work. Add one with "
+                    "These daemons belong to this account but have joined no network at all, \
+                     so nothing can dispatch to them. Add one with "
                     code .mono { "heyvm network add-host" } "."
                 }
-                div .scroll {
-                    table {
-                        thead { tr { th { "Name" } th { "Daemon" } th { "Status" } th { "Last seen" } } }
-                        tbody { (runner_rows(&set.unjoined)) }
-                    }
-                }
+                (runner_table(&pool.unjoined))
             }
         }
     };
-    layout(app_name, "runners", who, body)
+    layout(app_name, "networks", who, body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn runner(id: &str, name: &str, status: RunnerStatus) -> Runner {
+    pub(super) fn runner(id: &str, name: &str, status: RunnerStatus) -> Runner {
         Runner {
             id: id.into(),
             name: name.into(),
@@ -220,54 +292,80 @@ mod tests {
         }
     }
 
-    fn populated() -> RunnerSet {
-        RunnerSet {
-            network_id: "net-1".into(),
-            network_name: "prod-runners".into(),
-            runners: vec![
-                runner("hd-1", "bigbox", RunnerStatus::Online),
-                runner("hd-2", "oldbox", RunnerStatus::Stale),
+    pub(super) fn populated() -> Pool {
+        Pool {
+            networks: vec![
+                RunnerSet {
+                    network_id: "net-1".into(),
+                    network_name: "prod-runners".into(),
+                    is_default: true,
+                    served: true,
+                    runners: vec![
+                        runner("hd-1", "bigbox", RunnerStatus::Online),
+                        runner("hd-2", "oldbox", RunnerStatus::Stale),
+                    ],
+                },
+                RunnerSet {
+                    network_id: "net-2".into(),
+                    network_name: "lab".into(),
+                    is_default: false,
+                    served: false,
+                    runners: vec![runner("hd-3", "benchbox", RunnerStatus::Online)],
+                },
             ],
             unjoined: vec![runner("hd-9", "laptop", RunnerStatus::Online)],
             last_error: None,
+            default_network_id: "net-1".into(),
         }
     }
 
     #[test]
-    fn the_page_lists_every_runner_with_its_status() {
-        let html = runners_page("ci", Some("Sam Currie"), &populated()).into_string();
+    fn the_page_lists_every_network_and_its_runners() {
+        let html = networks_page("ci", Some("Sam Currie"), &populated()).into_string();
+        assert!(html.contains("prod-runners"));
+        assert!(html.contains("lab"), "an unserved network is still listed");
         assert!(html.contains("bigbox"));
+        assert!(html.contains("benchbox"));
         assert!(html.contains("hd-1"));
         assert!(html.contains(r#"class="pill online""#));
         assert!(html.contains(r#"class="pill stale""#));
-        assert!(html.contains("1 of 2 can take work"));
+        assert!(html.contains("1 of 2 host(s) can take work"));
         assert!(html.contains("Sam Currie"));
+    }
+
+    /// The distinction the whole page turns on: a network this instance builds
+    /// for, versus one that merely exists.
+    #[test]
+    fn served_and_unserved_networks_are_told_apart_with_the_fix_named() {
+        let html = networks_page("ci", None, &populated()).into_string();
+        assert!(html.contains("serving"));
+        assert!(html.contains("not served"));
+        assert!(html.contains("CI_NETWORK"), "and what to do about it");
     }
 
     /// An unjoined daemon is the single most common "why is nothing running"
     /// cause, so the page must name it and the command that fixes it.
     #[test]
     fn unjoined_daemons_get_their_own_section_naming_the_fix() {
-        let html = runners_page("ci", None, &populated()).into_string();
-        assert!(html.contains("Registered but not in this network"));
+        let html = networks_page("ci", None, &populated()).into_string();
+        assert!(html.contains("Registered but in no network"));
         assert!(html.contains("laptop"));
         assert!(html.contains("heyvm network add-host"));
     }
 
     #[test]
-    fn an_empty_pool_explains_how_to_add_one() {
-        let html = runners_page("ci", None, &RunnerSet::default()).into_string();
-        assert!(html.contains("No host has joined this network"));
-        assert!(html.contains("heyvmd"));
-        assert!(!html.contains("Registered but not in this network"));
+    fn an_empty_account_explains_how_to_add_a_network() {
+        let html = networks_page("ci", None, &Pool::default()).into_string();
+        assert!(html.contains("heyvm network create"));
+        assert!(!html.contains("Registered but in no network"));
     }
 
     /// A refresh failure must not render as an empty-but-healthy pool.
     #[test]
     fn a_stale_snapshot_says_so() {
-        let mut set = populated();
-        set.last_error = Some("heyvm control plane: GET /networks: timeout".into());
-        let html = runners_page("ci", None, &set).into_string();
+        let mut pool = populated();
+        pool.last_error = Some("heyvm control plane: GET /networks: timeout".into());
+        let html = networks_page("ci", None, &pool).into_string();
         assert!(html.contains("The runner pool is stale"));
         assert!(html.contains("GET /networks: timeout"));
     }
@@ -276,7 +374,7 @@ mod tests {
     /// — "a token is not a person".
     #[test]
     fn an_anonymous_request_renders_no_identity() {
-        let html = runners_page("ci", None, &populated()).into_string();
+        let html = networks_page("ci", None, &populated()).into_string();
         assert!(!html.contains(r#"class="who""#));
     }
 
@@ -284,9 +382,9 @@ mod tests {
     /// from a daemon's self-reported hostname.
     #[test]
     fn a_hostile_runner_name_is_escaped() {
-        let mut set = populated();
-        set.runners[0].name = "<script>alert(1)</script>".into();
-        let html = runners_page("ci", None, &set).into_string();
+        let mut pool = populated();
+        pool.networks[0].runners[0].name = "<script>alert(1)</script>".into();
+        let html = networks_page("ci", None, &pool).into_string();
         assert!(!html.contains("<script>alert(1)</script>"));
         assert!(html.contains("&lt;script&gt;"));
     }
@@ -335,8 +433,10 @@ pub fn runs_page(app_name: &str, who: Option<&str>, runs: &[Run]) -> Markup {
             h2 { "Runs" }
             @if runs.is_empty() {
                 p .empty {
-                    "Nothing has been submitted yet. From a repository with "
-                    code .mono { ".ci/workflows/*.yml" } ", run " code .mono { "git ci" } "."
+                    "Nothing has been submitted yet. Register a repository on "
+                    a href="/repos" { "Repositories" }
+                    " for a token, then from a clone with "
+                    code .mono { ".ci/workflows/*.yml" } " run " code .mono { "git submit" } "."
                 }
             } @else {
                 div .scroll {
@@ -658,7 +758,7 @@ pub fn workflows_page(
             @if workflows.is_empty() {
                 p .empty {
                     "Nothing has been submitted yet, so no workflow is known. Run "
-                    code .mono { "git ci" } " from a repository that has one."
+                    code .mono { "git submit" } " from a repository that has one."
                 }
             } @else {
                 div .scroll {
@@ -691,9 +791,280 @@ pub fn workflows_page(
     layout(app_name, "workflows", who, body)
 }
 
+// ---- registered repositories --------------------------------------------
+
+/// One repository as the page needs it: the registration, its tokens, and how
+/// its last build went.
+pub struct RepoView {
+    pub repo: Repo,
+    pub tokens: Vec<RepoToken>,
+    pub last_run: Option<Run>,
+}
+
+/// What just happened, rendered on the response to the POST that did it.
+#[derive(Default)]
+pub struct RepoFlash {
+    pub ok: Option<String>,
+    pub error: Option<String>,
+    /// `(repository name, the token)`. Shown exactly once — nothing stores the
+    /// plaintext, so there is no route that could show it again.
+    pub token: Option<(String, String)>,
+}
+
+impl RepoFlash {
+    pub fn done(message: impl Into<String>) -> Self {
+        Self {
+            ok: Some(message.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            error: Some(message.into()),
+            ..Self::default()
+        }
+    }
+
+    pub fn minted(repo_name: String, token: String) -> Self {
+        Self {
+            token: Some((repo_name, token)),
+            ..Self::default()
+        }
+    }
+}
+
+/// The two lines that point a clone at this installation.
+fn setup_lines(endpoint: &str, token: &str) -> String {
+    format!("git config ci.endpoint {endpoint}\ngit config ci.token {token}")
+}
+
+/// A network picker listing only what this orchestrator can dispatch to.
+///
+/// Unserved networks are deliberately absent rather than shown-and-disabled: a
+/// choice that cannot be made is not a choice, and `/networks` is where the
+/// question "why is that one missing" is answered properly.
+fn network_options(pool: &Pool, selected: Option<&str>) -> Markup {
+    let default_name = pool
+        .default_set()
+        .map(|s| s.network_name.as_str())
+        .unwrap_or("none resolved");
+    html! {
+        option value="" selected[selected.is_none()] {
+            "Default (" (default_name) ")"
+        }
+        @for set in pool.served() {
+            option value=(set.network_name)
+                   selected[selected.is_some_and(|s| set.matches(s))] {
+                (set.network_name)
+                @if set.dispatchable().count() == 0 { " — no host online" }
+            }
+        }
+    }
+}
+
+fn token_rows(tokens: &[RepoToken]) -> Markup {
+    html! {
+        @for t in tokens {
+            tr {
+                // The key id, not the token: it is the half that is not secret,
+                // and it is what a submit's log line names.
+                td .mono { (t.id) }
+                td {
+                    (if t.name.is_empty() { "—" } else { t.name.as_str() })
+                    @if let Some(by) = &t.created_email {
+                        span .meta { " · minted by " (by) }
+                    }
+                }
+                td .mono { (t.created_at.format("%Y-%m-%d").to_string()) }
+                td .mono {
+                    @match t.last_used_at {
+                        Some(at) => (at.format("%Y-%m-%d %H:%M").to_string()),
+                        None => ("never".to_string()),
+                    }
+                }
+                td {
+                    @if t.is_active() {
+                        span .pill.success { "active" }
+                    } @else {
+                        span .pill.cancelled { "revoked" }
+                    }
+                }
+                td {
+                    @if t.is_active() {
+                        form method="post"
+                             action={ "/repos/" (t.repo_id) "/tokens/" (t.id) "/revoke" } {
+                            button .quiet type="submit" { "Revoke" }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `GET /repos` — what may submit, and with what.
+pub fn repos_page(
+    app_name: &str,
+    who: Option<&str>,
+    repos: &[RepoView],
+    endpoint: &str,
+    require_token: bool,
+    pool: &Pool,
+    flash: &RepoFlash,
+) -> Markup {
+    let body = html! {
+        @if let Some(err) = &flash.error {
+            div .banner { (err) }
+        }
+        @if let Some(ok) = &flash.ok {
+            div .notice { (ok) }
+        }
+        @if let Some((repo_name, token)) = &flash.token {
+            div .notice {
+                strong { "A new submit token for " (repo_name) "." }
+                " This is the only time it is shown — nothing here stores it, only its \
+                 digest. Run these two lines in a clone of that repository:"
+                pre .secret { (setup_lines(endpoint, token)) }
+                "Then " code .mono { "git submit" } " builds it."
+            }
+        }
+
+        section {
+            h2 { "Repositories" }
+            p .sub {
+                "A registered repository submits with its own tokens, each revocable on \
+                 its own. The token says which repository a submit is for, so one \
+                 repository's credential cannot start a build of another's workflow."
+                @if require_token {
+                    " " strong { "CI_REQUIRE_REPO_TOKEN is set" }
+                    ", so a token is the only way to submit."
+                } @else {
+                    " The shared " code .mono { "CI_WEBHOOK_SECRET" } " still submits too, \
+                      until CI_REQUIRE_REPO_TOKEN is set."
+                }
+            }
+
+            form .row method="post" action="/repos" {
+                label {
+                    "Clone URL"
+                    input type="text" name="url" required
+                          placeholder="git@github.com:me/app.git";
+                }
+                label {
+                    "Name (optional)"
+                    input type="text" name="name" placeholder="me/app";
+                }
+                label {
+                    "Workflow path (optional)"
+                    input type="text" name="workflow_path" placeholder=".ci/workflows/*.yml";
+                }
+                label {
+                    "Network"
+                    select name="network" { (network_options(pool, None)) }
+                }
+                button type="submit" { "Register" }
+            }
+        }
+
+        section {
+            @if repos.is_empty() {
+                p .empty {
+                    "No repository is registered. Until one is, " code .mono { "git submit" }
+                    " signs with the installation-wide " code .mono { "CI_WEBHOOK_SECRET" }
+                    " — a credential that cannot be revoked for one repository and cannot \
+                      say which repository is submitting."
+                }
+            }
+            @for view in repos {
+                div .repo {
+                    div .head {
+                        h3 { (view.repo.name) }
+                        @if !view.repo.enabled {
+                            span .pill.cancelled { "paused" }
+                        }
+                        @if let Some(run) = &view.last_run {
+                            a href={ "/runs/" (run.id) } { (pill(&run.status)) }
+                        }
+                        form method="post" action={ "/repos/" (view.repo.id) "/enabled" } {
+                            input type="hidden" name="enabled"
+                                  value=(if view.repo.enabled { "false" } else { "true" });
+                            button .quiet type="submit" {
+                                (if view.repo.enabled { "Pause" } else { "Resume" })
+                            }
+                        }
+                        form method="post" action={ "/repos/" (view.repo.id) "/delete" } {
+                            button .quiet type="submit" { "Remove" }
+                        }
+                    }
+                    p .meta {
+                        code .mono { (view.repo.url) }
+                        @if let Some(path) = &view.repo.workflow_path {
+                            " · " code .mono { (path) }
+                        }
+                        @if let Some(by) = &view.repo.created_email {
+                            " · registered by " (by)
+                        }
+                        " · " (view.repo.created_at.format("%Y-%m-%d").to_string())
+                    }
+
+                    form .row method="post" action={ "/repos/" (view.repo.id) "/network" } {
+                        label {
+                            "Builds run in"
+                            select name="network" {
+                                (network_options(pool, view.repo.network.as_deref()))
+                            }
+                        }
+                        button type="submit" { "Assign" }
+                    }
+                    // A network that was assigned and has since been renamed,
+                    // deleted or dropped from CI_NETWORK. Left visible rather
+                    // than silently reset, because the fix is a decision.
+                    @if let Some(assigned) = &view.repo.network
+                        && !pool.served().any(|s| s.matches(assigned))
+                    {
+                        p .meta {
+                            "⚠ Assigned to " code .mono { (assigned) }
+                            ", which this orchestrator does not serve — submits for this \
+                             repository are refused until it is reassigned or added to "
+                            code .mono { "CI_NETWORK" } "."
+                        }
+                    }
+
+                    @if view.tokens.is_empty() {
+                        p .empty { "No token yet, so nothing can submit as this repository." }
+                    } @else {
+                        div .scroll {
+                            table {
+                                thead { tr {
+                                    th { "Key" } th { "For" } th { "Created" }
+                                    th { "Last used" } th { "Status" } th { }
+                                } }
+                                tbody { (token_rows(&view.tokens)) }
+                            }
+                        }
+                    }
+
+                    form .row method="post" action={ "/repos/" (view.repo.id) "/tokens" } {
+                        label {
+                            "New token for"
+                            input type="text" name="name" placeholder="sam's laptop";
+                        }
+                        button type="submit" { "Mint" }
+                    }
+                }
+            }
+        }
+    };
+    layout(app_name, "repos", who, body)
+}
+
 #[cfg(test)]
 mod page_tests {
     use super::*;
+    // The networks fixture, reused so the repositories page is exercised
+    // against the same pool the networks page renders.
+    use super::tests::populated;
     use chrono::Utc;
 
     fn run(status: &str) -> Run {
@@ -768,7 +1139,11 @@ mod page_tests {
     #[test]
     fn an_empty_dashboard_says_how_to_start() {
         let html = runs_page("ci", None, &[]).into_string();
-        assert!(html.contains("git ci"));
+        assert!(html.contains("git submit"));
+        assert!(
+            html.contains("/repos"),
+            "and where the credential comes from"
+        );
     }
 
     #[test]
@@ -947,5 +1322,124 @@ mod page_tests {
         assert!(html.contains("other"));
         assert!(html.contains("never"));
         assert!(html.contains(".ci/workflows/*.yml"));
+    }
+
+    // ---- repositories ---------------------------------------------------
+
+    fn repo_view(enabled: bool, revoked: bool) -> RepoView {
+        RepoView {
+            repo: Repo {
+                id: "019fca648a6e-00000001".into(),
+                url: "git@github.com:me/app.git".into(),
+                normalized: "github.com/me/app".into(),
+                name: "me/app".into(),
+                workflow_path: None,
+                network: Some("prod-runners".into()),
+                enabled,
+                created_email: Some("sam@sarocu.com".into()),
+                created_at: Utc::now(),
+            },
+            tokens: vec![RepoToken {
+                id: "019fca648a6e-00000002".into(),
+                repo_id: "019fca648a6e-00000001".into(),
+                name: "laptop".into(),
+                created_email: Some("sam@sarocu.com".into()),
+                created_at: Utc::now(),
+                last_used_at: None,
+                revoked_at: revoked.then(Utc::now),
+            }],
+            last_run: Some(run("success")),
+        }
+    }
+
+    #[test]
+    fn the_repos_page_lists_a_registration_and_its_tokens() {
+        let html = repos_page(
+            "ci",
+            Some("Sam"),
+            &[repo_view(true, false)],
+            "https://ci.example.com",
+            false,
+            &populated(),
+            &RepoFlash::default(),
+        )
+        .into_string();
+        assert!(html.contains("me/app"));
+        assert!(
+            html.contains("019fca648a6e-00000002"),
+            "the key id is shown"
+        );
+        assert!(html.contains("/repos/019fca648a6e-00000001/tokens"));
+        assert!(html.contains("active"));
+        assert!(html.contains("Pause"));
+    }
+
+    /// A revoked token stays visible — it is still the answer to "what used to
+    /// have access" — but must not offer to be revoked again.
+    #[test]
+    fn a_revoked_token_renders_as_revoked_without_a_second_revoke_button() {
+        let html = repos_page(
+            "ci",
+            None,
+            &[repo_view(true, true)],
+            "https://ci.example.com",
+            false,
+            &populated(),
+            &RepoFlash::default(),
+        )
+        .into_string();
+        assert!(html.contains("revoked"));
+        assert!(!html.contains("/revoke"), "{html}");
+    }
+
+    /// The one-time display, and the only place a token's plaintext is ever
+    /// rendered.
+    #[test]
+    fn a_minted_token_is_shown_once_with_the_two_lines_that_use_it() {
+        let html = repos_page(
+            "ci",
+            Some("Sam"),
+            &[repo_view(true, false)],
+            "https://ci.example.com",
+            true,
+            &populated(),
+            &RepoFlash::minted("me/app".into(), "cis_k1.secret-value".into()),
+        )
+        .into_string();
+        assert!(html.contains("git config ci.endpoint https://ci.example.com"));
+        assert!(html.contains("git config ci.token cis_k1.secret-value"));
+        assert!(
+            html.contains("CI_REQUIRE_REPO_TOKEN is set"),
+            "the page says the shared secret is off"
+        );
+
+        // And nowhere else: a page rendered without the flash must not carry it.
+        let plain = repos_page(
+            "ci",
+            Some("Sam"),
+            &[repo_view(true, false)],
+            "https://ci.example.com",
+            false,
+            &populated(),
+            &RepoFlash::default(),
+        )
+        .into_string();
+        assert!(!plain.contains("cis_"), "{plain}");
+    }
+
+    #[test]
+    fn an_empty_repos_page_says_what_submitting_without_one_means() {
+        let html = repos_page(
+            "ci",
+            None,
+            &[],
+            "https://ci.example.com",
+            false,
+            &populated(),
+            &RepoFlash::failed("A clone URL is required."),
+        )
+        .into_string();
+        assert!(html.contains("CI_WEBHOOK_SECRET"));
+        assert!(html.contains("A clone URL is required."));
     }
 }

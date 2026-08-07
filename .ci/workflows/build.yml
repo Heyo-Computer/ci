@@ -21,23 +21,24 @@ jobs:
     uses: default
     vm:
       driver: firecracker
-      image: ubuntu:24.04
+      # Built from deploy/image/Dockerfile with `heyvm mvm build`. Not a public
+      # base image: the daemon resolves a bare name against
+      # ~/.heyo/images/firecracker/{name}.ext4, so this must be built on any
+      # host that runs this job. See deploy/image/README.md.
+      image: ci-rust
       size_class: medium
-      # A release build of this crate carries a `target/` of several GB, and it
-      # is the warm VM's whole value that it survives between runs.
+      # Mounted at /var/cache/ci by the image's init, which is where
+      # CARGO_TARGET_DIR points — deliberately *not* /workspace, which `ci`
+      # wipes on every checkout. This disk is what makes reusing a warm VM
+      # worth anything.
       disk_size_gb: 20
-      setup_hooks:
-        # `git` is required, not a convenience: `git submit` sends a bundle by
-        # default and the checkout step clones it *inside the guest*. Without it
-        # the run fails before the first step, at checkout. (`git submit
-        # --archive` sends a plain tree and needs none of this.)
-        #
-        # `pkg-config` and `libssl-dev` are not optional either: reqwest's
-        # default TLS is native-tls, which links OpenSSL rather than bundling it.
-        - apt-get update && apt-get install -y build-essential curl git pkg-config libssl-dev
-        - curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+      # No setup_hooks: the toolchain, git and the OpenSSL headers are in the
+      # image. Hooks run on every cold VM, so baking them in is the difference
+      # between a build that starts in seconds and one that apt-gets a
+      # toolchain first.
+      #
       # A dependency change is the one thing that must not reuse a warm VM: the
-      # cached `~/.cargo` and `target/` in it were built against the old
+      # cached registry and `target/` in it were resolved against the old
       # lockfile. `rust-toolchain.toml` is listed although this repository has
       # none — a missing file hashes to an explicit marker, so adding one later
       # busts the pool at the moment it most needs busting.
@@ -48,14 +49,23 @@ jobs:
       CARGO_TERM_COLOR: never
     steps:
       - name: Build
+        # No `. "$HOME/.cargo/env"`: the image puts cargo on PATH through
+        # /etc/profile.d, and the daemon runs every step as `sh -lc`, which is a
+        # login shell and reads it.
+        #
         # `--locked` because the VM is fingerprinted on `Cargo.lock`: resolving
         # a different dependency set than the one the fingerprint was taken
         # from would make the warm VM's cache a claim that is not true.
-        run: . "$HOME/.cargo/env" && cargo build --release --locked
+        run: cargo build --release --locked
         # A cold build of ~300 crates is well past the 30-minute default. A warm
-        # VM reuses `target/` and takes a fraction of this.
+        # VM reuses the cache on /var/cache/ci and takes a fraction of this.
         timeout-minutes: 60
+      # `ci/upload-artifact` tars its `path` relative to the working directory,
+      # and CARGO_TARGET_DIR is outside it — so the binary is brought back in
+      # rather than the uploader taught about absolute paths.
+      - name: Collect the binary
+        run: mkdir -p dist && cp "$CARGO_TARGET_DIR/release/ci" dist/ci
       - uses: ci/upload-artifact
         with:
           name: ci
-          path: target/release/ci
+          path: dist

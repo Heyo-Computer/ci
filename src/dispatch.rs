@@ -1638,6 +1638,73 @@ impl Dispatcher {
         }
     }
 
+    /// Fail jobs that have waited longer than `CI_RUNNER_WAIT_SECS` for a
+    /// runner that was never going to take them.
+    ///
+    /// This is the behaviour the README has always described and nothing
+    /// implemented: a job is pinned to its host's subject even when that host is
+    /// offline — deliberately, since the warm pool is host-local and migrating
+    /// discards the cache the pin asked for — but consumers are bound only for
+    /// hosts that are *online*. A job pinned to one that is not therefore went
+    /// to a subject nothing reads, and waited for ever with no steps and no
+    /// error. `CI_RUNNER_WAIT_SECS` was dead configuration describing it.
+    ///
+    /// Failing is better than waiting silently: the job says which host it was
+    /// waiting for, and the run stops being "running" for ever.
+    async fn fail_jobs_waiting_for_a_runner(&self) {
+        // Bounded per pass for the same reason the log sweep is: a backlog
+        // built up during an outage should not become one enormous burst.
+        const BATCH: i64 = 100;
+        let wait = self.config.heyvm.runner_wait;
+        let stuck = match self.store.jobs_waiting_longer_than(wait, BATCH).await {
+            Ok(stuck) => stuck,
+            Err(e) => {
+                tracing::warn!("could not look for jobs waiting on a runner: {e}");
+                return;
+            }
+        };
+
+        let pool = self.runners.snapshot();
+        for job in stuck {
+            // Re-checked rather than assumed: a host that came online between
+            // the query and now will have taken the job, and failing it here
+            // would kill work that is about to start.
+            let online = job
+                .runner_hd_id
+                .as_deref()
+                .and_then(|id| pool.locate(id))
+                .is_some_and(|(_, r)| r.status.is_dispatchable());
+            if online {
+                continue;
+            }
+
+            let where_to = job
+                .runner_hd_id
+                .clone()
+                .or_else(|| job.network.clone())
+                .unwrap_or_else(|| "its network".to_string());
+            let detail = format!(
+                "no runner took this job within {}s. It is pinned to {where_to}, which \
+                 is not online — a pinned job waits for its own host rather than \
+                 migrating, because the warm VM pool is host-local. Bring that host \
+                 back, set `fallback: any` on the job, or point `uses:` elsewhere.",
+                wait.as_secs()
+            );
+            tracing::warn!(job = %job.job_key, "{detail}");
+            if let Err(e) = self
+                .store
+                .set_job_status(&job.id, JobStatus::Failure, Some(&detail))
+                .await
+            {
+                tracing::warn!(job = %job.job_key, "could not fail a stuck job: {e}");
+                continue;
+            }
+            if let Err(e) = self.advance_run(&job.run_id).await {
+                tracing::warn!(run = %job.run_id, "could not advance after failing: {e}");
+            }
+        }
+    }
+
     /// Every pooled VM on the runners this instance serves.
     pub async fn vm_inventory(&self) -> Result<Vec<crate::pool::PooledVmView>, DispatchError> {
         let ours = self.served_runner_ids();
@@ -1747,6 +1814,7 @@ impl Dispatcher {
                     tracing::warn!("could not renew VM leases: {e}");
                 }
                 self.renew_vm_ttls().await;
+                self.fail_jobs_waiting_for_a_runner().await;
                 if let Err(e) = self.reclaim_pool().await {
                     tracing::warn!("could not reclaim expired VM leases: {e}");
                 }

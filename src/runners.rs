@@ -56,6 +56,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+/// How long to wait for an iroh tunnel to a runner before giving up.
+///
+/// Generous — NAT traversal through a relay is not instant — but finite, which
+/// is the point: this happens before a VM exists, so an unbounded dial shows up
+/// as a job that never starts a step and never errors.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Membership kind for a daemon host, as the control plane spells it.
 const MEMBER_KIND_HOST: &str = "host";
 
@@ -632,12 +639,22 @@ impl Runners {
         }
 
         let ticket = self.connection_ticket(runner_id).await?;
-        let client = HeyoClient::connect_p2p(
-            &ticket,
-            self.config.heyvm.relay.as_deref(),
-            Some(self.config.heyvm.api_key.clone()),
+        // Bounded. This runs *before* the VM boot timeout applies, so an iroh
+        // dial that never completes is a job with no steps and no error — the
+        // hang looks identical to a runner that is merely slow.
+        let client = tokio::time::timeout(
+            DIAL_TIMEOUT,
+            HeyoClient::connect_p2p(
+                &ticket,
+                self.config.heyvm.relay.as_deref(),
+                Some(self.config.heyvm.api_key.clone()),
+            ),
         )
         .await
+        .map_err(|_| RunnerError::Unreachable {
+            runner: runner_id.to_string(),
+            reason: format!("the iroh dial did not complete within {DIAL_TIMEOUT:?}"),
+        })?
         .map_err(|e| RunnerError::Unreachable {
             runner: runner_id.to_string(),
             reason: format!("iroh connect failed: {e}"),

@@ -198,6 +198,14 @@ queued for that host and fails after `CI_RUNNER_WAIT_SECS`, because the warm poo
 is host-local — moving the job discards the cache the pin asked for and turns a
 fast build into a slow one for reasons nothing reports. `fallback: any` opts in.
 
+That timeout matters more than it looks. Consumers are bound only for hosts that
+are **online**, while `route_for` pins a job to its node whatever its status — so
+a job pinned to a host that is not online goes to a subject nothing reads. The
+wait is what turns that from a run stuck for ever with no steps and no error into
+a failure naming the host it was waiting for. It is checked on the lease loop and
+re-confirmed against the live pool first, so a host that comes back in the
+meantime keeps its job.
+
 **`vm:` describes the machine.** GitHub gives you an opaque runner image; here
 the author declares the driver, image, size and setup hooks — and, via
 `cache_key_files`, what should invalidate the warm VM the next run would reuse.
@@ -520,6 +528,40 @@ two consumers would silently eat each other's work.
 A queue message carries **ids only**. The expanded plan lives in `ci_job.plan`,
 so a redelivery runs exactly what the original delivery would have, even if the
 branch moved underneath it.
+
+### Connecting to it
+
+```bash
+CI_NATS_URL=nats://127.0.0.1:4222      # comma-separated for a cluster
+CI_NATS_SUBJECT_PREFIX=ci              # namespaces both streams and every
+                                       # subject and durable consumer name
+```
+
+The prefix is interpolated verbatim, so it is charset-checked at startup —
+`[A-Za-z0-9_-]`. Two installations sharing a NATS server need different prefixes
+or they share a work queue.
+
+**Four ways to authenticate, and exactly one may be set.** They are not a
+precedence order: naming two is a startup error, because guessing which an
+operator meant is how a process authenticates as the wrong principal.
+
+| | |
+|---|---|
+| `CI_NATS_USER` + `CI_NATS_PASSWORD` | Both or neither. A user alone is not a token, and either half alone is refused rather than guessed at. |
+| `CI_NATS_TOKEN` | A bare token. |
+| `CI_NATS_CREDS` | Path to a `.creds` file, read at startup. An unreadable path is a startup error, not a fallback to anonymous. |
+| `CI_NATS_NKEY` | An nkey seed. |
+
+Userinfo in the URL (`nats://user:pass@host`) still works and is the last
+resort: any of the above overrides it, and startup **warns** when a credential
+arrives that way, because a URL is visible in shell history, process listings and
+container specs. The credential lives in `nats_auth::NatsEndpoint`, which has a
+hand-written `Debug` that cannot print it — so a `{:?}` on `Config` cannot leak a
+password. Only the sanitized server list is ever logged.
+
+One trap specific to this deployment: the NATS **system** account is not a
+substitute for a real one. JetStream cannot be enabled on it, so a `sys` login
+connects successfully and then fails on the first stream.
 
 ### `ack_wait` is short, and the job says it is still running
 

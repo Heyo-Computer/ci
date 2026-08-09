@@ -697,6 +697,37 @@ impl Store {
         Ok(Some(jobs.rows_affected()))
     }
 
+    /// Jobs that have sat on a queue longer than a runner was ever going to
+    /// take to pick them up.
+    ///
+    /// A job is pinned to its host's subject even when that host is not online —
+    /// deliberately, because the warm pool is host-local and silently migrating
+    /// discards the cache the pin asked for. But consumers are only bound for
+    /// hosts that *are* online, so a job pinned to one that is not goes to a
+    /// subject nothing reads. Without this it waits for ever.
+    pub async fn jobs_waiting_longer_than(
+        &self,
+        wait: Duration,
+        limit: i64,
+    ) -> Result<Vec<JobRow>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT j.* FROM ci_job j
+               JOIN ci_run r ON r.id = j.run_id
+              WHERE j.status = 'queued'
+                AND j.queued_at IS NOT NULL
+                AND j.queued_at < now() - make_interval(secs => $1)
+                AND r.status NOT IN ('success','failure','cancelled')
+              ORDER BY j.queued_at
+              LIMIT $2",
+        )
+        .bind(wait.as_secs() as f64)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok(rows.iter().map(JobRow::from_row).collect())
+    }
+
     /// Whether a job has been cancelled out from under whoever is running it.
     ///
     /// Its own query rather than [`Self::get_job`]: this is asked between every
@@ -768,12 +799,14 @@ impl Store {
     /// `Nats-Msg-Id` dedup is the belt; this is the braces, and it also keeps
     /// the row's status honest.
     pub async fn queue_job(&self, job_id: &str) -> Result<bool, StoreError> {
-        let result =
-            sqlx::query("UPDATE ci_job SET status = 'queued' WHERE id = $1 AND status = 'pending'")
-                .bind(job_id)
-                .execute(&self.pool)
-                .await
-                .map_err(StoreError::sql)?;
+        let result = sqlx::query(
+            "UPDATE ci_job SET status = 'queued', queued_at = now()
+                  WHERE id = $1 AND status = 'pending'",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -2089,6 +2122,67 @@ jobs:
         assert!(
             store.get_run(&run_id).await.unwrap().is_some(),
             "the run survives its registration"
+        );
+    }
+
+    /// A job pinned to a host that never comes online must become findable, or
+    /// it waits for ever with no steps and no error — which is what
+    /// `CI_RUNNER_WAIT_SECS` was always documented to prevent and never did.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_job_waiting_on_a_runner_becomes_visible_after_the_wait() {
+        let store = test_store().await;
+        let plan = test_plan();
+        let run_id = crate::vm::new_id();
+        store
+            .create_run(&run_id, &RunRequest::default(), &plan)
+            .await
+            .unwrap();
+        let job = job_id(&run_id, "build-x86_64");
+
+        // Pending, not queued: a job waiting on `needs:` is not waiting on a
+        // runner, and failing it would kill work that has not been offered yet.
+        assert!(
+            store
+                .jobs_waiting_longer_than(Duration::from_secs(0), 50)
+                .await
+                .unwrap()
+                .iter()
+                .all(|j| j.id != job),
+            "a pending job is not waiting on a runner"
+        );
+
+        assert!(store.queue_job(&job).await.unwrap());
+        // Long enough that nothing legitimately queued qualifies.
+        assert!(
+            store
+                .jobs_waiting_longer_than(Duration::from_secs(3600), 50)
+                .await
+                .unwrap()
+                .iter()
+                .all(|j| j.id != job),
+            "a job queued a moment ago is not stuck"
+        );
+
+        let stuck = store
+            .jobs_waiting_longer_than(Duration::from_secs(0), 50)
+            .await
+            .unwrap();
+        assert!(stuck.iter().any(|j| j.id == job), "queued past the wait");
+
+        // Once it starts, or the run ends, it stops being offered.
+        store
+            .start_job(&job, "hd-1", "sb-1", "fp", 1)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .jobs_waiting_longer_than(Duration::from_secs(0), 50)
+                .await
+                .unwrap()
+                .iter()
+                .all(|j| j.id != job),
+            "a running job is not waiting"
         );
     }
 

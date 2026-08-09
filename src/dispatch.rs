@@ -377,7 +377,8 @@ impl Dispatcher {
             };
 
             if self.store.queue_job(&job.id).await? {
-                self.bus
+                let published = self
+                    .bus
                     .publish_job(
                         &route,
                         &JobMessage {
@@ -386,8 +387,36 @@ impl Dispatcher {
                             job_key: plan.key.clone(),
                         },
                     )
-                    .await?;
-                tracing::info!(run = run_id, job = %plan.key, route = ?route, "queued");
+                    .await;
+
+                match published {
+                    Ok(()) => {
+                        tracing::info!(run = run_id, job = %plan.key, route = ?route, "queued")
+                    }
+                    // The status was committed before this call, so a failure
+                    // here leaves a row saying `queued` with nothing on the
+                    // queue — two stores disagreeing, with nothing to notice.
+                    // Rolling back makes the scheduler's own retry the repair;
+                    // `Nats-Msg-Id` means a later duplicate publish collapses,
+                    // so retrying is safe even if the message did land.
+                    Err(e) => {
+                        tracing::warn!(
+                            run = run_id, job = %plan.key, route = ?route,
+                            "could not publish, returning the job to pending: {e}"
+                        );
+                        if let Err(e) = self.store.unqueue_job(&job.id).await {
+                            // Now it really is stranded, and saying so is all
+                            // that is left.
+                            tracing::error!(
+                                run = run_id, job = %plan.key,
+                                "could not roll back a failed publish: {e}"
+                            );
+                        }
+                        // Deliberately not propagated: one unreachable subject
+                        // must not stop the rest of the run being scheduled.
+                        continue;
+                    }
+                }
             }
         }
 
@@ -1638,6 +1667,29 @@ impl Dispatcher {
         }
     }
 
+    /// Re-run the scheduler for runs that still have something pending.
+    ///
+    /// `advance_run` is otherwise driven only by a submit and by jobs finishing,
+    /// so a run whose jobs all failed to publish has nothing left to nudge it —
+    /// the rollback above would return them to `pending` and there they would
+    /// stay. Idempotent by construction: `queue_job` only moves a job that is
+    /// still `pending`, and a job waiting on `needs:` is simply not ready yet.
+    async fn nudge_stalled_runs(&self) {
+        const BATCH: i64 = 100;
+        let runs = match self.store.runs_with_pending_jobs(BATCH).await {
+            Ok(runs) => runs,
+            Err(e) => {
+                tracing::warn!("could not look for stalled runs: {e}");
+                return;
+            }
+        };
+        for run_id in runs {
+            if let Err(e) = self.advance_run(&run_id).await {
+                tracing::warn!(run = %run_id, "could not advance a stalled run: {e}");
+            }
+        }
+    }
+
     /// Fail jobs that have waited longer than `CI_RUNNER_WAIT_SECS` for a
     /// runner that was never going to take them.
     ///
@@ -1815,6 +1867,7 @@ impl Dispatcher {
                 }
                 self.renew_vm_ttls().await;
                 self.fail_jobs_waiting_for_a_runner().await;
+                self.nudge_stalled_runs().await;
                 if let Err(e) = self.reclaim_pool().await {
                     tracing::warn!("could not reclaim expired VM leases: {e}");
                 }

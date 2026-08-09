@@ -539,6 +539,23 @@ Two disjoint spaces, and the `r`/`n` segment is load-bearing:
 Without it, a network named like a runner would produce overlapping filters and
 two consumers would silently eat each other's work.
 
+**Postgres commits before NATS does, so the publish has a rollback.**
+`queue_job` moves a job `pending → queued` and only then publishes; a failure in
+between would leave a row claiming to be queued with nothing on the queue, and
+nothing reconciling the two — a job that never runs and never errors. So a failed
+publish returns the job to `pending`, which makes the scheduler's own retry the
+repair. `Nats-Msg-Id` collapses a duplicate, so retrying is safe even when the
+message did land after all.
+
+One publish failing does not abort the rest: the run's other jobs are still
+scheduled, because one unreachable subject should not hold up a whole run.
+
+`advance_run` is otherwise driven only by a submit and by jobs finishing, so a
+run whose jobs *all* failed to publish would have nothing left to nudge it. The
+lease loop re-runs the scheduler for any active run with a pending job —
+idempotent by construction, since `queue_job` only moves a job that is still
+pending and a job waiting on `needs:` simply is not ready.
+
 A queue message carries **ids only**. The expanded plan lives in `ci_job.plan`,
 so a redelivery runs exactly what the original delivery would have, even if the
 branch moved underneath it.

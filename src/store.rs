@@ -810,6 +810,46 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Put a job back on the runway after its message failed to publish.
+    ///
+    /// [`Self::queue_job`] commits `pending → queued` before anything reaches
+    /// NATS, so a failed publish leaves a row claiming to be queued with nothing
+    /// on the queue — and the two stores then disagree with nothing to notice.
+    /// Returning it to `pending` makes the scheduler's own retry the repair.
+    ///
+    /// Guarded on `queued` so it can never take a job that has since started.
+    pub async fn unqueue_job(&self, job_id: &str) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE ci_job SET status='pending', queued_at=NULL
+              WHERE id = $1 AND status = 'queued'",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Active runs that still have a job waiting to be scheduled.
+    ///
+    /// The scheduler is otherwise only driven by a submit and by jobs finishing,
+    /// so a run whose every job failed to publish has nothing left to nudge it.
+    pub async fn runs_with_pending_jobs(&self, limit: i64) -> Result<Vec<String>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT r.id FROM ci_run r
+               JOIN ci_job j ON j.run_id = r.id
+              WHERE r.status NOT IN ('success','failure','cancelled')
+                AND j.status = 'pending'
+              ORDER BY r.id
+              LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+    }
+
     pub async fn set_job_status(
         &self,
         job_id: &str,
@@ -2122,6 +2162,64 @@ jobs:
         assert!(
             store.get_run(&run_id).await.unwrap().is_some(),
             "the run survives its registration"
+        );
+    }
+
+    /// The repair for a publish that failed after the status was committed:
+    /// the job goes back on the runway, and the scheduler finds the run again.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_failed_publish_returns_the_job_to_pending_and_the_run_is_found() {
+        let store = test_store().await;
+        let plan = test_plan();
+        let run_id = crate::vm::new_id();
+        store
+            .create_run(&run_id, &RunRequest::default(), &plan)
+            .await
+            .unwrap();
+        let job = job_id(&run_id, "build-x86_64");
+
+        assert!(store.queue_job(&job).await.unwrap());
+        assert!(store.unqueue_job(&job).await.unwrap(), "rolled back");
+
+        // Back to pending, with the queue clock cleared — otherwise the
+        // runner-wait watchdog would count time it never spent queued.
+        let row = store.get_job(&job).await.unwrap().unwrap();
+        assert_eq!(row.status, "pending");
+        assert!(
+            store
+                .jobs_waiting_longer_than(Duration::from_secs(0), 50)
+                .await
+                .unwrap()
+                .iter()
+                .all(|j| j.id != job),
+            "a rolled-back job is not waiting on a runner"
+        );
+
+        // And the run is offered to the scheduler again, which is what stops it
+        // sitting pending for ever.
+        assert!(
+            store
+                .runs_with_pending_jobs(500)
+                .await
+                .unwrap()
+                .contains(&run_id)
+        );
+
+        // Re-queueing works, and rolling back a job that has since started does
+        // not: it would take a running job off a runner.
+        assert!(store.queue_job(&job).await.unwrap());
+        store
+            .start_job(&job, "hd-1", "sb-1", "fp", 1)
+            .await
+            .unwrap();
+        assert!(
+            !store.unqueue_job(&job).await.unwrap(),
+            "a started job must never be rolled back"
+        );
+        assert_eq!(
+            store.get_job(&job).await.unwrap().unwrap().status,
+            "running"
         );
     }
 

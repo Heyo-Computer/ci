@@ -115,6 +115,23 @@ pub enum Route {
     Network(String),
 }
 
+/// A route's backlog, as JetStream sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueueDepth {
+    /// Delivered to nobody yet.
+    pub waiting: u64,
+    /// Delivered and not yet acked — jobs being worked on right now. With the
+    /// progress heartbeat extending each ack, this is a live count rather than a
+    /// count of things that might have been abandoned.
+    pub in_flight: u64,
+}
+
+impl QueueDepth {
+    pub fn is_empty(&self) -> bool {
+        self.waiting == 0 && self.in_flight == 0
+    }
+}
+
 pub struct Bus {
     js: Jetstream,
     prefix: String,
@@ -326,10 +343,20 @@ impl Bus {
             })
     }
 
-    /// How many messages are waiting for a route. This is what the dashboard's
-    /// backlog gauge reads, and it is exact because `WorkQueue` deletes on ack.
-    pub async fn pending(&self, route: &Route) -> Result<u64, BusError> {
+    /// What is on a route's queue, and whether anything is reading it.
+    ///
+    /// `Ok(None)` means **no durable consumer exists** — the state that matters
+    /// most and the one the old `pending()` reported as an error, indistinguishable
+    /// from NATS being down. A job routed to a subject nothing consumes waits for
+    /// ever, so "nobody is listening" has to be a value the dashboard can render
+    /// rather than a failure it swallows.
+    ///
+    /// Exact rather than approximate: `WorkQueue` retention deletes on ack, so
+    /// the counts are the backlog rather than a high-water mark.
+    pub async fn depth(&self, route: &Route) -> Result<Option<QueueDepth>, BusError> {
         let durable = self.durable_for(route)?;
+        // A stream failure is a real error — NATS is unreachable or the stream
+        // is gone — and must not be reported as "nothing is consuming".
         let stream = self
             .js
             .get_stream(&self.jobs_stream)
@@ -338,19 +365,17 @@ impl Bus {
                 stream: self.jobs_stream.clone(),
                 reason: e.to_string(),
             })?;
-        let mut consumer: PullConsumer =
-            stream
-                .get_consumer(&durable)
-                .await
-                .map_err(|e| BusError::Consumer {
-                    durable: durable.clone(),
-                    reason: e.to_string(),
-                })?;
-        let info = consumer.info().await.map_err(|e| BusError::Consumer {
-            durable,
-            reason: e.to_string(),
-        })?;
-        Ok(info.num_pending)
+
+        let Ok(mut consumer) = stream.get_consumer::<PullConfig>(&durable).await else {
+            return Ok(None);
+        };
+        let Ok(info) = consumer.info().await else {
+            return Ok(None);
+        };
+        Ok(Some(QueueDepth {
+            waiting: info.num_pending,
+            in_flight: info.num_ack_pending as u64,
+        }))
     }
 
     /// Publish a state transition for dashboards to tail. Best-effort: an event
@@ -545,7 +570,7 @@ mod tests {
         got.ack().await.expect("acked");
 
         // WorkQueue deletes on ack, so the backlog is now genuinely zero.
-        assert_eq!(bus.pending(&route).await.unwrap(), 0);
+        assert_eq!(bus.depth(&route).await.unwrap().unwrap().waiting, 0);
         cleanup(&bus).await;
     }
 
@@ -576,8 +601,8 @@ mod tests {
             .unwrap();
         }
 
-        assert_eq!(bus.pending(&a).await.unwrap(), 1);
-        assert_eq!(bus.pending(&b).await.unwrap(), 1);
+        assert_eq!(bus.depth(&a).await.unwrap().unwrap().waiting, 1);
+        assert_eq!(bus.depth(&b).await.unwrap().unwrap().waiting, 1);
 
         let mut batch = ca.fetch().max_messages(5).messages().await.unwrap();
         let m = batch.next().await.unwrap().unwrap();
@@ -590,7 +615,7 @@ mod tests {
         assert!(batch.next().await.is_none(), "and nothing else");
 
         // b's message is untouched by a's consumer.
-        assert_eq!(bus.pending(&b).await.unwrap(), 1);
+        assert_eq!(bus.depth(&b).await.unwrap().unwrap().waiting, 1);
         let mut batch = cb.fetch().max_messages(5).messages().await.unwrap();
         let m = batch.next().await.unwrap().unwrap();
         let decoded: JobMessage = serde_json::from_slice(&m.payload).unwrap();
@@ -663,7 +688,7 @@ mod tests {
         bus.publish_job(&route, &msg).await.unwrap();
 
         assert_eq!(
-            bus.pending(&route).await.unwrap(),
+            bus.depth(&route).await.unwrap().unwrap().waiting,
             1,
             "Nats-Msg-Id must collapse the duplicate"
         );

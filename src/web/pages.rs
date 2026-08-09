@@ -165,10 +165,10 @@ fn status_pill(status: RunnerStatus) -> Markup {
 }
 
 fn runner_rows(runners: &[Runner]) -> Markup {
-    runner_rows_marking(runners, "")
+    runner_rows_marking(runners, "", &QueueDepths::default())
 }
 
-fn runner_rows_marking(runners: &[Runner], this_host: &str) -> Markup {
+fn runner_rows_marking(runners: &[Runner], this_host: &str, depths: &QueueDepths) -> Markup {
     html! {
         @for r in runners {
             tr {
@@ -182,6 +182,7 @@ fn runner_rows_marking(runners: &[Runner], this_host: &str) -> Markup {
                 }
                 td .mono { (r.id) }
                 td { (status_pill(r.status)) }
+                td { (queue_cell(depths, &r.id, r.status.is_dispatchable())) }
                 td .mono { (r.last_seen_at.as_deref().unwrap_or("—")) }
             }
         }
@@ -200,7 +201,12 @@ fn runner_table(runners: &[Runner]) -> Markup {
 }
 
 /// One network and the hosts in it.
-fn network_section(set: &RunnerSet, default_id: &str, this_host: &str) -> Markup {
+fn network_section(
+    set: &RunnerSet,
+    default_id: &str,
+    this_host: &str,
+    depths: &QueueDepths,
+) -> Markup {
     let joined = !this_host.is_empty() && set.runners.iter().any(|r| r.id == this_host);
     html! {
         div .repo {
@@ -231,6 +237,10 @@ fn network_section(set: &RunnerSet, default_id: &str, this_host: &str) -> Markup
                 code .mono { (set.network_id) }
                 " · " (set.dispatchable().count()) " of " (set.runners.len())
                 " host(s) can take work"
+                @if set.served {
+                    " · unpinned queue: "
+                    (queue_cell(depths, &set.network_id, set.dispatchable().count() > 0))
+                }
             }
             @if set.runners.is_empty() {
                 p .empty {
@@ -241,8 +251,11 @@ fn network_section(set: &RunnerSet, default_id: &str, this_host: &str) -> Markup
             } @else {
                 div .scroll {
                     table {
-                        thead { tr { th { "Name" } th { "Daemon" } th { "Status" } th { "Last seen" } } }
-                        tbody { (runner_rows_marking(&set.runners, this_host)) }
+                        thead { tr {
+                            th { "Name" } th { "Daemon" } th { "Status" }
+                            th { "Queue" } th { "Last seen" }
+                        } }
+                        tbody { (runner_rows_marking(&set.runners, this_host, depths)) }
                     }
                 }
             }
@@ -419,9 +432,51 @@ pub fn vms_page(
     layout(app_name, "vms", who, body)
 }
 
+/// Queue depth per route, keyed by network id or runner id.
+///
+/// A missing key is "not read"; a present `None` is **no consumer bound**, which
+/// is a different and much more interesting thing.
+#[derive(Default)]
+pub struct QueueDepths {
+    pub by_route: std::collections::HashMap<String, Option<crate::bus::QueueDepth>>,
+    pub error: Option<String>,
+}
+
+/// The gauge, and the warning that replaces it when nothing is listening.
+fn queue_cell(depths: &QueueDepths, key: &str, dispatchable: bool) -> Markup {
+    html! {
+        @match depths.by_route.get(key) {
+            // The state a stuck run looks like: work routed here and nothing
+            // bound to read it. Consumers are only created for online hosts, so
+            // this is expected on an offline one and alarming on a live one.
+            Some(None) => {
+                @if dispatchable {
+                    span .pill.failure { "no consumer" }
+                } @else {
+                    span .meta { "no consumer" }
+                }
+            }
+            Some(Some(d)) if d.is_empty() => span .meta { "idle" },
+            Some(Some(d)) => {
+                span .mono {
+                    (d.waiting) " queued"
+                    @if d.in_flight > 0 { ", " (d.in_flight) " running" }
+                }
+            }
+            None => span .meta { "—" },
+        }
+    }
+}
+
 /// `GET /networks` — every network on the account, the hosts in each, and which
 /// of them this orchestrator builds for.
-pub fn networks_page(app_name: &str, who: Option<&str>, pool: &Pool, notice: &Notice) -> Markup {
+pub fn networks_page(
+    app_name: &str,
+    who: Option<&str>,
+    pool: &Pool,
+    depths: &QueueDepths,
+    notice: &Notice,
+) -> Markup {
     let served = pool.served().count();
     let body = html! {
         @if let Some(err) = &notice.error {
@@ -433,6 +488,12 @@ pub fn networks_page(app_name: &str, who: Option<&str>, pool: &Pool, notice: &No
         @if let Some(err) = &pool.last_error {
             div .banner {
                 strong { "The runner pool is stale. " }
+                (err)
+            }
+        }
+        @if let Some(err) = &depths.error {
+            div .banner {
+                strong { "Queue depths are unavailable. " }
                 (err)
             }
         }
@@ -466,7 +527,7 @@ pub fn networks_page(app_name: &str, who: Option<&str>, pool: &Pool, notice: &No
                 }
             }
             @for set in &pool.networks {
-                (network_section(set, &pool.default_network_id, &pool.default_node_id))
+                (network_section(set, &pool.default_network_id, &pool.default_node_id, depths))
             }
         }
 
@@ -531,8 +592,14 @@ mod tests {
 
     #[test]
     fn the_page_lists_every_network_and_its_runners() {
-        let html =
-            networks_page("ci", Some("Sam Currie"), &populated(), &Notice::default()).into_string();
+        let html = networks_page(
+            "ci",
+            Some("Sam Currie"),
+            &populated(),
+            &QueueDepths::default(),
+            &Notice::default(),
+        )
+        .into_string();
         assert!(html.contains("prod-runners"));
         assert!(html.contains("lab"), "an unserved network is still listed");
         assert!(html.contains("bigbox"));
@@ -548,7 +615,14 @@ mod tests {
     /// for, versus one that merely exists.
     #[test]
     fn served_and_unserved_networks_are_told_apart_with_the_fix_named() {
-        let html = networks_page("ci", None, &populated(), &Notice::default()).into_string();
+        let html = networks_page(
+            "ci",
+            None,
+            &populated(),
+            &QueueDepths::default(),
+            &Notice::default(),
+        )
+        .into_string();
         assert!(html.contains("serving"));
         assert!(html.contains("not served"));
         assert!(html.contains("CI_NETWORK"), "and what to do about it");
@@ -558,7 +632,14 @@ mod tests {
     /// cause, so the page must name it and the command that fixes it.
     #[test]
     fn unjoined_daemons_get_their_own_section_naming_the_fix() {
-        let html = networks_page("ci", None, &populated(), &Notice::default()).into_string();
+        let html = networks_page(
+            "ci",
+            None,
+            &populated(),
+            &QueueDepths::default(),
+            &Notice::default(),
+        )
+        .into_string();
         assert!(html.contains("Registered but in no network"));
         assert!(html.contains("laptop"));
         assert!(html.contains("heyvm network add-host"));
@@ -566,7 +647,14 @@ mod tests {
 
     #[test]
     fn an_empty_account_explains_how_to_add_a_network() {
-        let html = networks_page("ci", None, &Pool::default(), &Notice::default()).into_string();
+        let html = networks_page(
+            "ci",
+            None,
+            &Pool::default(),
+            &QueueDepths::default(),
+            &Notice::default(),
+        )
+        .into_string();
         assert!(html.contains("heyvm network create"));
         assert!(!html.contains("Registered but in no network"));
     }
@@ -576,7 +664,14 @@ mod tests {
     fn a_stale_snapshot_says_so() {
         let mut pool = populated();
         pool.last_error = Some("heyvm control plane: GET /networks: timeout".into());
-        let html = networks_page("ci", None, &pool, &Notice::default()).into_string();
+        let html = networks_page(
+            "ci",
+            None,
+            &pool,
+            &QueueDepths::default(),
+            &Notice::default(),
+        )
+        .into_string();
         assert!(html.contains("The runner pool is stale"));
         assert!(html.contains("GET /networks: timeout"));
     }
@@ -585,7 +680,14 @@ mod tests {
     /// — "a token is not a person".
     #[test]
     fn an_anonymous_request_renders_no_identity() {
-        let html = networks_page("ci", None, &populated(), &Notice::default()).into_string();
+        let html = networks_page(
+            "ci",
+            None,
+            &populated(),
+            &QueueDepths::default(),
+            &Notice::default(),
+        )
+        .into_string();
         assert!(!html.contains(r#"class="who""#));
     }
 
@@ -647,13 +749,83 @@ mod tests {
         assert!(html.contains("Nothing is pooled"));
     }
 
+    /// The gauge exists for one diagnostic above all: work routed to a subject
+    /// nothing reads. That is what a stuck run looks like, and it must be
+    /// legible at a glance rather than inferred from a queue that never drains.
+    #[test]
+    fn a_route_with_no_consumer_is_called_out_on_a_live_host() {
+        use crate::bus::QueueDepth;
+        let mut depths = QueueDepths::default();
+        // hd-1 is online in the fixture, so nothing consuming its queue is wrong.
+        depths.by_route.insert("hd-1".into(), None);
+        depths.by_route.insert(
+            "net-1".into(),
+            Some(QueueDepth {
+                waiting: 3,
+                in_flight: 1,
+            }),
+        );
+
+        let html =
+            networks_page("ci", None, &populated(), &depths, &Notice::default()).into_string();
+        assert!(html.contains("no consumer"), "{html}");
+        assert!(
+            html.contains(r#"class="pill failure""#),
+            "flagged, not muted"
+        );
+        assert!(html.contains("3 queued"));
+        assert!(html.contains("1 running"));
+    }
+
+    /// An offline host with no consumer is expected — consumers are only bound
+    /// for online hosts — so it is stated, not alarmed about.
+    #[test]
+    fn an_offline_host_without_a_consumer_is_not_alarming() {
+        use crate::bus::QueueDepth;
+        let mut depths = QueueDepths::default();
+        // hd-2 is Stale in the fixture.
+        depths.by_route.insert("hd-2".into(), None);
+        depths.by_route.insert(
+            "hd-1".into(),
+            Some(QueueDepth {
+                waiting: 0,
+                in_flight: 0,
+            }),
+        );
+
+        let html =
+            networks_page("ci", None, &populated(), &depths, &Notice::default()).into_string();
+        assert!(html.contains("no consumer"));
+        assert!(html.contains("idle"), "an empty live queue reads as idle");
+    }
+
+    /// NATS being unreachable is not an idle queue, and must not render as one.
+    #[test]
+    fn an_unreadable_queue_says_so_rather_than_showing_zeroes() {
+        let depths = QueueDepths {
+            error: Some("could not reach NATS".into()),
+            ..QueueDepths::default()
+        };
+        let html =
+            networks_page("ci", None, &populated(), &depths, &Notice::default()).into_string();
+        assert!(html.contains("Queue depths are unavailable"), "{html}");
+        assert!(html.contains("could not reach NATS"));
+    }
+
     /// The join button is offered only where it would do something: a network
     /// this host is not already in.
     #[test]
     fn joining_is_offered_for_networks_this_host_is_not_in() {
         let mut pool = populated();
         pool.default_node_id = "hd-1".into(); // already a member of net-1
-        let html = networks_page("ci", None, &pool, &Notice::default()).into_string();
+        let html = networks_page(
+            "ci",
+            None,
+            &pool,
+            &QueueDepths::default(),
+            &Notice::default(),
+        )
+        .into_string();
 
         assert!(
             !html.contains(r#"action="/networks/net-1/join""#),
@@ -672,7 +844,14 @@ mod tests {
     fn an_unidentifiable_host_explains_itself_and_offers_no_join() {
         let mut pool = populated();
         pool.default_node_id = String::new();
-        let html = networks_page("ci", None, &pool, &Notice::default()).into_string();
+        let html = networks_page(
+            "ci",
+            None,
+            &pool,
+            &QueueDepths::default(),
+            &Notice::default(),
+        )
+        .into_string();
 
         assert!(html.contains("CI_DEFAULT_NODE"), "{html}");
         assert!(!html.contains("/join"), "no button without a host: {html}");
@@ -684,12 +863,20 @@ mod tests {
             "ci",
             None,
             &populated(),
+            &QueueDepths::default(),
             &Notice::done("This host is now a member of lab."),
         )
         .into_string();
         assert!(html.contains("This host is now a member of lab."));
 
-        let html = networks_page("ci", None, &populated(), &Notice::failed("nope")).into_string();
+        let html = networks_page(
+            "ci",
+            None,
+            &populated(),
+            &QueueDepths::default(),
+            &Notice::failed("nope"),
+        )
+        .into_string();
         assert!(html.contains("nope"));
     }
 
@@ -699,7 +886,14 @@ mod tests {
     fn a_hostile_runner_name_is_escaped() {
         let mut pool = populated();
         pool.networks[0].runners[0].name = "<script>alert(1)</script>".into();
-        let html = networks_page("ci", None, &pool, &Notice::default()).into_string();
+        let html = networks_page(
+            "ci",
+            None,
+            &pool,
+            &QueueDepths::default(),
+            &Notice::default(),
+        )
+        .into_string();
         assert!(!html.contains("<script>alert(1)</script>"));
         assert!(html.contains("&lt;script&gt;"));
     }

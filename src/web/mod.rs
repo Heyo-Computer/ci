@@ -1071,12 +1071,70 @@ fn not_found(state: &AppState, who: Option<&Identity>, message: &str) -> axum::r
         .into_response()
 }
 
+/// Read every served route's backlog, concurrently.
+///
+/// One round trip per network and per runner, so they go together and under one
+/// deadline — a dashboard must not hang because NATS is slow, and a page with no
+/// gauges beats a page that never renders.
+async fn queue_depths(state: &AppState) -> pages::QueueDepths {
+    let pool = state.runners.snapshot();
+    let mut routes = Vec::new();
+    for set in pool.served() {
+        if !set.network_id.is_empty() {
+            routes.push((
+                set.network_id.clone(),
+                crate::bus::Route::Network(set.network_id.clone()),
+            ));
+        }
+        // Every runner, not just the dispatchable ones. A queue on an offline
+        // host is exactly what somebody needs to see — that is where a pinned
+        // job goes to wait.
+        for r in &set.runners {
+            routes.push((r.id.clone(), crate::bus::Route::Runner(r.id.clone())));
+        }
+    }
+
+    let reads = routes
+        .iter()
+        .map(|(key, route)| async move { (key.clone(), state.dispatcher.bus.depth(route).await) });
+
+    let mut depths = pages::QueueDepths::default();
+    let results = match tokio::time::timeout(
+        Duration::from_secs(5),
+        futures::future::join_all(reads),
+    )
+    .await
+    {
+        Ok(results) => results,
+        Err(_) => {
+            depths.error = Some("The queue did not answer within 5s.".to_string());
+            return depths;
+        }
+    };
+    for (key, result) in results {
+        match result {
+            Ok(depth) => {
+                depths.by_route.insert(key, depth);
+            }
+            // A stream-level failure is NATS being unreachable, not an idle
+            // queue, and saying so once at the top beats a page of blanks.
+            Err(e) => depths
+                .error
+                .get_or_insert_with(|| e.to_string())
+                .clone_from(&e.to_string()),
+        }
+    }
+    depths
+}
+
 async fn networks_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let who = Identity::from_headers(&headers);
+    let depths = queue_depths(&state).await;
     pages::networks_page(
         &state.config.name,
         who.as_ref().map(|i| i.display()),
         &state.runners.snapshot(),
+        &depths,
         &pages::Notice::default(),
     )
 }
@@ -1141,15 +1199,17 @@ async fn cleanup_failed_vms(
     render_vms(&state, who.as_ref(), notice).await
 }
 
-fn render_networks(
+async fn render_networks(
     state: &AppState,
     who: Option<&Identity>,
     notice: pages::Notice,
 ) -> axum::response::Response {
+    let depths = queue_depths(state).await;
     pages::networks_page(
         &state.config.name,
         who.map(|i| i.display()),
         &state.runners.snapshot(),
+        &depths,
         &notice,
     )
     .into_response()
@@ -1180,14 +1240,16 @@ async fn join_network(
             pages::Notice::failed(
                 "This machine's daemon could not be identified, so there is no host to                  add. Set CI_DEFAULT_NODE to its daemon id or name.",
             ),
-        );
+        )
+        .await;
     }
     let Some(network) = pool.find(&network_id) else {
         return render_networks(
             &state,
             who.as_ref(),
             pages::Notice::failed("That network no longer exists on this account."),
-        );
+        )
+        .await;
     };
     let network_name = network.network_name.clone();
 
@@ -1227,7 +1289,7 @@ async fn join_network(
             pages::Notice::failed(e.to_string())
         }
     };
-    render_networks(&state, who.as_ref(), notice)
+    render_networks(&state, who.as_ref(), notice).await
 }
 
 #[cfg(test)]

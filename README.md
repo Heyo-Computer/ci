@@ -245,6 +245,20 @@ CI_NETWORK=prod-runners,lab      # serve two; the first is the default
 CI_NETWORK='*'                   # serve every network on the account
 ```
 
+`/networks` carries a **Queue** column: what is waiting on each host's subject
+and each network's unpinned subject, read straight from JetStream. Exact rather
+than sampled, because `WorkQueue` retention deletes on ack — the count *is* the
+backlog.
+
+The reading that matters is **`no consumer`**, flagged in red on a host that is
+online. Consumers are bound only for online hosts while `route_for` pins a job to
+its node whatever its status, so a job can be routed to a subject nothing reads.
+That is what a stuck run looks like from the outside, and it used to be
+answerable only by curling the NATS monitoring endpoint. On an *offline* host the
+same state is expected and is stated rather than alarmed about. NATS being
+unreachable is a banner, not a page of zeroes — an idle queue and an unreadable
+one must not look alike.
+
 `/networks` lists **every** heyvm network on the account with the hosts in each,
 whether or not this instance builds for it, plus the daemons that joined no
 network at all. That last list is there because "my runner isn't picking up

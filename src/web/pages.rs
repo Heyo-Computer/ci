@@ -147,6 +147,7 @@ pub fn layout(app_name: &str, current: &str, who: Option<&str>, body: Markup) ->
                         a href="/" class=[(current == "runs").then_some("on")] { "Runs" }
                         a href="/networks" class=[(current == "networks").then_some("on")] { "Networks" }
                         a href="/workflows" class=[(current == "workflows").then_some("on")] { "Workflows" }
+                        a href="/vms" class=[(current == "vms").then_some("on")] { "VMs" }
                         a href="/repos" class=[(current == "repos").then_some("on")] { "Repositories" }
                     }
                     @if let Some(who) = who {
@@ -277,6 +278,145 @@ impl Notice {
             error: Some(message.into()),
         }
     }
+}
+
+/// A job id is `<run>.<job key>`; the run is already its own column here, so
+/// only the key is worth the width.
+fn short_job(job_id: &str) -> &str {
+    job_id
+        .rsplit_once('.')
+        .map(|(_, key)| key)
+        .unwrap_or(job_id)
+}
+
+/// `GET /vms` — the warm pool, and what is left over in it.
+///
+/// Two questions this has to answer, and the layout follows them. **Is reuse
+/// working**: rows are grouped by runner and fingerprint, because a pool that is
+/// working shows one row per fingerprint per host and a pool that is not shows
+/// several. **What is left over**: each row carries the outcome of the run that
+/// last used it, so a machine a failed build left behind is visible rather than
+/// inferred.
+pub fn vms_page(
+    app_name: &str,
+    who: Option<&str>,
+    vms: &[crate::pool::PooledVmView],
+    notice: &Notice,
+) -> Markup {
+    // A fingerprint appearing twice on one host means two VMs that could have
+    // been one — the pool missing, not doing its job.
+    let mut seen: std::collections::BTreeMap<(&str, &str), usize> =
+        std::collections::BTreeMap::new();
+    for v in vms {
+        *seen
+            .entry((v.runner_hd_id.as_str(), v.fingerprint.as_str()))
+            .or_default() += 1;
+    }
+    let idle_failed = vms
+        .iter()
+        .filter(|v| {
+            v.status == "idle"
+                && matches!(
+                    v.last_run_status.as_deref(),
+                    Some("failure") | Some("cancelled")
+                )
+        })
+        .count();
+
+    let body = html! {
+        @if let Some(err) = &notice.error { div .banner { (err) } }
+        @if let Some(ok) = &notice.ok { div .notice { (ok) } }
+
+        section {
+            h2 { "Warm VMs" }
+            p .sub {
+                "Every VM this orchestrator has pooled, on the hosts it serves. A job \
+                 reuses one when its fingerprint matches — so two rows with the same \
+                 fingerprint on the same host means reuse did not happen."
+            }
+
+            @if idle_failed > 0 {
+                form method="post" action="/vms/cleanup-failed" {
+                    button type="submit" {
+                        "Destroy " (idle_failed) " idle VM(s) left by failed runs"
+                    }
+                }
+            }
+
+            @if vms.is_empty() {
+                p .empty {
+                    "Nothing is pooled. A VM appears here once a job builds or claims one."
+                }
+            } @else {
+                div .scroll {
+                    table {
+                        thead { tr {
+                            th { "VM" } th { "Host" } th { "Fingerprint" } th { "Status" }
+                            th { "Last run" } th { "Age" } th { "Last used" } th { }
+                        } }
+                        tbody {
+                            @for v in vms {
+                                tr {
+                                    td .mono {
+                                        (v.sandbox_id)
+                                        // What the VM was built for. Part of its
+                                        // identity, and the first thing to look
+                                        // at when a fingerprint is unfamiliar.
+                                        @if !v.workflow_id.trim().is_empty() {
+                                            span .meta { " " (v.workflow_id) }
+                                        }
+                                    }
+                                    td .mono { (v.runner_hd_id) }
+                                    td .mono {
+                                        (short(&v.fingerprint, 12))
+                                        @if seen.get(&(v.runner_hd_id.as_str(), v.fingerprint.as_str()))
+                                            .copied().unwrap_or(0) > 1 {
+                                            " " span .pill.failure { "not reused" }
+                                        }
+                                    }
+                                    td {
+                                        (pill(&v.status))
+                                        @if v.status == "claimed" && v.leased_by.is_some() {
+                                            span .meta { " held" }
+                                        }
+                                    }
+                                    td {
+                                        @match (&v.last_run_id, &v.last_run_status) {
+                                            (Some(id), Some(st)) => a href={ "/runs/" (id) } { (pill(st)) },
+                                            _ => span .meta { "—" },
+                                        }
+                                        // Which job, so a VM can be traced to the
+                                        // work that left it in this state.
+                                        @if let Some(job) = v.claimed_by_job.as_ref().or(v.last_job.as_ref()) {
+                                            span .meta { " " (short_job(job)) }
+                                        }
+                                    }
+                                    td .mono {
+                                        ((chrono::Utc::now() - v.created_at)
+                                            .to_std()
+                                            .map(human_duration)
+                                            .unwrap_or_else(|_| "—".into()))
+                                    }
+                                    td .mono { (v.last_used_at.format("%Y-%m-%d %H:%M").to_string()) }
+                                    td {
+                                        // A claimed VM has a job on it; destroying
+                                        // it would fail that build from underneath.
+                                        @if v.status != "claimed" {
+                                            form method="post"
+                                                 action={ "/vms/" (v.sandbox_id) "/destroy" } {
+                                                button .quiet type="submit" { "Destroy" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+    layout(app_name, "vms", who, body)
 }
 
 /// `GET /networks` — every network on the account, the hosts in each, and which
@@ -447,6 +587,64 @@ mod tests {
     fn an_anonymous_request_renders_no_identity() {
         let html = networks_page("ci", None, &populated(), &Notice::default()).into_string();
         assert!(!html.contains(r#"class="who""#));
+    }
+
+    fn pooled(
+        sandbox: &str,
+        runner: &str,
+        fingerprint: &str,
+        status: &str,
+        run_status: Option<&str>,
+    ) -> crate::pool::PooledVmView {
+        crate::pool::PooledVmView {
+            sandbox_id: sandbox.into(),
+            runner_hd_id: runner.into(),
+            fingerprint: fingerprint.into(),
+            workflow_id: "build".into(),
+            status: status.into(),
+            claimed_by_job: None,
+            last_job: Some("run.build".into()),
+            last_run_id: run_status.map(|_| "019fca648a6e-00000000".to_string()),
+            last_run_status: run_status.map(str::to_string),
+            leased_by: None,
+            created_at: chrono::Utc::now(),
+            last_used_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The two questions the page exists to answer.
+    #[test]
+    fn the_vms_page_shows_reuse_and_what_failed_runs_left_behind() {
+        let vms = [
+            pooled("sb-1", "hd-1", "fp-aaaa", "idle", Some("success")),
+            // Same host, same fingerprint: two VMs where one would have done.
+            pooled("sb-2", "hd-1", "fp-aaaa", "idle", Some("failure")),
+            pooled("sb-3", "hd-1", "fp-bbbb", "claimed", Some("running")),
+        ];
+        let html = vms_page("ci", None, &vms, &Notice::default()).into_string();
+
+        assert!(
+            html.contains("not reused"),
+            "a repeated fingerprint is flagged"
+        );
+        assert!(html.contains("Destroy 1 idle VM(s) left by failed runs"));
+        // A claimed VM must not be offered for destruction — that would fail a
+        // live build from underneath.
+        assert!(html.contains(r#"action="/vms/sb-1/destroy""#));
+        assert!(!html.contains(r#"action="/vms/sb-3/destroy""#), "{html}");
+    }
+
+    /// With nothing left over there is nothing to sweep, so the bulk action is
+    /// absent rather than a button that reports doing nothing.
+    #[test]
+    fn a_healthy_pool_offers_no_cleanup() {
+        let vms = [pooled("sb-1", "hd-1", "fp-aaaa", "idle", Some("success"))];
+        let html = vms_page("ci", None, &vms, &Notice::default()).into_string();
+        assert!(!html.contains("cleanup-failed"), "{html}");
+        assert!(!html.contains("not reused"));
+
+        let html = vms_page("ci", None, &[], &Notice::default()).into_string();
+        assert!(html.contains("Nothing is pooled"));
     }
 
     /// The join button is offered only where it would do something: a network

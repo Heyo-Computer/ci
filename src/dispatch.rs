@@ -35,6 +35,7 @@ use crate::runners::Runners;
 use crate::store::{JobStatus, RunStatus, StepStatus, Store, step_id};
 use crate::vm::{ExecOutput, Vm, VmError, Vms, sandbox_name};
 use crate::workflow::{Fallback, Step};
+use async_nats::jetstream::AckKind;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -1438,12 +1439,12 @@ async fn copy_tree(
 /// must not hold up another runner's queue, and JetStream's per-consumer
 /// `num_pending` is only a useful backlog number if each consumer serves one
 /// host.
-async fn consume(dispatcher: Arc<Dispatcher>, route: Route, max_job: Duration) {
+async fn consume(dispatcher: Arc<Dispatcher>, route: Route) {
     use futures::StreamExt;
 
     let label = format!("{route:?}");
     loop {
-        let consumer = match dispatcher.bus.consumer_for(&route, max_job).await {
+        let consumer = match dispatcher.bus.consumer_for(&route).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!("{label}: could not bind a consumer, retrying: {e}");
@@ -1478,7 +1479,55 @@ async fn consume(dispatcher: Arc<Dispatcher>, route: Route, max_job: Duration) {
                 continue;
             };
 
-            match dispatcher.run_job(&job, attempt).await {
+            // Tell JetStream this job is still being worked on, for as long as
+            // it is. `ack_wait` is deliberately short so a dispatcher that dies
+            // releases its job in about a minute; this is what stops that same
+            // short window from redelivering a *healthy* long build underneath
+            // itself and putting two dispatchers on one VM.
+            let msg = Arc::new(msg);
+            let heartbeat = {
+                let msg = Arc::clone(&msg);
+                let job_key = job.job_key.clone();
+                tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(crate::bus::ACK_PROGRESS_EVERY);
+                    // The first tick is immediate and would be a no-op ack a
+                    // moment after delivery.
+                    ticker.tick().await;
+                    loop {
+                        ticker.tick().await;
+                        if let Err(e) = msg.ack_with(AckKind::Progress).await {
+                            // Logged, not fatal: one missed heartbeat still
+                            // leaves most of the window, and the next tick may
+                            // well land.
+                            tracing::warn!(job = %job_key, "could not extend the ack window: {e}");
+                        }
+                    }
+                })
+            };
+
+            // `CI_MAX_JOB_SECONDS` is enforced here, and only here. It used to
+            // reach JetStream as `ack_wait` and nothing else, so once the ack
+            // window stopped being derived from it the setting would have become
+            // decorative — a documented ceiling on a job that bounded nothing.
+            //
+            // A job cut off this way leaves its VM claimed, because `run_job`
+            // never reaches its own release. The lease reclaims it once this
+            // dispatcher stops renewing, which is exactly the case leases exist
+            // for.
+            let ceiling = dispatcher.config.max_job_duration;
+            let outcome =
+                match tokio::time::timeout(ceiling, dispatcher.run_job(&job, attempt)).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err(DispatchError::JobTimeout {
+                        job: job.job_key.clone(),
+                        after: ceiling,
+                    }),
+                };
+            // Before the ack, always — including on the error paths below, which
+            // is why it is aborted here rather than in each arm.
+            heartbeat.abort();
+
+            match outcome {
                 Ok(status) => {
                     tracing::info!(job = %job.job_key, "finished: {}", status.as_str());
                     let _ = msg.ack().await;
@@ -1529,11 +1578,6 @@ impl Dispatcher {
     /// or brought into `CI_NETWORK=*`'s scope — is picked up the same way.
     pub fn spawn_consumers(self: Arc<Self>) {
         let interval = self.config.heyvm.refresh_interval;
-        // The longest job any consumer might see bounds `ack_wait`. Derived from
-        // the configured ceiling rather than per-job, because the consumer is
-        // created before the job is known.
-        let max_job = self.config.max_job_duration;
-
         tokio::spawn(async move {
             let mut running: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
             let mut ticker = tokio::time::interval(interval);
@@ -1568,7 +1612,7 @@ impl Dispatcher {
                     tracing::info!("starting a consumer for {key}");
                     let d = self.clone();
                     let r = route.clone();
-                    running.insert(key, tokio::spawn(consume(d, r, max_job)));
+                    running.insert(key, tokio::spawn(consume(d, r)));
                 }
             }
         });
@@ -1579,6 +1623,89 @@ impl Dispatcher {
         crate::pool::Lease {
             instance: &self.config.instance_id,
             ttl: self.config.vm_lease,
+        }
+    }
+
+    /// Every pooled VM on the runners this instance serves.
+    pub async fn vm_inventory(&self) -> Result<Vec<crate::pool::PooledVmView>, DispatchError> {
+        let ours = self.served_runner_ids();
+        Ok(self.pool.inventory(&ours).await?)
+    }
+
+    /// The hosts this instance may act on. Scoping every pool operation to them
+    /// is what keeps two orchestrators from destroying each other's machines.
+    fn served_runner_ids(&self) -> Vec<String> {
+        self.runners
+            .snapshot()
+            .all_runners()
+            .map(|r| r.id.clone())
+            .collect()
+    }
+
+    /// Destroy VMs that have been taken out of circulation, and forget them.
+    ///
+    /// The row goes only once the daemon confirms — a row removed while the
+    /// sandbox survives is a VM nothing will ever clean up again. A failure
+    /// leaves it `draining`, which keeps it out of the pool and visible on the
+    /// page rather than silently back in rotation.
+    async fn destroy_swept(&self, taken: Vec<crate::pool::PooledVm>) -> (usize, Vec<String>) {
+        let mut destroyed = 0;
+        let mut failed = Vec::new();
+        for vm in taken {
+            let result = async {
+                let options = self.runners.options_for(&vm.runner_hd_id).await?;
+                let handle = self.vms.open(options, vm.sandbox_id.clone()).await?;
+                handle.destroy().await?;
+                Ok::<_, DispatchError>(())
+            }
+            .await;
+
+            match result {
+                Ok(()) => {
+                    if let Err(e) = self.pool.forget(&vm.sandbox_id).await {
+                        tracing::warn!(vm = %vm.sandbox_id, "destroyed but not forgotten: {e}");
+                    }
+                    destroyed += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(vm = %vm.sandbox_id, "could not destroy: {e}");
+                    failed.push(format!("{}: {e}", vm.sandbox_id));
+                }
+            }
+        }
+        (destroyed, failed)
+    }
+
+    /// Destroy one pooled VM by id.
+    pub async fn destroy_pooled_vm(&self, sandbox_id: &str) -> Result<String, DispatchError> {
+        let ours = self.served_runner_ids();
+        let Some(taken) = self.pool.take_one_for_sweep(sandbox_id, &ours).await? else {
+            return Err(DispatchError::VmNotSweepable(sandbox_id.to_string()));
+        };
+        let (destroyed, failed) = self.destroy_swept(vec![taken]).await;
+        if destroyed == 1 {
+            Ok(format!("{sandbox_id} is destroyed and out of the pool."))
+        } else {
+            Err(DispatchError::Artifact(failed.join("; ")))
+        }
+    }
+
+    /// Destroy every idle VM whose last run failed.
+    pub async fn destroy_failed_vms(&self) -> Result<String, DispatchError> {
+        let ours = self.served_runner_ids();
+        let taken = self.pool.take_failed_for_sweep(&ours).await?;
+        if taken.is_empty() {
+            return Ok("No idle VM is left over from a failed run.".to_string());
+        }
+        let wanted = taken.len();
+        let (destroyed, failed) = self.destroy_swept(taken).await;
+        if failed.is_empty() {
+            Ok(format!("Destroyed {destroyed} VM(s) left by failed runs."))
+        } else {
+            Ok(format!(
+                "Destroyed {destroyed} of {wanted}. Still draining, and shown below: {}",
+                failed.join("; ")
+            ))
         }
     }
 
@@ -1791,6 +1918,13 @@ pub enum DispatchError {
         node: String,
         served: Vec<String>,
     },
+    /// A VM cannot be swept: unknown, on another instance's host, or claimed.
+    VmNotSweepable(String),
+    /// A job ran past `CI_MAX_JOB_SECONDS`.
+    JobTimeout {
+        job: String,
+        after: Duration,
+    },
     /// `uses:` named a VM that the pinned node does not have.
     UnknownVm {
         wanted: String,
@@ -1872,6 +2006,18 @@ impl std::fmt::Display for DispatchError {
                  host could not be identified. Set CI_DEFAULT_NODE to its daemon id \
                  or name — heyvmd reports its own id only when BACKEND_SERVER_ID is \
                  set in its environment, so it is often not discoverable."
+            ),
+            Self::VmNotSweepable(id) => write!(
+                f,
+                "{id} cannot be destroyed from here. It is either unknown, on a host \
+                 this orchestrator does not serve, or currently running a job — a \
+                 claimed VM is left alone so cleaning up cannot fail a live build."
+            ),
+            Self::JobTimeout { job, after } => write!(
+                f,
+                "job {job:?} ran past CI_MAX_JOB_SECONDS ({}s) and was cut off. Its VM \
+                 is reclaimed once this dispatcher's lease on it lapses.",
+                after.as_secs()
             ),
             Self::UnknownVm {
                 wanted,
@@ -2631,12 +2777,7 @@ jobs:
             Route::Runner("hd-local".into()),
             Route::Network("local".into()),
         ] {
-            consumers.push(
-                d.bus
-                    .consumer_for(&route, Duration::from_secs(600))
-                    .await
-                    .expect("consumer"),
-            );
+            consumers.push(d.bus.consumer_for(&route).await.expect("consumer"));
         }
 
         for _ in 0..20 {

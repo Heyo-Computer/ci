@@ -53,13 +53,39 @@ use std::time::Duration;
 /// and redelivers. Must exceed the job timeout plus the poll interval, or a
 /// perfectly healthy job is redelivered while it is still running — and then two
 /// dispatchers are driving one VM.
-const ACK_WAIT_SLACK: Duration = Duration::from_secs(60);
+/// How long JetStream waits for an ack before redelivering.
+///
+/// Short on purpose. The executor extends it with `AckKind::Progress` every
+/// [`ACK_PROGRESS_EVERY`] for as long as a job is running, so this is not a
+/// ceiling on job length — it is how quickly a job is released when the process
+/// running it *stops* saying anything, which is the case that matters after a
+/// crash or a restart.
+pub const ACK_WAIT: Duration = Duration::from_secs(60);
+
+/// How often a running job says it is still running.
+///
+/// Comfortably inside [`ACK_WAIT`], so a slow round trip or a busy runtime does
+/// not cost a redelivery — that would put two dispatchers on one VM, which is
+/// far worse than releasing a dead job a minute late.
+pub const ACK_PROGRESS_EVERY: Duration = Duration::from_secs(20);
 
 /// Redelivery ladder, indexed by attempt and saturating at the last entry.
+///
+/// **The first entry must equal [`ACK_WAIT`]**, and that is not a style rule —
+/// nats-server *overrides* a consumer's `ack_wait` with `backoff[0]` whenever a
+/// ladder is set. The two are one setting wearing two names, and the server
+/// believes the ladder.
+///
+/// This ladder used to start at one second while `ack_wait` was configured as
+/// the whole job budget, so the configured value was silently discarded and
+/// every running job became eligible for redelivery a second after it started.
+/// With `max_deliver` at four, a healthy build could burn all four deliveries
+/// while doing nothing wrong — after which a dispatcher that died had no
+/// redelivery left to recover it at all.
 const BACKOFF: [Duration; 3] = [
-    Duration::from_secs(1),
-    Duration::from_secs(5),
-    Duration::from_secs(30),
+    ACK_WAIT,
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(15 * 60),
 ];
 
 pub fn backoff_for(attempt: u32) -> Duration {
@@ -226,14 +252,24 @@ impl Bus {
 
     /// Bind (creating if needed) the durable consumer for a route.
     ///
-    /// `ack_wait` is derived from the longest job this consumer may see. Set it
-    /// too low and a healthy long build is redelivered mid-run, putting two
-    /// dispatchers on one VM.
-    pub async fn consumer_for(
-        &self,
-        route: &Route,
-        max_job: Duration,
-    ) -> Result<PullConsumer, BusError> {
+    /// `ack_wait` is [`ACK_WAIT`] — short, and deliberately **not** derived from
+    /// the longest job. The executor sends `AckKind::Progress` while a job runs,
+    /// which extends the window by another `ack_wait` each time, so a healthy
+    /// build of any length is never redelivered while its dispatcher is alive.
+    ///
+    /// Sizing it to `CI_MAX_JOB_SECONDS` instead — the obvious reading of "never
+    /// redeliver a running job" — meant a dispatcher that *died* held its job for
+    /// the entire job budget, four hours by default, with the run showing
+    /// `running` the whole time. The heartbeat says "still working" rather than
+    /// the configuration promising it in advance.
+    ///
+    /// **An existing consumer is reconciled, not reused blindly.** JetStream
+    /// returns the consumer that is already there and ignores the config passed
+    /// with it, so an installation upgrading into this would silently keep its
+    /// old four-hour window and none of this would take effect. A mismatch is
+    /// therefore repaired by deleting and recreating, which costs one
+    /// redelivery of anything in flight at the moment of the upgrade.
+    pub async fn consumer_for(&self, route: &Route) -> Result<PullConsumer, BusError> {
         let durable = self.durable_for(route)?;
         let filter = self.subject_for(route)?;
         let stream = self
@@ -245,18 +281,44 @@ impl Bus {
                 reason: e.to_string(),
             })?;
 
+        let config = PullConfig {
+            durable_name: Some(durable.clone()),
+            filter_subject: filter,
+            ack_wait: ACK_WAIT,
+            max_deliver: MAX_DELIVER,
+            backoff: BACKOFF.to_vec(),
+            ..Default::default()
+        };
+
+        let consumer = stream
+            .get_or_create_consumer(&durable, config.clone())
+            .await
+            .map_err(|e| BusError::Consumer {
+                durable: durable.clone(),
+                reason: e.to_string(),
+            })?;
+
+        // Only the window matters here; every other field is either derived from
+        // the route or unchanged since this consumer was created.
+        let mut consumer = consumer;
+        let current = consumer.info().await.map(|i| i.config.ack_wait).ok();
+        if current == Some(ACK_WAIT) {
+            return Ok(consumer);
+        }
+        tracing::info!(
+            "{durable}: ack_wait is {:?}, recreating it as {ACK_WAIT:?} so a dead \
+             dispatcher releases its job promptly",
+            current
+        );
         stream
-            .get_or_create_consumer(
-                &durable,
-                PullConfig {
-                    durable_name: Some(durable.clone()),
-                    filter_subject: filter,
-                    ack_wait: max_job + ACK_WAIT_SLACK,
-                    max_deliver: MAX_DELIVER,
-                    backoff: BACKOFF.to_vec(),
-                    ..Default::default()
-                },
-            )
+            .delete_consumer(&durable)
+            .await
+            .map_err(|e| BusError::Consumer {
+                durable: durable.clone(),
+                reason: format!("deleting the stale consumer: {e}"),
+            })?;
+        stream
+            .get_or_create_consumer(&durable, config)
             .await
             .map_err(|e| BusError::Consumer {
                 durable,
@@ -381,13 +443,25 @@ mod tests {
     }
 
     #[test]
+    /// nats-server overrides `ack_wait` with `backoff[0]` when a ladder is set,
+    /// so the two must agree or the configured window is silently discarded.
+    /// This is a compile-time guard on the pair; the server's behaviour itself
+    /// is pinned by `an_existing_consumer_with_the_wrong_ack_wait_is_recreated`.
+    #[test]
+    fn the_first_backoff_step_is_the_ack_wait() {
+        assert_eq!(
+            BACKOFF[0], ACK_WAIT,
+            "nats-server takes ack_wait from backoff[0]; they cannot disagree"
+        );
+    }
+
     fn the_backoff_ladder_saturates() {
-        assert_eq!(backoff_for(1), Duration::from_secs(1));
-        assert_eq!(backoff_for(2), Duration::from_secs(5));
-        assert_eq!(backoff_for(3), Duration::from_secs(30));
-        assert_eq!(backoff_for(99), Duration::from_secs(30));
+        assert_eq!(backoff_for(1), ACK_WAIT);
+        assert_eq!(backoff_for(2), Duration::from_secs(5 * 60));
+        assert_eq!(backoff_for(3), Duration::from_secs(15 * 60));
+        assert_eq!(backoff_for(99), Duration::from_secs(15 * 60));
         // Attempt 0 should not underflow into a panic.
-        assert_eq!(backoff_for(0), Duration::from_secs(1));
+        assert_eq!(backoff_for(0), ACK_WAIT);
     }
 
     #[test]
@@ -461,10 +535,7 @@ mod tests {
         };
         // Consumer first: creating it after publishing still works for a
         // durable, but binding first is what a dispatcher actually does.
-        let consumer = bus
-            .consumer_for(&route, Duration::from_secs(60))
-            .await
-            .expect("consumer");
+        let consumer = bus.consumer_for(&route).await.expect("consumer");
         bus.publish_job(&route, &msg).await.expect("published");
 
         let mut batch = consumer.fetch().max_messages(1).messages().await.unwrap();
@@ -489,8 +560,8 @@ mod tests {
         let a = Route::Runner("hd-a".into());
         let b = Route::Runner("hd-b".into());
 
-        let ca = bus.consumer_for(&a, Duration::from_secs(60)).await.unwrap();
-        let cb = bus.consumer_for(&b, Duration::from_secs(60)).await.unwrap();
+        let ca = bus.consumer_for(&a).await.unwrap();
+        let cb = bus.consumer_for(&b).await.unwrap();
 
         for (route, key) in [(&a, "for-a"), (&b, "for-b")] {
             bus.publish_job(
@@ -529,6 +600,50 @@ mod tests {
         cleanup(&bus).await;
     }
 
+    /// The half of this that is easy to ship broken.
+    ///
+    /// JetStream returns an existing durable and ignores the config passed with
+    /// it, so an installation upgrading into a shorter `ack_wait` would keep its
+    /// old one and none of the fix would take effect — the code would look
+    /// right and the four-hour window would still be there.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_NATS_URL"]
+    async fn an_existing_consumer_with_the_wrong_ack_wait_is_recreated() {
+        let prefix = test_prefix();
+        let bus = test_bus(&prefix).await;
+        let route = Route::Runner("hd-ackwait".into());
+        let durable = bus.durable_for(&route).unwrap();
+
+        // Stand in for a consumer created by a previous build.
+        let stream = bus.js.get_stream(&bus.jobs_stream).await.unwrap();
+        stream
+            .get_or_create_consumer(
+                &durable,
+                PullConfig {
+                    durable_name: Some(durable.clone()),
+                    filter_subject: bus.subject_for(&route).unwrap(),
+                    ack_wait: Duration::from_secs(4 * 60 * 60),
+                    max_deliver: MAX_DELIVER,
+                    backoff: BACKOFF.to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the old consumer");
+
+        let mut reconciled = bus.consumer_for(&route).await.expect("consumer");
+        assert_eq!(
+            reconciled.info().await.unwrap().config.ack_wait,
+            ACK_WAIT,
+            "an upgrade must not silently keep the old window"
+        );
+
+        // And binding again is a no-op rather than a delete/recreate cycle,
+        // which would redeliver in-flight work on every reconnect.
+        let mut again = bus.consumer_for(&route).await.expect("consumer");
+        assert_eq!(again.info().await.unwrap().config.ack_wait, ACK_WAIT);
+    }
+
     /// A client that retries a submit it never saw the response to must not
     /// enqueue the job twice.
     #[tokio::test]
@@ -537,10 +652,7 @@ mod tests {
         let prefix = test_prefix();
         let bus = test_bus(&prefix).await;
         let route = Route::Runner("hd-dedupe".into());
-        let _ = bus
-            .consumer_for(&route, Duration::from_secs(60))
-            .await
-            .unwrap();
+        let _ = bus.consumer_for(&route).await.unwrap();
 
         let msg = JobMessage {
             run_id: "run1".into(),

@@ -280,12 +280,12 @@ pub struct Config {
     /// [`ALLOW_UNAUTHENTICATED_RUNNERS`].
     pub allow_unauthenticated_runners: bool,
 
-    /// Ceiling on any one job, and the basis for JetStream's `ack_wait`.
+    /// Ceiling on any one job, enforced by the executor.
     ///
-    /// A consumer is bound before it knows which job it will get, so `ack_wait`
-    /// has to be derived from the longest job that is allowed to exist. Set it
-    /// below a real job's runtime and JetStream redelivers healthy work
-    /// mid-build, putting two dispatchers on one VM.
+    /// No longer the basis for JetStream's `ack_wait`: a running job now extends
+    /// its own ack window with `AckKind::Progress`, so the queue does not need
+    /// to be told in advance how long a build might take. This is the wall clock
+    /// a job is cut off at, and the only thing that bounds a runaway one.
     pub max_job_duration: Duration,
 
     /// Identifies this process among orchestrators sharing a database.

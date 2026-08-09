@@ -311,6 +311,27 @@ Two decisions in there:
   `Cargo.lock`" and "an empty `Cargo.lock`" indistinguishable, so *adding* a
   lockfile later would not bust the pool — the moment it most needs busting.
 
+`/vms` shows the pool and answers the two questions worth asking of it. **Is
+reuse working** — rows are grouped by host and fingerprint, and a fingerprint
+appearing twice on one host is flagged `not reused`, because that is two VMs
+where one would have done. **What was left behind** — each row carries the
+outcome of the run that last used it, so a machine a failed build left in a
+strange state is visible rather than inferred, and reusable-by-fingerprint is
+exactly why that matters.
+
+Cleanup destroys a single VM, or every idle one whose last run failed. Both go
+through `take_for_sweep`'s pattern: the row is marked `draining` first, so a
+concurrent claim cannot hand out a machine that is about to be killed, and it is
+only forgotten once the daemon confirms the sandbox is gone — a row removed while
+the VM survives is a VM nothing will ever clean up again. **A claimed VM is
+refused**, in the query rather than only in the page, so cleaning up cannot fail
+a live build from underneath. Everything is scoped to the hosts this instance
+serves, for the same reason the sweep always was.
+
+`ci_vm_pool.last_job` is kept after a claim is released. `claimed_by_job`
+answers "who holds this now" and is nulled on release; it cannot answer "which
+run left this behind", which is the question cleanup is asking.
+
 The pool table survives a restart. Without it a crash orphans every VM until its
 TTL, and the next run builds a second pool beside the one already sitting there.
 
@@ -476,6 +497,28 @@ two consumers would silently eat each other's work.
 A queue message carries **ids only**. The expanded plan lives in `ci_job.plan`,
 so a redelivery runs exactly what the original delivery would have, even if the
 branch moved underneath it.
+
+### `ack_wait` is short, and the job says it is still running
+
+A dispatcher extends its claim on a message with `AckKind::Progress` every 20
+seconds for as long as a job runs, so `ack_wait` is 60 seconds rather than a
+ceiling derived from `CI_MAX_JOB_SECONDS`. A build of any length is safe while
+its dispatcher is alive, and one that *dies* releases its job in about a minute
+instead of holding it for the whole job budget.
+
+**`backoff[0]` and `ack_wait` are one setting.** nats-server overrides `ack_wait`
+with the first entry of the backoff ladder whenever a ladder is set — verified
+against a live server, not inferred. The ladder here used to start at one second
+while `ack_wait` was configured as four hours, so the configured value was
+discarded and every running job became eligible for redelivery a second after it
+started; with `max_deliver` at four, a healthy build could burn all four
+deliveries while doing nothing wrong, leaving a dispatcher that died with no
+redelivery left to recover it. A unit test now pins the two together and an
+integration test pins the server's behaviour.
+
+Binding also **reconciles an existing consumer**: JetStream returns the durable
+that is already there and ignores the config passed with it, so an upgrade would
+otherwise keep the old window and none of this would take effect.
 
 ### Migrations
 

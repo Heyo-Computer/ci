@@ -130,6 +130,27 @@ impl PooledVm {
     }
 }
 
+/// A pooled VM as the dashboard shows it: the row, plus what its last job did.
+///
+/// The join is what makes the page answer the two questions worth asking of a
+/// warm pool — "is anything being reused" (same fingerprint, same runner, more
+/// than one row) and "is this left over from a build that failed".
+#[derive(Debug, Clone)]
+pub struct PooledVmView {
+    pub sandbox_id: String,
+    pub runner_hd_id: String,
+    pub fingerprint: String,
+    pub workflow_id: String,
+    pub status: String,
+    pub claimed_by_job: Option<String>,
+    pub last_job: Option<String>,
+    pub last_run_id: Option<String>,
+    pub last_run_status: Option<String>,
+    pub leased_by: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_used_at: chrono::DateTime<chrono::Utc>,
+}
+
 #[derive(Clone)]
 pub struct Pool {
     db: PgPool,
@@ -162,6 +183,7 @@ impl Pool {
         let row = sqlx::query(
             "UPDATE ci_vm_pool
                 SET status = 'claimed', claimed_by_job = $3, last_used_at = now(),
+                    last_job = $3,
                     leased_by = $4, leased_until = now() + make_interval(secs => $5)
               WHERE sandbox_id = (
                     SELECT sandbox_id FROM ci_vm_pool
@@ -199,10 +221,10 @@ impl Pool {
         sqlx::query(
             "INSERT INTO ci_vm_pool
                 (sandbox_id, runner_hd_id, fingerprint, workflow_id, status, claimed_by_job,
-                 leased_by, leased_until)
-             VALUES ($1,$2,$3,$4,'claimed',$5,$6, now() + make_interval(secs => $7))
+                 last_job, leased_by, leased_until)
+             VALUES ($1,$2,$3,$4,'claimed',$5,$5,$6, now() + make_interval(secs => $7))
              ON CONFLICT (sandbox_id) DO UPDATE
-                SET status='claimed', claimed_by_job=$5, last_used_at=now(),
+                SET status='claimed', claimed_by_job=$5, last_job=$5, last_used_at=now(),
                     leased_by=$6, leased_until=now() + make_interval(secs => $7)",
         )
         .bind(sandbox_id)
@@ -268,6 +290,113 @@ impl Pool {
             .fetch_all(&self.db)
             .await
             .map_err(PoolError::sql)?;
+        Ok(rows.iter().map(PooledVm::from_row).collect())
+    }
+
+    /// Every pooled VM on the runners this instance serves, with the outcome of
+    /// the run that last used each.
+    pub async fn inventory(&self, runners: &[String]) -> Result<Vec<PooledVmView>, PoolError> {
+        if runners.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT p.sandbox_id, p.runner_hd_id, p.fingerprint, p.workflow_id, p.status,
+                    p.claimed_by_job, p.last_job, p.leased_by, p.created_at, p.last_used_at,
+                    r.id AS last_run_id, r.status AS last_run_status
+               FROM ci_vm_pool p
+               LEFT JOIN ci_job j ON j.id = COALESCE(p.claimed_by_job, p.last_job)
+               LEFT JOIN ci_run r ON r.id = j.run_id
+              WHERE p.runner_hd_id = ANY($1)
+              ORDER BY p.runner_hd_id, p.fingerprint, p.last_used_at DESC",
+        )
+        .bind(runners)
+        .fetch_all(&self.db)
+        .await
+        .map_err(PoolError::sql)?;
+        Ok(rows
+            .iter()
+            .map(|r| PooledVmView {
+                sandbox_id: r.get("sandbox_id"),
+                runner_hd_id: r.get("runner_hd_id"),
+                fingerprint: r.get("fingerprint"),
+                workflow_id: r.get("workflow_id"),
+                status: r.get("status"),
+                claimed_by_job: r.get("claimed_by_job"),
+                last_job: r.get("last_job"),
+                last_run_id: r.get("last_run_id"),
+                last_run_status: r.get("last_run_status"),
+                leased_by: r.get("leased_by"),
+                created_at: r.get("created_at"),
+                last_used_at: r.get("last_used_at"),
+            })
+            .collect())
+    }
+
+    /// Take one idle VM out of circulation so it can be destroyed.
+    ///
+    /// `draining` rather than a straight delete, for the reason
+    /// [`Self::take_for_sweep`] gives: the row should only go away once the
+    /// daemon confirms the sandbox is gone, and marking it first stops a
+    /// concurrent `claim` handing out a machine that is about to be killed.
+    ///
+    /// A *claimed* VM is refused. It has a job on it, and destroying it would
+    /// fail that build from underneath — cleaning up is for what was left
+    /// behind, not for what is running.
+    pub async fn take_one_for_sweep(
+        &self,
+        sandbox_id: &str,
+        runners: &[String],
+    ) -> Result<Option<PooledVm>, PoolError> {
+        if runners.is_empty() {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "UPDATE ci_vm_pool
+                SET status = 'draining'
+              WHERE sandbox_id = $1
+                AND runner_hd_id = ANY($2)
+                AND status <> 'claimed'
+             RETURNING *",
+        )
+        .bind(sandbox_id)
+        .bind(runners)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(PoolError::sql)?;
+        Ok(row.as_ref().map(PooledVm::from_row))
+    }
+
+    /// Take every idle VM whose last run failed.
+    ///
+    /// The cleanup somebody actually wants after a bad build: those machines are
+    /// reusable as far as the fingerprint is concerned, which is exactly the
+    /// problem — a VM left in a strange state by a failed build is handed to the
+    /// next job that matches it.
+    pub async fn take_failed_for_sweep(
+        &self,
+        runners: &[String],
+    ) -> Result<Vec<PooledVm>, PoolError> {
+        if runners.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "UPDATE ci_vm_pool
+                SET status = 'draining'
+              WHERE sandbox_id IN (
+                    SELECT p.sandbox_id FROM ci_vm_pool p
+                      JOIN ci_job j ON j.id = p.last_job
+                      JOIN ci_run r ON r.id = j.run_id
+                     WHERE p.status = 'idle'
+                       AND p.runner_hd_id = ANY($1)
+                       AND r.status IN ('failure','cancelled')
+                     FOR UPDATE SKIP LOCKED
+              )
+             RETURNING *",
+        )
+        .bind(runners)
+        .fetch_all(&self.db)
+        .await
+        .map_err(PoolError::sql)?;
         Ok(rows.iter().map(PooledVm::from_row).collect())
     }
 
@@ -970,6 +1099,87 @@ mod tests {
             0,
             "an instance must never reclaim a VM it is holding"
         );
+    }
+
+    /// The two selections the cleanup page offers, and the guard that matters:
+    /// a VM with a job on it is never taken.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn sweeping_takes_what_failed_runs_left_and_never_a_running_job() {
+        let (pool, store) = test_pool().await;
+        let runner = runner_id();
+        let ours = std::slice::from_ref(&runner);
+
+        // Two runs on this runner: one that failed, one still going.
+        let mut ids = Vec::new();
+        for status in [
+            crate::store::RunStatus::Failure,
+            crate::store::RunStatus::Running,
+        ] {
+            let run_id = crate::vm::new_id();
+            let wf = crate::workflow::Workflow::parse(
+                "wf.yml",
+                "name: t\njobs:\n  build:\n    vm: { driver: firecracker }\n    \
+                 steps: [{ run: \"true\" }]\n",
+            )
+            .unwrap();
+            let plan = crate::plan::Plan::build(&wf).unwrap();
+            store
+                .create_run(&run_id, &crate::store::RunRequest::default(), &plan)
+                .await
+                .unwrap();
+            store.set_run_status(&run_id, status, None).await.unwrap();
+            ids.push(crate::store::job_id(&run_id, "build"));
+        }
+
+        // The failed run's VM went back to the pool, which is the problem: it is
+        // reusable as far as the fingerprint is concerned.
+        pool.register(
+            &sb(&runner, "failed"),
+            &runner,
+            "fp-f",
+            "wf",
+            &ids[0],
+            held(),
+        )
+        .await
+        .unwrap();
+        pool.release(&sb(&runner, "failed")).await.unwrap();
+        // The running one is still claimed.
+        pool.register(&sb(&runner, "busy"), &runner, "fp-b", "wf", &ids[1], held())
+            .await
+            .unwrap();
+
+        let taken = pool.take_failed_for_sweep(ours).await.unwrap();
+        assert_eq!(taken.len(), 1, "only the failed run's idle VM");
+        assert_eq!(taken[0].sandbox_id, sb(&runner, "failed"));
+
+        // Draining, so a concurrent claim cannot take it back while it is being
+        // destroyed.
+        assert_eq!(
+            pool.claim(&runner, "fp-f", "job-next", held())
+                .await
+                .unwrap(),
+            None
+        );
+
+        // And a claimed VM is refused outright, however it is asked for.
+        assert!(
+            pool.take_one_for_sweep(&sb(&runner, "busy"), ours)
+                .await
+                .unwrap()
+                .is_none(),
+            "a VM running a job must never be swept"
+        );
+
+        // The inventory carries the run outcome the page groups on.
+        let inv = pool.inventory(ours).await.unwrap();
+        let failed = inv
+            .iter()
+            .find(|v| v.sandbox_id == sb(&runner, "failed"))
+            .unwrap();
+        assert_eq!(failed.last_run_status.as_deref(), Some("failure"));
+        assert_eq!(failed.last_job.as_deref(), Some(ids[0].as_str()));
     }
 
     /// The keepalive's input: which VMs this instance is running a job on, and

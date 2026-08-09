@@ -88,6 +88,12 @@ pub fn router(
         // network grants host-shell access to it through the network, so it is
         // not a read.
         .route("/networks/{network_id}/join", post(join_network))
+        .route("/vms", get(vms_page))
+        // Admin-only: destroying a VM is destroying somebody's warm cache, and
+        // on a claimed one it would fail a live build — which is why the pool
+        // refuses those rather than trusting the page not to offer them.
+        .route("/vms/{sandbox_id}/destroy", post(destroy_vm))
+        .route("/vms/cleanup-failed", post(cleanup_failed_vms))
         .route("/workflows", get(workflows_page))
         // Behind the gate on purpose, and admin-only on top of it: a submit
         // token is the right to run code on a runner, so minting one is not a
@@ -1036,6 +1042,66 @@ async fn networks_page(State(state): State<AppState>, headers: HeaderMap) -> imp
         &state.runners.snapshot(),
         &pages::Notice::default(),
     )
+}
+
+async fn vms_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let who = Identity::from_headers(&headers);
+    render_vms(&state, who.as_ref(), pages::Notice::default()).await
+}
+
+async fn render_vms(
+    state: &AppState,
+    who: Option<&Identity>,
+    notice: pages::Notice,
+) -> axum::response::Response {
+    match state.dispatcher.vm_inventory().await {
+        Ok(vms) => pages::vms_page(&state.config.name, who.map(|i| i.display()), &vms, &notice)
+            .into_response(),
+        Err(e) => page_error(state, who, &e.to_string()),
+    }
+}
+
+async fn destroy_vm(
+    State(state): State<AppState>,
+    Path(sandbox_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let who = match may_manage(&state, &headers).await {
+        Ok(w) => w,
+        Err(response) => return response,
+    };
+    let notice = match state.dispatcher.destroy_pooled_vm(&sandbox_id).await {
+        Ok(message) => {
+            tracing::info!(
+                "destroyed pooled VM {sandbox_id} by {}",
+                who.as_ref().map(|w| w.display()).unwrap_or("anonymous")
+            );
+            pages::Notice::done(message)
+        }
+        Err(e) => pages::Notice::failed(e.to_string()),
+    };
+    render_vms(&state, who.as_ref(), notice).await
+}
+
+async fn cleanup_failed_vms(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let who = match may_manage(&state, &headers).await {
+        Ok(w) => w,
+        Err(response) => return response,
+    };
+    let notice = match state.dispatcher.destroy_failed_vms().await {
+        Ok(message) => {
+            tracing::info!(
+                "swept VMs from failed runs by {}",
+                who.as_ref().map(|w| w.display()).unwrap_or("anonymous")
+            );
+            pages::Notice::done(message)
+        }
+        Err(e) => pages::Notice::failed(e.to_string()),
+    };
+    render_vms(&state, who.as_ref(), notice).await
 }
 
 fn render_networks(

@@ -177,6 +177,18 @@ has no daemon field and there is no cloud-proxied exec — so `<network>/*/<vm>`
 would force the orchestrator to interrogate every host in the network to find one
 VM. Naming the node is refused-if-absent rather than guessed.
 
+**A named VM is somebody else's machine**, and the executor treats it that way.
+It is resolved on the pinned node by id or name, started if it is merely stopped,
+and then every step execs into it. Nothing else about the normal path applies:
+no fingerprint, no warm pool, no creation — and **no teardown**, so a long-lived
+VM is not destroyed because the job's `vm:` block happened to say
+`reuse: false`. Its TTL is left alone too; renewing it would be this app quietly
+extending the life of something it does not own, which is worth knowing if a
+build outlasts the TTL somebody else set.
+
+The `vm:` block is inert for such a job. The schema still requires one — it is a
+non-optional field — so it is written and ignored, and the run logs that it was.
+
 `default` is the only form that names no network, and it is not the same as
 omitting `uses:`: absent means the repository's assignment, while `default`
 means this machine regardless.

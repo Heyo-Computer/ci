@@ -603,13 +603,40 @@ impl Dispatcher {
         let plan: JobPlan = serde_json::from_value(row.plan.clone())
             .map_err(|e| DispatchError::BadPlan(e.to_string()))?;
 
-        let runner = self.pick_runner(&plan).await?;
+        let (runner, existing_vm) = self.pick_runner(&plan).await?;
         let workspace = self.workspace(&msg.run_id);
-        let fingerprint = crate::pool::fingerprint(&plan.vm, &workspace)?;
 
-        let (vm, reused) = self
-            .acquire_vm(&runner, &plan, &fingerprint, &msg.job_id)
-            .await?;
+        // Two ways to get a machine, and they share nothing but the handle.
+        //
+        // A job that named a VM in `uses:` runs in one that already exists: no
+        // fingerprint, no pool, no creation, and — see `release_vm` — no
+        // teardown. The `vm:` block is inert for it. Everything else builds or
+        // claims one from the warm pool as usual.
+        let (vm, reused, fingerprint) = match existing_vm.as_deref() {
+            Some(wanted) => {
+                let sandbox_id = self.resolve_existing_vm(&runner, wanted).await?;
+                let options = self.runners.options_for(&runner).await?;
+                let vm = self.vms.open(options, sandbox_id).await?;
+                // It may simply be stopped, which is recoverable and worth
+                // recovering: somebody pointed a job at this VM deliberately.
+                vm.ensure_running(BOOT_TIMEOUT).await?;
+                tracing::info!(
+                    job = %plan.key, vm = vm.id(),
+                    "using an existing VM; the `vm:` block is not applied to it"
+                );
+                // Not a pool fingerprint, because nothing about this VM was
+                // decided by one. The column still has to say something, and
+                // saying `existing` is more use than an unrelated hash.
+                (vm, true, "existing".to_string())
+            }
+            None => {
+                let fingerprint = crate::pool::fingerprint(&plan.vm, &workspace)?;
+                let (vm, reused) = self
+                    .acquire_vm(&runner, &plan, &fingerprint, &msg.job_id)
+                    .await?;
+                (vm, reused, fingerprint)
+            }
+        };
 
         if !self
             .store
@@ -663,10 +690,20 @@ impl Dispatcher {
         Ok(status)
     }
 
-    /// Resolve the plan's target to a concrete, online runner in its network.
-    async fn pick_runner(&self, plan: &JobPlan) -> Result<String, DispatchError> {
+    /// Resolve the plan's target to a concrete online runner, and the existing
+    /// VM on it when `uses:` named one.
+    ///
+    /// Both come from one [`Self::place`] call rather than the caller re-reading
+    /// `target`: the node and the VM are one decision, and reading the target
+    /// twice is how the queue a job was routed to and the machine it runs on
+    /// come to disagree.
+    async fn pick_runner(&self, plan: &JobPlan) -> Result<(String, Option<String>), DispatchError> {
         let pool = self.runners.snapshot();
         let placement = Self::place(&pool, plan)?;
+        // `place` only ever yields a VM alongside the node holding it, so this
+        // cannot name a VM without saying where it is.
+        let vm = placement.vm.map(str::to_string);
+
         if let Some(node) = placement.node {
             if !node.status.is_dispatchable() {
                 return Err(DispatchError::RunnerOffline {
@@ -674,7 +711,7 @@ impl Dispatcher {
                     status: node.status.as_str(),
                 });
             }
-            return Ok(node.id.clone());
+            return Ok((node.id.clone(), vm));
         }
         // Least-recently-used across the online set would need per-runner load;
         // for now the first online host wins, which is stable and predictable.
@@ -682,7 +719,7 @@ impl Dispatcher {
             .network
             .dispatchable()
             .next()
-            .map(|r| r.id.clone())
+            .map(|r| (r.id.clone(), vm))
             .ok_or_else(|| DispatchError::NoOnlineRunner(placement.network.network_name.clone()))
     }
 
@@ -740,12 +777,63 @@ impl Dispatcher {
         Ok((vm, false))
     }
 
+    /// Resolve the VM named by `uses: <network>/<node>/<vm>` to a sandbox id.
+    ///
+    /// By id or by name, the same two spellings a node accepts — `uses:` is
+    /// written by hand and the dashboard shows both. Listed from the node the
+    /// job is pinned to rather than searched for across the network, which is
+    /// exactly what naming the node in the path bought.
+    async fn resolve_existing_vm(
+        &self,
+        runner: &str,
+        wanted: &str,
+    ) -> Result<String, DispatchError> {
+        let options = self.runners.options_for(runner).await?;
+        let sandboxes = heyo_sdk::Sandbox::list(options).await.map_err(|e| {
+            DispatchError::Vm(crate::vm::VmError::Daemon {
+                sandbox: wanted.to_string(),
+                what: "listing sandboxes on the node",
+                source: e,
+            })
+        })?;
+
+        if let Some(found) = sandboxes
+            .iter()
+            .find(|s| s.id == wanted || s.name.eq_ignore_ascii_case(wanted))
+        {
+            return Ok(found.id.clone());
+        }
+        Err(DispatchError::UnknownVm {
+            wanted: wanted.to_string(),
+            node: runner.to_string(),
+            available: sandboxes
+                .iter()
+                .map(|s| {
+                    if s.name.is_empty() {
+                        s.id.clone()
+                    } else {
+                        format!("{} ({})", s.name, s.id)
+                    }
+                })
+                .collect(),
+        })
+    }
+
     /// Hand the VM back, or destroy it when the workflow said not to reuse.
     ///
     /// Failures here are logged, never propagated: the job's result is already
     /// decided, and turning a green build red because a TTL renewal failed would
     /// be worse than a VM that expires on its own.
     async fn release_vm(&self, plan: &JobPlan, vm: &Vm) {
+        // A VM named in `uses:` is not ours. It was not created for this job,
+        // it is not in the pool, and somebody else's long-lived machine must not
+        // be destroyed because a workflow happened to set `reuse: false` in a
+        // `vm:` block that never applied to it. Its TTL is left alone for the
+        // same reason — renewing it would be this app quietly extending the life
+        // of something it does not own.
+        if plan.target.is_existing_vm() {
+            return;
+        }
         if !plan.vm.reuse {
             if let Err(e) = vm.destroy().await {
                 tracing::warn!(vm = vm.id(), "could not destroy: {e}");
@@ -1541,6 +1629,12 @@ pub enum DispatchError {
         node: String,
         served: Vec<String>,
     },
+    /// `uses:` named a VM that the pinned node does not have.
+    UnknownVm {
+        wanted: String,
+        node: String,
+        available: Vec<String>,
+    },
     /// The network exists on the account but this instance does not serve it.
     UnservedNetwork {
         wanted: String,
@@ -1616,6 +1710,17 @@ impl std::fmt::Display for DispatchError {
                  host could not be identified. Set CI_DEFAULT_NODE to its daemon id \
                  or name — heyvmd reports its own id only when BACKEND_SERVER_ID is \
                  set in its environment, so it is often not discoverable."
+            ),
+            Self::UnknownVm {
+                wanted,
+                node,
+                available,
+            } => write!(
+                f,
+                "no sandbox {wanted:?} exists on node {node:?}. `uses: \
+                 <network>/<node>/<vm>` runs in a VM that is already there — it \
+                 does not create one. On that node: {}",
+                or_none(available)
             ),
             Self::DefaultNodeUnserved { node, served } => write!(
                 f,
@@ -1853,6 +1958,52 @@ mod tests {
             matches!(err, DispatchError::UnknownRunner { .. }),
             "{err:?}"
         );
+    }
+
+    /// A VM named in `uses:` is somebody else's machine. The pool never created
+    /// it, so teardown must not touch it — destroying a long-lived VM because a
+    /// workflow set `reuse: false` in a `vm:` block that never applied to it
+    /// would be the worst kind of surprise.
+    #[test]
+    fn an_existing_vm_is_never_torn_down_by_the_job_that_used_it() {
+        let mut plan = plan_targeting(Some("prod-runners/hd-1/sb-1a34"));
+        assert!(plan.target.is_existing_vm());
+        // Even with the `vm:` block asking for destruction, which is exactly the
+        // configuration that would otherwise delete it.
+        plan.vm.reuse = false;
+
+        // `release_vm` returns before touching the VM or the pool. Asserted on
+        // the predicate it branches on, because the call itself needs a live
+        // daemon; the branch is the whole behaviour.
+        assert!(
+            plan.target.is_existing_vm(),
+            "release_vm returns early on exactly this"
+        );
+
+        let built = plan_targeting(Some("prod-runners/hd-1"));
+        assert!(
+            !built.target.is_existing_vm(),
+            "a job that built its own VM must still be released"
+        );
+    }
+
+    /// The node and the VM are one decision. Reading `target` twice is how the
+    /// queue a job was routed to and the machine it runs on come to disagree.
+    #[test]
+    fn the_resolved_vm_travels_with_the_node_that_holds_it() {
+        let pool = test_pool();
+
+        let pinned = plan_targeting(Some("prod-runners/hd-1/sb-1a34"));
+        let placed = Dispatcher::place(&pool, &pinned).expect("resolves");
+        assert_eq!(placed.node.map(|n| n.id.as_str()), Some("hd-1"));
+        assert_eq!(placed.vm, Some("sb-1a34"));
+
+        // An unpinned job never carries a VM, so the exec-only branch cannot be
+        // entered without a host to exec on.
+        let unpinned = plan_targeting(Some("prod-runners"));
+        let placed = Dispatcher::place(&pool, &unpinned).expect("resolves");
+        assert!(placed.node.is_none());
+        assert!(placed.vm.is_none());
     }
 
     /// A pool that has resolved nothing must refuse rather than pick, or a

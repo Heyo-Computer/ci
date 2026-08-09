@@ -4,10 +4,15 @@
 //! no agent to install and nothing to register with this app. Two control-plane
 //! reads compose into the pool:
 //!
-//! - `GET /networks/{id}/members` — members whose `sandbox_kind` is `host`. The
-//!   SDK's own doc for [`NetworkMemberKind::Host`] says it: *"A daemon host
-//!   machine (`sandbox_ref` = daemon `hd-*` id). Assigning a host to a network
-//!   unlocks host-shell access to it."* Membership is the authorization.
+//! - `GET /networks/{id}/members` — members whose `sandbox_kind` is `host`: a
+//!   daemon host machine, with `sandbox_ref` its `hd-*` id. Assigning a host to
+//!   a network is what unlocks host-shell access to it, so membership is the
+//!   authorization.
+//!
+//!   The string is compared rather than an SDK enum because **the SDK has no
+//!   `host` variant**: `NetworkMemberKind` is `Local | Deployed` only, which is
+//!   also why [`Runners::join_network`] posts the member by hand. `heyvm network
+//!   add-host` does the same.
 //! - `GET /me/daemons` — liveness and the human-readable name. `Online` means a
 //!   heartbeat within ~3 minutes.
 //!
@@ -668,6 +673,45 @@ impl Runners {
             base_url: Some(client.base_url().to_string()),
             timeout: None,
         })
+    }
+
+    /// Join a daemon host to a network — what `heyvm network add-host` does.
+    ///
+    /// Through the raw client rather than the SDK's `Network::add_member`, and
+    /// not by preference: `NetworkMemberKind` has only `Local` and `Deployed`,
+    /// so the typed API **cannot say `host`** at all. `heyvm network add-host`
+    /// has the same problem and solves it the same way, posting the string
+    /// (`network_client::register_member(..., "host", ...)`).
+    ///
+    /// `POST /networks/{id}/members` rather than the CLI's `/networks/me/members`,
+    /// because `me` is whichever network the account calls default and this is a
+    /// page where somebody picks one. The route is documented idempotent on
+    /// `(network_id, sandbox_kind, sandbox_ref)`, so a second click is a no-op
+    /// rather than a duplicate member.
+    pub async fn join_network(&self, network_id: &str, node_id: &str) -> Result<(), RunnerError> {
+        let client = HeyoClient::new(self.client_options()).map_err(|e| {
+            RunnerError::ControlPlane(format!("could not build a cloud client: {e}"))
+        })?;
+        let path = format!("/networks/{network_id}/members");
+        let body = serde_json::json!({
+            "sandbox_kind": MEMBER_KIND_HOST,
+            "sandbox_ref": node_id,
+        });
+
+        let response = client
+            .raw_request(Method::POST, &path, Some(&body), RequestOptions::default())
+            .await
+            .map_err(|e| RunnerError::ControlPlane(format!("POST {path}: {e}")))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let detail = response.text().await.unwrap_or_default();
+            return Err(RunnerError::ControlPlane(format!(
+                "POST {path} returned {status}: {}",
+                detail.chars().take(200).collect::<String>()
+            )));
+        }
+        Ok(())
     }
 
     /// Drop a runner's tunnel so the next `client_for` redials.

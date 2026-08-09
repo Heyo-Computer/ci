@@ -84,6 +84,10 @@ pub fn router(
         // deployment; both render the same page.
         .route("/networks", get(networks_page))
         .route("/runners", get(networks_page))
+        // Behind the gate and admin-only, like /repos: joining a host to a
+        // network grants host-shell access to it through the network, so it is
+        // not a read.
+        .route("/networks/{network_id}/join", post(join_network))
         .route("/workflows", get(workflows_page))
         // Behind the gate on purpose, and admin-only on top of it: a submit
         // token is the right to run code on a runner, so minting one is not a
@@ -1005,7 +1009,97 @@ async fn networks_page(State(state): State<AppState>, headers: HeaderMap) -> imp
         &state.config.name,
         who.as_ref().map(|i| i.display()),
         &state.runners.snapshot(),
+        &pages::Notice::default(),
     )
+}
+
+fn render_networks(
+    state: &AppState,
+    who: Option<&Identity>,
+    notice: pages::Notice,
+) -> axum::response::Response {
+    pages::networks_page(
+        &state.config.name,
+        who.map(|i| i.display()),
+        &state.runners.snapshot(),
+        &notice,
+    )
+    .into_response()
+}
+
+/// `POST /networks/{id}/join` — put this orchestrator's own host in a network.
+///
+/// The button exists because `uses: default` is useless until this machine is a
+/// member of some network the instance serves, and the alternative was an error
+/// message telling somebody to go and run `heyvm network add-host` on a box they
+/// may not have a shell on.
+async fn join_network(
+    State(state): State<AppState>,
+    Path(network_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let who = match may_manage(&state, &headers).await {
+        Ok(w) => w,
+        Err(response) => return response,
+    };
+
+    let pool = state.runners.snapshot();
+    let node_id = pool.default_node_id.clone();
+    if node_id.is_empty() {
+        return render_networks(
+            &state,
+            who.as_ref(),
+            pages::Notice::failed(
+                "This machine's daemon could not be identified, so there is no host to                  add. Set CI_DEFAULT_NODE to its daemon id or name.",
+            ),
+        );
+    }
+    let Some(network) = pool.find(&network_id) else {
+        return render_networks(
+            &state,
+            who.as_ref(),
+            pages::Notice::failed("That network no longer exists on this account."),
+        );
+    };
+    let network_name = network.network_name.clone();
+
+    let notice = match state.runners.join_network(&network_id, &node_id).await {
+        Ok(()) => {
+            tracing::info!(
+                "joined host {node_id} to network {network_name} by {}",
+                who.as_ref().map(|w| w.display()).unwrap_or("anonymous")
+            );
+            // Re-read before rendering, or the page shows the state from before
+            // the click and reads as though nothing happened. A failure here is
+            // not the join failing — the join already succeeded — so it must not
+            // be reported as one.
+            if let Err(e) = state.runners.refresh().await {
+                tracing::warn!("joined, but could not re-read the pool: {e}");
+            }
+            let served = state
+                .runners
+                .snapshot()
+                .find(&network_id)
+                .is_some_and(|n| n.served);
+            let mut message = format!(
+                "This host is now a member of {network_name}. It may take a moment to appear online."
+            );
+            if !served {
+                // Joining does not make an instance take work for a network,
+                // and finding that out from a queued job that never runs is
+                // worse than being told now.
+                message.push_str(
+                    " This orchestrator does not serve that network, though, so jobs                      still cannot be sent to it — add it to CI_NETWORK, or set                      CI_NETWORK=*.",
+                );
+            }
+            pages::Notice::done(message)
+        }
+        Err(e) => {
+            tracing::warn!("could not join {network_name}: {e}");
+            pages::Notice::failed(e.to_string())
+        }
+    };
+    render_networks(&state, who.as_ref(), notice)
 }
 
 #[cfg(test)]

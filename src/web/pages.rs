@@ -164,10 +164,21 @@ fn status_pill(status: RunnerStatus) -> Markup {
 }
 
 fn runner_rows(runners: &[Runner]) -> Markup {
+    runner_rows_marking(runners, "")
+}
+
+fn runner_rows_marking(runners: &[Runner], this_host: &str) -> Markup {
     html! {
         @for r in runners {
             tr {
-                td { (r.name) }
+                td {
+                    (r.name)
+                    // Which row is this machine, so "add this host" and the list
+                    // are obviously about the same thing.
+                    @if !this_host.is_empty() && r.id == this_host {
+                        " " span .pill.queued { "this host" }
+                    }
+                }
                 td .mono { (r.id) }
                 td { (status_pill(r.status)) }
                 td .mono { (r.last_seen_at.as_deref().unwrap_or("—")) }
@@ -188,7 +199,8 @@ fn runner_table(runners: &[Runner]) -> Markup {
 }
 
 /// One network and the hosts in it.
-fn network_section(set: &RunnerSet, default_id: &str) -> Markup {
+fn network_section(set: &RunnerSet, default_id: &str, this_host: &str) -> Markup {
+    let joined = !this_host.is_empty() && set.runners.iter().any(|r| r.id == this_host);
     html! {
         div .repo {
             div .head {
@@ -204,6 +216,15 @@ fn network_section(set: &RunnerSet, default_id: &str) -> Markup {
                 @if set.is_default {
                     span .meta { "heyvm default" }
                 }
+                // Joining is what makes a network usable from here at all: an
+                // unserved network with no hosts is not something a job can be
+                // pointed at, and `uses: default` needs this machine to be a
+                // member of one.
+                @if !this_host.is_empty() && !joined {
+                    form method="post" action={ "/networks/" (set.network_id) "/join" } {
+                        button type="submit" { "Add this host" }
+                    }
+                }
             }
             p .meta {
                 code .mono { (set.network_id) }
@@ -212,11 +233,17 @@ fn network_section(set: &RunnerSet, default_id: &str) -> Markup {
             }
             @if set.runners.is_empty() {
                 p .empty {
-                    "No host has joined this network. On the machine you want to build on, run "
+                    "No host has joined this network. Add this machine with the button \
+                     above, or on another machine run "
                     code .mono { "heyvmd" } " and then " code .mono { "heyvm network add-host" } "."
                 }
             } @else {
-                (runner_table(&set.runners))
+                div .scroll {
+                    table {
+                        thead { tr { th { "Name" } th { "Daemon" } th { "Status" } th { "Last seen" } } }
+                        tbody { (runner_rows_marking(&set.runners, this_host)) }
+                    }
+                }
             }
             @if !set.served {
                 p .meta {
@@ -229,15 +256,57 @@ fn network_section(set: &RunnerSet, default_id: &str) -> Markup {
     }
 }
 
+/// The outcome of an action, rendered on the response to the POST that did it.
+#[derive(Default)]
+pub struct Notice {
+    pub ok: Option<String>,
+    pub error: Option<String>,
+}
+
+impl Notice {
+    pub fn done(message: impl Into<String>) -> Self {
+        Self {
+            ok: Some(message.into()),
+            error: None,
+        }
+    }
+
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self {
+            ok: None,
+            error: Some(message.into()),
+        }
+    }
+}
+
 /// `GET /networks` — every network on the account, the hosts in each, and which
 /// of them this orchestrator builds for.
-pub fn networks_page(app_name: &str, who: Option<&str>, pool: &Pool) -> Markup {
+pub fn networks_page(app_name: &str, who: Option<&str>, pool: &Pool, notice: &Notice) -> Markup {
     let served = pool.served().count();
     let body = html! {
+        @if let Some(err) = &notice.error {
+            div .banner { (err) }
+        }
+        @if let Some(ok) = &notice.ok {
+            div .notice { (ok) }
+        }
         @if let Some(err) = &pool.last_error {
             div .banner {
                 strong { "The runner pool is stale. " }
                 (err)
+            }
+        }
+
+        // `uses: default` is the one form that needs this host to be somewhere,
+        // so when it is not identifiable at all that is worth saying before the
+        // list rather than leaving every join button mysteriously absent.
+        @if pool.default_node_id.is_empty() {
+            div .banner {
+                strong { "This machine's daemon could not be identified. " }
+                "So " code .mono { "uses: default" } " is refused, and there is no host \
+                 to add to a network from here. Set " code .mono { "CI_DEFAULT_NODE" }
+                " to its daemon id or name — heyvmd reports its own id only when \
+                 BACKEND_SERVER_ID is set in its environment."
             }
         }
 
@@ -257,7 +326,7 @@ pub fn networks_page(app_name: &str, who: Option<&str>, pool: &Pool) -> Markup {
                 }
             }
             @for set in &pool.networks {
-                (network_section(set, &pool.default_network_id))
+                (network_section(set, &pool.default_network_id, &pool.default_node_id))
             }
         }
 
@@ -322,7 +391,8 @@ mod tests {
 
     #[test]
     fn the_page_lists_every_network_and_its_runners() {
-        let html = networks_page("ci", Some("Sam Currie"), &populated()).into_string();
+        let html =
+            networks_page("ci", Some("Sam Currie"), &populated(), &Notice::default()).into_string();
         assert!(html.contains("prod-runners"));
         assert!(html.contains("lab"), "an unserved network is still listed");
         assert!(html.contains("bigbox"));
@@ -338,7 +408,7 @@ mod tests {
     /// for, versus one that merely exists.
     #[test]
     fn served_and_unserved_networks_are_told_apart_with_the_fix_named() {
-        let html = networks_page("ci", None, &populated()).into_string();
+        let html = networks_page("ci", None, &populated(), &Notice::default()).into_string();
         assert!(html.contains("serving"));
         assert!(html.contains("not served"));
         assert!(html.contains("CI_NETWORK"), "and what to do about it");
@@ -348,7 +418,7 @@ mod tests {
     /// cause, so the page must name it and the command that fixes it.
     #[test]
     fn unjoined_daemons_get_their_own_section_naming_the_fix() {
-        let html = networks_page("ci", None, &populated()).into_string();
+        let html = networks_page("ci", None, &populated(), &Notice::default()).into_string();
         assert!(html.contains("Registered but in no network"));
         assert!(html.contains("laptop"));
         assert!(html.contains("heyvm network add-host"));
@@ -356,7 +426,7 @@ mod tests {
 
     #[test]
     fn an_empty_account_explains_how_to_add_a_network() {
-        let html = networks_page("ci", None, &Pool::default()).into_string();
+        let html = networks_page("ci", None, &Pool::default(), &Notice::default()).into_string();
         assert!(html.contains("heyvm network create"));
         assert!(!html.contains("Registered but in no network"));
     }
@@ -366,7 +436,7 @@ mod tests {
     fn a_stale_snapshot_says_so() {
         let mut pool = populated();
         pool.last_error = Some("heyvm control plane: GET /networks: timeout".into());
-        let html = networks_page("ci", None, &pool).into_string();
+        let html = networks_page("ci", None, &pool, &Notice::default()).into_string();
         assert!(html.contains("The runner pool is stale"));
         assert!(html.contains("GET /networks: timeout"));
     }
@@ -375,8 +445,54 @@ mod tests {
     /// — "a token is not a person".
     #[test]
     fn an_anonymous_request_renders_no_identity() {
-        let html = networks_page("ci", None, &populated()).into_string();
+        let html = networks_page("ci", None, &populated(), &Notice::default()).into_string();
         assert!(!html.contains(r#"class="who""#));
+    }
+
+    /// The join button is offered only where it would do something: a network
+    /// this host is not already in.
+    #[test]
+    fn joining_is_offered_for_networks_this_host_is_not_in() {
+        let mut pool = populated();
+        pool.default_node_id = "hd-1".into(); // already a member of net-1
+        let html = networks_page("ci", None, &pool, &Notice::default()).into_string();
+
+        assert!(
+            !html.contains(r#"action="/networks/net-1/join""#),
+            "already a member; the button would be a no-op: {html}"
+        );
+        assert!(
+            html.contains(r#"action="/networks/net-2/join""#),
+            "not a member of lab, so it should be offered: {html}"
+        );
+        assert!(html.contains("this host"), "the row is marked");
+    }
+
+    /// With no identifiable daemon there is no host to add, so the page says
+    /// which variable fixes it instead of rendering buttons that cannot work.
+    #[test]
+    fn an_unidentifiable_host_explains_itself_and_offers_no_join() {
+        let mut pool = populated();
+        pool.default_node_id = String::new();
+        let html = networks_page("ci", None, &pool, &Notice::default()).into_string();
+
+        assert!(html.contains("CI_DEFAULT_NODE"), "{html}");
+        assert!(!html.contains("/join"), "no button without a host: {html}");
+    }
+
+    #[test]
+    fn a_notice_renders_above_the_networks() {
+        let html = networks_page(
+            "ci",
+            None,
+            &populated(),
+            &Notice::done("This host is now a member of lab."),
+        )
+        .into_string();
+        assert!(html.contains("This host is now a member of lab."));
+
+        let html = networks_page("ci", None, &populated(), &Notice::failed("nope")).into_string();
+        assert!(html.contains("nope"));
     }
 
     /// maud escapes by construction; this pins it, because runner names come
@@ -385,7 +501,7 @@ mod tests {
     fn a_hostile_runner_name_is_escaped() {
         let mut pool = populated();
         pool.networks[0].runners[0].name = "<script>alert(1)</script>".into();
-        let html = networks_page("ci", None, &pool).into_string();
+        let html = networks_page("ci", None, &pool, &Notice::default()).into_string();
         assert!(!html.contains("<script>alert(1)</script>"));
         assert!(html.contains("&lt;script&gt;"));
     }

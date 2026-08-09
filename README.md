@@ -231,6 +231,17 @@ network at all. That last list is there because "my runner isn't picking up
 jobs" is otherwise a dead end: a registered daemon that never joined looks
 exactly like one that was never registered.
 
+**Add this host** joins the machine running `ci` to a network, which is
+`heyvm network add-host` without needing a shell on that box. It is offered only
+for a network this host is not already in, and it is admin-only behind the gate —
+joining a host to a network unlocks host-shell access to it, so it is not a read.
+Joining does not make this instance *serve* that network; the page says so when
+the two differ, because finding out from a job that never runs is worse.
+
+The member is posted by hand rather than through the SDK, because
+`NetworkMemberKind` is `Local | Deployed` and has no `host` variant at all —
+`heyvm network add-host` has the same problem and solves it the same way.
+
 **What an instance serves is configuration, not discovery.** Jobs are sharded
 onto one durable JetStream consumer per runner and per network precisely so
 several orchestrators can run at once *as long as they own disjoint sets*. An

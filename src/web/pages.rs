@@ -816,6 +816,17 @@ pub fn run_page(
             @if let Some(err) = &run.error {
                 div .banner { (err) }
             }
+            // Offered only while there is something to stop. A finished run
+            // would get a button that reports having done nothing.
+            @if !matches!(run.status.as_str(), "success" | "failure" | "cancelled") {
+                form method="post" action={ "/runs/" (run.id) "/cancel" } {
+                    button type="submit" { "Cancel this run" }
+                }
+                p .meta {
+                    "Queued jobs are dropped and running ones stop after their current \
+                     step — a step already executing cannot be aborted."
+                }
+            }
         }
 
         section {
@@ -1630,6 +1641,26 @@ mod page_tests {
         let html = run_page("ci", None, &run("success"), &[j], &[], &[], Some(2)).into_string();
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("&lt;img"));
+    }
+
+    /// Cancel is offered while there is something to stop, and not otherwise.
+    #[test]
+    fn a_running_run_can_be_cancelled_and_a_finished_one_cannot() {
+        let mut r = run("success");
+        r.status = "running".into();
+        let html = run_page("ci", None, &r, &[], &[], &[], Some(2)).into_string();
+        assert!(
+            html.contains(r#"action="/runs/019fca648a6e-00000000/cancel""#),
+            "{html}"
+        );
+        assert!(html.contains("cannot be aborted"), "the limit is stated");
+
+        for finished in ["success", "failure", "cancelled"] {
+            let mut r = run(finished);
+            r.status = finished.into();
+            let html = run_page("ci", None, &r, &[], &[], &[], Some(2)).into_string();
+            assert!(!html.contains("/cancel"), "{finished}: {html}");
+        }
     }
 
     /// The VM log is the one failure with no step log to read — a machine that

@@ -657,6 +657,59 @@ impl Store {
         Ok(status)
     }
 
+    /// Cancel a run and every job of it that has not finished.
+    ///
+    /// Returns how many jobs were stopped, and `None` if the run was already
+    /// terminal — cancelling something that has finished is a no-op worth
+    /// reporting rather than a silent success that looks like it did something.
+    ///
+    /// The jobs are marked first. A queued job is then dropped when JetStream
+    /// delivers it, because [`Self::start_job`] refuses a job that is already
+    /// terminal and `run_job` checks the same thing on entry; a running one
+    /// notices at its next step boundary. So this one statement covers work in
+    /// all three states without needing to reach any of them.
+    pub async fn cancel_run(&self, run_id: &str) -> Result<Option<u64>, StoreError> {
+        let run = sqlx::query(
+            "UPDATE ci_run
+                SET status='cancelled', finished_at=now(),
+                    error=COALESCE(error, 'cancelled')
+              WHERE id = $1 AND status NOT IN ('success','failure','cancelled')",
+        )
+        .bind(run_id)
+        .execute(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        if run.rows_affected() == 0 {
+            return Ok(None);
+        }
+
+        let jobs = sqlx::query(
+            "UPDATE ci_job
+                SET status='cancelled', finished_at=now(),
+                    error=COALESCE(error, 'cancelled')
+              WHERE run_id = $1
+                AND status NOT IN ('success','failure','skipped','cancelled')",
+        )
+        .bind(run_id)
+        .execute(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok(Some(jobs.rows_affected()))
+    }
+
+    /// Whether a job has been cancelled out from under whoever is running it.
+    ///
+    /// Its own query rather than [`Self::get_job`]: this is asked between every
+    /// step, and the plan JSONB is the largest column on the row.
+    pub async fn is_job_cancelled(&self, job_id: &str) -> Result<bool, StoreError> {
+        let row = sqlx::query("SELECT status FROM ci_job WHERE id = $1")
+            .bind(job_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StoreError::sql)?;
+        Ok(row.map(|r| r.get::<String, _>("status")) == Some("cancelled".to_string()))
+    }
+
     pub async fn jobs_of(&self, run_id: &str) -> Result<Vec<JobRow>, StoreError> {
         let rows =
             sqlx::query("SELECT * FROM ci_job WHERE run_id = $1 ORDER BY created_at, job_key")
@@ -2037,6 +2090,69 @@ jobs:
             store.get_run(&run_id).await.unwrap().is_some(),
             "the run survives its registration"
         );
+    }
+
+    /// Cancelling has to stop work in all three states a job might be in, and
+    /// leave finished work alone.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn cancelling_stops_unfinished_jobs_and_keeps_the_rest() {
+        let store = test_store().await;
+        let plan = test_plan();
+        let run_id = crate::vm::new_id();
+        store
+            .create_run(&run_id, &RunRequest::default(), &plan)
+            .await
+            .unwrap();
+
+        // One already finished, one running, one still pending.
+        let done = job_id(&run_id, "build-x86_64");
+        let running = job_id(&run_id, "build-aarch64");
+        store
+            .set_job_status(&done, JobStatus::Success, None)
+            .await
+            .unwrap();
+        store
+            .start_job(&running, "hd-1", "sb-1", "fp", 1)
+            .await
+            .unwrap();
+
+        let cancelled = store.cancel_run(&run_id).await.unwrap();
+        assert_eq!(cancelled, Some(2), "the running and the pending one");
+
+        let by_key: std::collections::HashMap<_, _> = store
+            .jobs_of(&run_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|j| (j.job_key.clone(), j))
+            .collect();
+        assert_eq!(
+            by_key["build-x86_64"].status, "success",
+            "work that finished is not rewritten"
+        );
+        assert_eq!(by_key["build-aarch64"].status, "cancelled");
+        assert_eq!(by_key["deploy"].status, "cancelled");
+        assert_eq!(
+            store.get_run(&run_id).await.unwrap().unwrap().status,
+            "cancelled"
+        );
+
+        // What the executor polls between steps.
+        assert!(store.is_job_cancelled(&running).await.unwrap());
+        assert!(!store.is_job_cancelled(&done).await.unwrap());
+
+        // A redelivery of a cancelled job must not restart it.
+        assert!(
+            !store
+                .start_job(&running, "hd-1", "sb-2", "fp", 2)
+                .await
+                .unwrap(),
+            "a cancelled job must refuse to start"
+        );
+
+        // And cancelling twice reports that there was nothing left to stop.
+        assert_eq!(store.cancel_run(&run_id).await.unwrap(), None);
     }
 
     // ---- log retention ---------------------------------------------------

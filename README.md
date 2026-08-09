@@ -294,6 +294,29 @@ so a hand-written query stays readable. The cost is that renaming a network in
 heyvm orphans the assignment — which surfaces as a refused submit and a warning
 on `/repos`, rather than as a build that quietly moves.
 
+## Cancelling a run
+
+`POST /runs/{id}/cancel`, from a button on the run page while there is something
+to stop. It marks the run and every unfinished job `cancelled` — and that one
+statement is the whole mechanism, because it covers work in each of the three
+states it might be in without reaching a runner at all:
+
+- **queued** — dropped when JetStream delivers it, since `run_job` refuses a job
+  that is already terminal on entry;
+- **about to start** — refused by `start_job`, whose `WHERE` clause excludes
+  terminal statuses;
+- **running** — noticed at the next step boundary.
+
+**Cancellation is cooperative, and the limit is honest**: the daemon has no route
+to abort an exec-operation in flight, so a step that has already started runs to
+its own end or its `timeout-minutes`. What stops is everything after it. The page
+says so next to the button rather than implying an instant kill.
+
+A cancelled job stays cancelled. `continue-on-error` is about a step failing, not
+about somebody stopping the run, so it does not convert a cancellation into a
+success — and the executor does not write `failure` over it, which would make a
+deliberate stop read as a broken build.
+
 ## The warm VM pool
 
 ```

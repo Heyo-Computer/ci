@@ -678,6 +678,11 @@ impl Dispatcher {
                 self.store.set_job_outputs(&msg.job_id, outputs).await?;
                 JobStatus::Success
             }
+            // Cancelled stays cancelled. `continue_on_error` is about a step
+            // failing, not about somebody stopping the run — and writing
+            // `failure` here would overwrite the status that cancelling just
+            // set, making a deliberate stop look like a broken build.
+            Err(DispatchError::Cancelled(_)) => JobStatus::Cancelled,
             Err(_) if plan.continue_on_error => JobStatus::Success,
             Err(_) => JobStatus::Failure,
         };
@@ -1105,6 +1110,13 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
         let mut failed: Option<String> = None;
 
         for (idx, step) in plan.steps.iter().enumerate() {
+            // Cancellation is cooperative, and this is where it takes effect.
+            // The daemon has no route to abort an exec-operation in flight, so
+            // a step that has started runs to its own end or its timeout; what
+            // stops is everything after it.
+            if self.store.is_job_cancelled(&msg.job_id).await? {
+                return Err(DispatchError::Cancelled(plan.key.clone()));
+            }
             let sid = step_id(&msg.job_id, idx);
             self.store
                 .create_step(
@@ -1918,6 +1930,8 @@ pub enum DispatchError {
         node: String,
         served: Vec<String>,
     },
+    /// The run was cancelled while this job was running.
+    Cancelled(String),
     /// A VM cannot be swept: unknown, on another instance's host, or claimed.
     VmNotSweepable(String),
     /// A job ran past `CI_MAX_JOB_SECONDS`.
@@ -2006,6 +2020,12 @@ impl std::fmt::Display for DispatchError {
                  host could not be identified. Set CI_DEFAULT_NODE to its daemon id \
                  or name — heyvmd reports its own id only when BACKEND_SERVER_ID is \
                  set in its environment, so it is often not discoverable."
+            ),
+            Self::Cancelled(job) => write!(
+                f,
+                "job {job:?} was cancelled. The step that was already running was \
+                 allowed to finish — the daemon has no way to abort one — and \
+                 nothing after it ran."
             ),
             Self::VmNotSweepable(id) => write!(
                 f,

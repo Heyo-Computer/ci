@@ -78,6 +78,9 @@ pub fn router(
         .route("/healthz", get(healthz))
         .route("/", get(runs_page))
         .route("/runs/{run_id}", get(run_page))
+        // Admin-only like the other state-changing routes: cancelling stops
+        // somebody's build.
+        .route("/runs/{run_id}/cancel", post(cancel_run))
         .route("/runs/{run_id}/jobs/{job_key}", get(job_page))
         // `/runners` was this page's name when there was one network to show.
         // Kept because it is in people's history and in the README of a running
@@ -370,6 +373,40 @@ async fn run_page(
         Ok(None) => not_found(&state, who.as_ref(), &format!("No run {run_id}.")),
         Err(e) => page_error(&state, who.as_ref(), &e.to_string()),
     }
+}
+
+/// `POST /runs/{id}/cancel` — stop a run.
+///
+/// Marks the run and every unfinished job cancelled, which is all it takes to
+/// stop work in each of the three states it might be in: a queued job is dropped
+/// when JetStream delivers it, a job about to start is refused by `start_job`,
+/// and a running one notices at its next step boundary. Nothing has to reach a
+/// runner.
+async fn cancel_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let who = match may_manage(&state, &headers).await {
+        Ok(w) => w,
+        Err(response) => return response,
+    };
+
+    match state.store.cancel_run(&run_id).await {
+        Ok(Some(jobs)) => {
+            tracing::info!(
+                "cancelled run {run_id} ({jobs} job(s)) by {}",
+                who.as_ref().map(|w| w.display()).unwrap_or("anonymous")
+            );
+        }
+        Ok(None) => {
+            tracing::debug!("run {run_id} was already finished; nothing to cancel");
+        }
+        Err(e) => return page_error(&state, who.as_ref(), &e.to_string()),
+    }
+    // Back to the run, which now shows what happened — rather than a flash on a
+    // page the browser would re-post on refresh.
+    axum::response::Redirect::to(&format!("/runs/{run_id}")).into_response()
 }
 
 async fn job_page(

@@ -69,6 +69,33 @@ const POLL_SLACK: Duration = Duration::from_secs(30);
 /// comes from — it is measured against a real guest, not chosen.
 const UPLOAD_CHUNK: usize = 24 * 1024;
 
+/// One line of a VM's own log, as `GET /sandboxes/{id}/logs` returns it.
+///
+/// Re-declared rather than imported: the daemon's `LogEntry` lives in
+/// `mvm-ctrl`, which this crate deliberately does not depend on. Every field is
+/// defaulted so a daemon that adds or drops one does not break the parse of the
+/// rest — a VM log is diagnostic, and half of it beats an error.
+#[derive(Debug, Clone, Deserialize)]
+struct LogsResponse {
+    #[serde(default)]
+    logs: Vec<LogLine>,
+    #[serde(default)]
+    total: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LogLine {
+    /// `stdout`, `stderr` or `console`.
+    #[serde(default = "unknown_source")]
+    source: String,
+    #[serde(default)]
+    message: String,
+}
+
+fn unknown_source() -> String {
+    "?".to_string()
+}
+
 /// The `vm:` block of a workflow job.
 ///
 /// Mirrors the subset of `SandboxCreateOptions` that makes sense to declare in a
@@ -646,6 +673,52 @@ impl Vm {
     }
 
     /// Push the TTL out so a pooled VM does not expire while it is still wanted.
+    /// The VM's own logs — console, stdout and stderr as the daemon collected
+    /// them — rendered as text.
+    ///
+    /// Not in the SDK, so it goes through the raw client like the exec routes
+    /// above. Bounded by `limit` because this is a whole VM's console since
+    /// boot and the point is to attach it to a run, not to stream it.
+    ///
+    /// Read *before* the VM is released: a job's VM may be destroyed the moment
+    /// it finishes, and a log nobody captured is a log nobody can read.
+    pub async fn logs(&self, limit: usize) -> Result<String, VmError> {
+        let path = format!("/sandboxes/{}/logs", encode_segment(&self.id));
+        let response: LogsResponse = self
+            .sandbox
+            .client()
+            .request(
+                Method::GET,
+                &path,
+                None::<&()>,
+                RequestOptions {
+                    timeout: Some(Duration::from_secs(30)),
+                    query: vec![("limit".to_string(), limit.to_string())],
+                },
+            )
+            .await
+            .map_err(|e| VmError::Daemon {
+                sandbox: self.id.clone(),
+                what: "reading the VM's logs",
+                source: e,
+            })?;
+
+        let mut out = String::new();
+        if response.total > response.logs.len() {
+            // Said once at the top rather than left for someone to infer from a
+            // log that starts mid-boot.
+            out.push_str(&format!(
+                "[ci] showing the last {} of {} lines\n",
+                response.logs.len(),
+                response.total
+            ));
+        }
+        for entry in &response.logs {
+            out.push_str(&format!("{:<7} {}\n", entry.source, entry.message));
+        }
+        Ok(out)
+    }
+
     pub async fn renew_ttl(&self, ttl: Duration) -> Result<(), VmError> {
         self.sandbox
             .set_ttl(ttl.as_secs())

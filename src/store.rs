@@ -16,6 +16,7 @@
 
 use crate::plan::{JobPlan, Plan};
 use chrono::{DateTime, Utc};
+
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
 use std::fmt;
@@ -962,6 +963,59 @@ impl Store {
                 uri: r.get("uri"),
             })
             .collect())
+    }
+
+    /// Runs old enough to sweep that still have a log recorded.
+    ///
+    /// Driven by the rows rather than by walking the log directory: a directory
+    /// whose run was deleted has nothing to update, and a run whose files were
+    /// removed by hand should stop being offered every hour. The `EXISTS`
+    /// clause is what makes the sweep converge — once the paths are nulled the
+    /// run is not returned again.
+    pub async fn runs_with_logs_before(
+        &self,
+        cutoff: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<String>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT r.id FROM ci_run r
+              WHERE r.created_at < $1
+                AND EXISTS (
+                      SELECT 1 FROM ci_job j
+                        JOIN ci_step s ON s.job_id = j.id
+                       WHERE j.run_id = r.id AND s.log_path IS NOT NULL)
+              ORDER BY r.created_at
+              LIMIT $2",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok(rows.iter().map(|r| r.get::<String, _>("id")).collect())
+    }
+
+    /// Forget where a run's logs were, after deleting them.
+    ///
+    /// The rows survive — a step that ran and its exit code are the run's
+    /// history, and losing that because the log aged out would make an old run
+    /// look like it never happened. Only the pointer and the byte count go.
+    pub async fn forget_logs_of(&self, run_id: &str) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "UPDATE ci_step SET log_path = NULL, log_bytes = 0
+              WHERE log_path IS NOT NULL
+                AND job_id IN (SELECT id FROM ci_job WHERE run_id = $1)",
+        )
+        .bind(run_id)
+        .execute(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok(result.rows_affected())
+    }
+
+    /// The directory holding every log of one run.
+    pub fn run_log_dir(&self, run_id: &str) -> PathBuf {
+        self.log_dir.join(sanitize_component(run_id))
     }
 
     // ---- registered repositories ----------------------------------------
@@ -1983,6 +2037,81 @@ jobs:
             store.get_run(&run_id).await.unwrap().is_some(),
             "the run survives its registration"
         );
+    }
+
+    // ---- log retention ---------------------------------------------------
+
+    /// The sweep has to be driven by rows, converge, and leave the run's
+    /// history behind — losing the fact that a step ran, along with its bytes,
+    /// would make an old run look as though it never happened.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn sweeping_discards_log_bytes_and_keeps_the_history() {
+        let store = test_store().await;
+        let plan = test_plan();
+        let run_id = crate::vm::new_id();
+        store
+            .create_run(&run_id, &RunRequest::default(), &plan)
+            .await
+            .unwrap();
+
+        let jid = job_id(&run_id, "deploy");
+        let sid = step_id(&jid, 0);
+        store
+            .create_step(&sid, &jid, 0, "Ship", None)
+            .await
+            .unwrap();
+        let path = store.log_path(&run_id, "deploy", 0, &sid);
+        store.append_log(&sid, &path, "output\n").await.unwrap();
+        store
+            .finish_step(&sid, StepStatus::Success, Some(0), None)
+            .await
+            .unwrap();
+        assert!(path.exists());
+
+        // Not yet old enough: a sweep must not take a run that is still inside
+        // the retention window.
+        let recent = store
+            .runs_with_logs_before(Utc::now() - chrono::Duration::days(1), 100)
+            .await
+            .unwrap();
+        assert!(
+            !recent.contains(&run_id),
+            "swept a run inside its retention"
+        );
+
+        // Old enough now.
+        let due = store
+            .runs_with_logs_before(Utc::now() + chrono::Duration::days(1), 500)
+            .await
+            .unwrap();
+        assert!(
+            due.contains(&run_id),
+            "a run past retention must be offered"
+        );
+
+        tokio::fs::remove_dir_all(store.run_log_dir(&run_id))
+            .await
+            .ok();
+        assert_eq!(store.forget_logs_of(&run_id).await.unwrap(), 1);
+
+        // The row survives with its result; only the pointer and size go.
+        let steps = store.steps_of(&jid).await.unwrap();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].status, "success");
+        assert_eq!(steps[0].exit_code, Some(0));
+        assert_eq!(steps[0].log_path, None);
+        assert_eq!(steps[0].log_bytes, 0);
+        assert_eq!(store.read_log(&steps[0]).await, None);
+        assert!(store.get_run(&run_id).await.unwrap().is_some());
+
+        // And it converges: a swept run is not offered again, or the sweeper
+        // would rescan the same rows every hour forever.
+        let again = store
+            .runs_with_logs_before(Utc::now() + chrono::Duration::days(1), 500)
+            .await
+            .unwrap();
+        assert!(!again.contains(&run_id), "the sweep must converge");
     }
 
     /// Being on the admin list promotes, but dropping off it must not demote —

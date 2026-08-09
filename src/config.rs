@@ -260,6 +260,18 @@ pub struct Config {
     /// the same way, so this bounds both the request and the upload.
     pub max_source_bytes: usize,
 
+    /// How many lines of a VM's own console to attach to a job.
+    ///
+    /// A whole boot log is long and nobody reads all of it; the tail is what
+    /// answers "why did this VM not come up".
+    pub vm_log_lines: usize,
+    /// How long a run's step and VM logs are kept on disk.
+    ///
+    /// Logs are the bulk of what this app writes — a build log is megabytes and
+    /// nothing prunes itself — so this defaults to something short rather than
+    /// to forever. `CI_LOG_RETENTION_DAYS=0` disables the sweep, which is a
+    /// choice about disk somebody should make deliberately.
+    pub log_retention: Option<Duration>,
     /// Emails seeded as admins on first sight. app-lb has no roles, so this app
     /// keeps its own.
     pub admin_emails: Vec<String>,
@@ -275,6 +287,22 @@ pub struct Config {
     /// below a real job's runtime and JetStream redelivers healthy work
     /// mid-build, putting two dispatchers on one VM.
     pub max_job_duration: Duration,
+
+    /// Identifies this process among orchestrators sharing a database.
+    ///
+    /// **Random per process, and deliberately not configurable.** It is how a
+    /// restarted instance recognises that a VM leased by "itself" was leased by
+    /// a process that no longer exists — a stable id would make the new process
+    /// inherit the dead one's leases and reclaim nothing.
+    pub instance_id: String,
+    /// How long a VM lease is good for without a renewal.
+    ///
+    /// The window between an instance dying and its VMs becoming reclaimable.
+    /// Comfortably more than the renewal interval, so a slow database or a
+    /// paused process does not drop a lease somebody is still using — losing a
+    /// lease early means two instances on one VM, which is far worse than
+    /// reclaiming a minute late.
+    pub vm_lease: Duration,
 
     /// Signs short-TTL, run-scoped tokens for the SSE log stream.
     ///
@@ -478,11 +506,15 @@ impl Config {
                 .unwrap_or_else(|| ".ci/workflows/*.yml".to_string()),
             max_source_bytes: bytes("CI_MAX_SOURCE_BYTES", 64 * 1024 * 1024)?,
             admin_emails,
+            vm_log_lines: bytes("CI_VM_LOG_LINES", 500)?,
+            log_retention: days("CI_LOG_RETENTION_DAYS", 2)?,
             max_job_duration: secs("CI_MAX_JOB_SECONDS", 4 * 60 * 60)?,
             allow_unauthenticated_runners: flag(
                 "CI_ALLOW_UNAUTHENTICATED_RUNNERS",
                 ALLOW_UNAUTHENTICATED_RUNNERS,
             )?,
+            instance_id: format!("ci-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]),
+            vm_lease: secs("CI_VM_LEASE_SECS", 180)?,
             stream_key: random_key(),
         })
     }
@@ -492,8 +524,9 @@ impl Config {
     /// rather than from someone's memory of the unit file.
     pub fn summary(&self) -> String {
         format!(
-            "listen={} public={} network={} nats={} prefix={} sink={} logs={} \
+            "instance={} listen={} public={} network={} nats={} prefix={} sink={} logs={} \
              heyosecret={} app-lb={} admins={} submit={}",
+            self.instance_id,
             self.listen_addr,
             self.public_url,
             self.heyvm
@@ -563,6 +596,24 @@ fn bytes(var: &'static str, default: usize) -> Result<usize, ConfigError> {
             Ok(n)
         }
     }
+}
+
+/// A retention period in whole days, where `0` means "never delete".
+///
+/// Zero is a legitimate value here, unlike every other duration in this file —
+/// which is why it does not go through `secs`, whose whole job is to refuse a
+/// zero that would become a busy loop.
+fn days(var: &'static str, default: u64) -> Result<Option<Duration>, ConfigError> {
+    let raw = match opt(var) {
+        None => return Ok(Some(Duration::from_secs(default * 86_400))),
+        Some(raw) => raw,
+    };
+    let n = raw.parse::<u64>().map_err(|e| ConfigError::BadValue {
+        var,
+        value: raw.clone(),
+        reason: format!("{e}; whole days, or 0 to keep logs forever"),
+    })?;
+    Ok((n > 0).then(|| Duration::from_secs(n * 86_400)))
 }
 
 fn secs(var: &'static str, default: u64) -> Result<Duration, ConfigError> {
@@ -714,6 +765,33 @@ mod tests {
         assert!(err.to_string().contains("CI_NETWORK"), "{err}");
         assert!(err.to_string().contains("names no network"), "{err}");
         unsafe { std::env::set_var("CI_NETWORK", "test-net") };
+    }
+
+    /// Retention is the one duration where zero is meaningful — it is how an
+    /// operator says "keep everything" — so it must not go through the guard
+    /// that refuses a zero elsewhere.
+    #[test]
+    fn a_retention_of_zero_means_forever_rather_than_being_refused() {
+        unsafe { std::env::remove_var("CI_TEST_RETENTION") };
+        assert_eq!(
+            days("CI_TEST_RETENTION", 2).unwrap(),
+            Some(Duration::from_secs(2 * 86_400)),
+            "the default is two days"
+        );
+
+        unsafe { std::env::set_var("CI_TEST_RETENTION", "0") };
+        assert_eq!(days("CI_TEST_RETENTION", 2).unwrap(), None);
+
+        unsafe { std::env::set_var("CI_TEST_RETENTION", "30") };
+        assert_eq!(
+            days("CI_TEST_RETENTION", 2).unwrap(),
+            Some(Duration::from_secs(30 * 86_400))
+        );
+
+        unsafe { std::env::set_var("CI_TEST_RETENTION", "two") };
+        let err = days("CI_TEST_RETENTION", 2).unwrap_err();
+        assert!(err.to_string().contains("whole days"), "{err}");
+        unsafe { std::env::remove_var("CI_TEST_RETENTION") };
     }
 
     /// The prefix reaches a subject and a durable consumer name verbatim, so a

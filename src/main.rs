@@ -35,6 +35,7 @@ use dispatch::Dispatcher;
 use pool::Pool;
 use runners::{RunnerError, Runners};
 use std::sync::Arc;
+use std::time::Duration;
 use store::Store;
 use vm::Vms;
 
@@ -204,11 +205,16 @@ async fn main() {
     }
     objects.clone().spawn_refresh_loop();
 
+    spawn_log_sweeper(config.clone(), store.clone());
+
     // A previous process may have died holding VMs. Reclaim before taking work,
-    // or the pool leaks its capacity one restart at a time.
+    // or the pool leaks its capacity one restart at a time. This instance's own
+    // id is fresh, so VMs leased by the process this one replaced no longer look
+    // like somebody's live work.
     if let Err(e) = dispatcher.reclaim_pool().await {
         tracing::warn!("could not reclaim the VM pool: {e}");
     }
+    dispatcher.clone().spawn_lease_loop();
     dispatcher.clone().spawn_consumers();
 
     // Bind before announcing readiness. A listener that cannot bind is a hard
@@ -241,6 +247,76 @@ async fn main() {
         std::process::exit(1);
     }
     tracing::info!("shut down cleanly");
+}
+
+/// Delete step and VM logs older than `CI_LOG_RETENTION_DAYS`.
+///
+/// Logs are the bulk of what this process writes and nothing else prunes them —
+/// a build log is megabytes, and an orchestrator that fills its disk stops being
+/// an orchestrator. The rows stay: a step that ran and its exit code are the
+/// run's history, and losing those with the bytes would make an old run look as
+/// though it never happened.
+///
+/// Bounded per pass rather than deleting everything found. A first sweep against
+/// months of history would otherwise be one enormous burst of unlink syscalls on
+/// the same disk a build is writing to.
+fn spawn_log_sweeper(config: Arc<Config>, store: Store) {
+    let Some(retention) = config.log_retention else {
+        tracing::info!("CI_LOG_RETENTION_DAYS=0, so logs are kept forever; watch the disk");
+        return;
+    };
+    /// How often to look. Logs age in days; checking hourly is prompt enough and
+    /// keeps each pass small.
+    const EVERY: Duration = Duration::from_secs(3600);
+    /// Runs per pass.
+    const BATCH: i64 = 200;
+
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(EVERY);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let Ok(cutoff) = chrono::Duration::from_std(retention) else {
+                tracing::error!("CI_LOG_RETENTION_DAYS is out of range; not sweeping");
+                return;
+            };
+            let cutoff = chrono::Utc::now() - cutoff;
+
+            let runs = match store.runs_with_logs_before(cutoff, BATCH).await {
+                Ok(runs) => runs,
+                Err(e) => {
+                    tracing::warn!("could not list runs to sweep: {e}");
+                    continue;
+                }
+            };
+            if runs.is_empty() {
+                continue;
+            }
+
+            let mut swept = 0u64;
+            for run_id in &runs {
+                let dir = store.run_log_dir(run_id);
+                // A missing directory is not an error: the files may have been
+                // removed by hand, or the run may have written none. The rows
+                // are still cleared so it is not offered again.
+                if let Err(e) = tokio::fs::remove_dir_all(&dir).await
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    tracing::warn!("could not remove {}: {e}", dir.display());
+                    continue;
+                }
+                match store.forget_logs_of(run_id).await {
+                    Ok(n) => swept += n,
+                    Err(e) => tracing::warn!("swept {run_id} on disk but not in the database: {e}"),
+                }
+            }
+            tracing::info!(
+                "log sweep: {} run(s) older than {} day(s), {swept} step log(s) discarded",
+                runs.len(),
+                retention.as_secs() / 86_400
+            );
+        }
+    });
 }
 
 /// SIGTERM as well as ctrl-c: supervisord stops a program with `TERM`, and a

@@ -37,6 +37,19 @@ use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::fmt;
 use std::path::Path;
+use std::time::Duration;
+
+/// Who is holding a VM, and how long the claim is good for without a renewal.
+///
+/// One type because the two never travel apart: a holder with no expiry cannot
+/// be reclaimed, and an expiry with no holder cannot say whose it is.
+#[derive(Debug, Clone, Copy)]
+pub struct Lease<'a> {
+    /// The instance id — random per process, so a restart does not inherit its
+    /// own previous life's claims.
+    pub instance: &'a str,
+    pub ttl: Duration,
+}
 
 /// Recorded for a `cache_key_files` entry that does not exist.
 ///
@@ -144,10 +157,12 @@ impl Pool {
         runner: &str,
         fingerprint: &str,
         job_id: &str,
+        lease: Lease<'_>,
     ) -> Result<Option<String>, PoolError> {
         let row = sqlx::query(
             "UPDATE ci_vm_pool
-                SET status = 'claimed', claimed_by_job = $3, last_used_at = now()
+                SET status = 'claimed', claimed_by_job = $3, last_used_at = now(),
+                    leased_by = $4, leased_until = now() + make_interval(secs => $5)
               WHERE sandbox_id = (
                     SELECT sandbox_id FROM ci_vm_pool
                      WHERE runner_hd_id = $1 AND fingerprint = $2 AND status = 'idle'
@@ -160,6 +175,8 @@ impl Pool {
         .bind(runner)
         .bind(fingerprint)
         .bind(job_id)
+        .bind(lease.instance)
+        .bind(lease.ttl.as_secs() as f64)
         .fetch_optional(&self.db)
         .await
         .map_err(PoolError::sql)?;
@@ -177,19 +194,24 @@ impl Pool {
         fingerprint: &str,
         workflow_id: &str,
         job_id: &str,
+        lease: Lease<'_>,
     ) -> Result<(), PoolError> {
         sqlx::query(
             "INSERT INTO ci_vm_pool
-                (sandbox_id, runner_hd_id, fingerprint, workflow_id, status, claimed_by_job)
-             VALUES ($1,$2,$3,$4,'claimed',$5)
+                (sandbox_id, runner_hd_id, fingerprint, workflow_id, status, claimed_by_job,
+                 leased_by, leased_until)
+             VALUES ($1,$2,$3,$4,'claimed',$5,$6, now() + make_interval(secs => $7))
              ON CONFLICT (sandbox_id) DO UPDATE
-                SET status='claimed', claimed_by_job=$5, last_used_at=now()",
+                SET status='claimed', claimed_by_job=$5, last_used_at=now(),
+                    leased_by=$6, leased_until=now() + make_interval(secs => $7)",
         )
         .bind(sandbox_id)
         .bind(runner)
         .bind(fingerprint)
         .bind(workflow_id)
         .bind(job_id)
+        .bind(lease.instance)
+        .bind(lease.ttl.as_secs() as f64)
         .execute(&self.db)
         .await
         .map_err(PoolError::sql)?;
@@ -200,7 +222,8 @@ impl Pool {
     pub async fn release(&self, sandbox_id: &str) -> Result<(), PoolError> {
         sqlx::query(
             "UPDATE ci_vm_pool
-                SET status='idle', claimed_by_job=NULL, last_used_at=now()
+                SET status='idle', claimed_by_job=NULL, last_used_at=now(),
+                    leased_by=NULL, leased_until=NULL
               WHERE sandbox_id = $1",
         )
         .bind(sandbox_id)
@@ -306,22 +329,89 @@ impl Pool {
     /// `SandboxNotFound` from a exec that looks like a daemon fault.
     ///
     /// [`take_for_sweep`]: Self::take_for_sweep
-    pub async fn release_orphans(&self, runners: &[String]) -> Result<u64, PoolError> {
+    /// Renew the leases this instance holds.
+    ///
+    /// One statement for every VM in flight here, on a timer. What it publishes
+    /// is not "this job is fine" but "this process is alive and still holding
+    /// these" — which is the only claim another instance can safely act on.
+    pub async fn renew_leases(&self, lease: Lease<'_>) -> Result<u64, PoolError> {
+        let result = sqlx::query(
+            "UPDATE ci_vm_pool
+                SET leased_until = now() + make_interval(secs => $2)
+              WHERE leased_by = $1 AND status = 'claimed'",
+        )
+        .bind(lease.instance)
+        .bind(lease.ttl.as_secs() as f64)
+        .execute(&self.db)
+        .await
+        .map_err(PoolError::sql)?;
+        Ok(result.rows_affected())
+    }
+
+    /// The VMs this instance is holding right now, with the host each is on.
+    ///
+    /// Claimed rows only: a claimed VM has a job on it, and that is the one that
+    /// must not be reaped out from under a long build. An *idle* pooled VM is
+    /// left to age out, which is what the sandbox TTL is for — renewing those
+    /// too would mean a VM this app created never expires at all.
+    pub async fn leased_by(&self, instance: &str) -> Result<Vec<(String, String)>, PoolError> {
+        let rows = sqlx::query(
+            "SELECT sandbox_id, runner_hd_id FROM ci_vm_pool
+              WHERE leased_by = $1 AND status = 'claimed'",
+        )
+        .bind(instance)
+        .fetch_all(&self.db)
+        .await
+        .map_err(PoolError::sql)?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("sandbox_id"), r.get("runner_hd_id")))
+            .collect())
+    }
+
+    /// Return VMs whose holder has stopped renewing their lease.
+    ///
+    /// **The lease is the authority, not the job's status.** A job left
+    /// `running` by a process that died is indistinguishable, from a row, from a
+    /// job another instance is running right now — so keying on it meant an
+    /// orchestrator could not reclaim even its own VMs after a restart. They
+    /// stayed `claimed` until the sandbox TTL reaped them, and the row leaked
+    /// until some later restart found the job terminal. An expired lease says
+    /// something the job status cannot: nobody is holding this.
+    ///
+    /// A row with **no** lease is one written before this existed, so it falls
+    /// back to the old job-status test. That matters for exactly one deploy —
+    /// the one that introduces leases, where a previous build may still be
+    /// running beside this one — and costs a clause to be safe through it.
+    ///
+    /// Still scoped to `runners`: a VM on a host this instance does not serve
+    /// belongs to whichever instance does, however stale its lease looks.
+    pub async fn release_orphans(
+        &self,
+        runners: &[String],
+        instance: &str,
+    ) -> Result<u64, PoolError> {
         if runners.is_empty() {
             return Ok(0);
         }
         let result = sqlx::query(
             "UPDATE ci_vm_pool p
-                SET status='idle', claimed_by_job=NULL
+                SET status='idle', claimed_by_job=NULL, leased_by=NULL, leased_until=NULL
               WHERE p.status = 'claimed'
                 AND p.runner_hd_id = ANY($1)
-                AND (p.claimed_by_job IS NULL
-                     OR NOT EXISTS (
-                        SELECT 1 FROM ci_job j
-                         WHERE j.id = p.claimed_by_job
-                           AND j.status IN ('pending','queued','running')))",
+                AND p.leased_by IS DISTINCT FROM $2
+                AND (
+                     p.leased_until < now()
+                     OR (p.leased_until IS NULL
+                         AND (p.claimed_by_job IS NULL
+                              OR NOT EXISTS (
+                                 SELECT 1 FROM ci_job j
+                                  WHERE j.id = p.claimed_by_job
+                                    AND j.status IN ('pending','queued','running'))))
+                )",
         )
         .bind(runners)
+        .bind(instance)
         .execute(&self.db)
         .await
         .map_err(PoolError::sql)?;
@@ -368,6 +458,26 @@ impl std::error::Error for PoolError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in instance id and lease for tests that are not about leasing.
+    const INSTANCE: &str = "ci-test-instance";
+    const LEASE: Duration = Duration::from_secs(180);
+
+    /// The common case: this test instance, with a lease that has time left.
+    fn held() -> Lease<'static> {
+        Lease {
+            instance: INSTANCE,
+            ttl: LEASE,
+        }
+    }
+
+    /// A lease that is already spent, standing in for a holder that stopped.
+    fn lapsed(instance: &str) -> Lease<'_> {
+        Lease {
+            instance,
+            ttl: Duration::from_secs(0),
+        }
+    }
     use heyo_sdk::{SandboxDriver, SandboxSize};
     use std::collections::BTreeMap;
 
@@ -588,6 +698,13 @@ mod tests {
         (pool, store)
     }
 
+    /// A distinct instance per test, for the tests that count rows this
+    /// instance holds — `renew_leases` is deliberately not runner-scoped, so a
+    /// shared id would make it pick up every other test's rows.
+    fn instance_id() -> String {
+        format!("ci-{}", crate::vm::new_id())
+    }
+
     /// A distinct runner per test so they never contend.
     fn runner_id() -> String {
         format!("hd-{}", crate::vm::new_id().replace('-', ""))
@@ -606,20 +723,26 @@ mod tests {
         let (pool, _s) = test_pool().await;
         let runner = runner_id();
 
-        pool.register(&sb(&runner, "1"), &runner, "fp-a", "wf", "job-1")
+        pool.register(&sb(&runner, "1"), &runner, "fp-a", "wf", "job-1", held())
             .await
             .unwrap();
         // Claimed by its creator, so nobody else can take it yet.
-        assert_eq!(pool.claim(&runner, "fp-a", "job-2").await.unwrap(), None);
+        assert_eq!(
+            pool.claim(&runner, "fp-a", "job-2", held()).await.unwrap(),
+            None
+        );
 
         pool.release(&sb(&runner, "1")).await.unwrap();
         assert_eq!(
-            pool.claim(&runner, "fp-a", "job-2").await.unwrap(),
+            pool.claim(&runner, "fp-a", "job-2", held()).await.unwrap(),
             Some(sb(&runner, "1")),
             "the next job with the same fingerprint inherits it"
         );
         // And now it is taken again.
-        assert_eq!(pool.claim(&runner, "fp-a", "job-3").await.unwrap(), None);
+        assert_eq!(
+            pool.claim(&runner, "fp-a", "job-3", held()).await.unwrap(),
+            None
+        );
     }
 
     /// The busting behaviour, at the pool level: a different fingerprint must
@@ -629,13 +752,16 @@ mod tests {
     async fn a_different_fingerprint_does_not_match() {
         let (pool, _s) = test_pool().await;
         let runner = runner_id();
-        pool.register(&sb(&runner, "2"), &runner, "fp-a", "wf", "job-1")
+        pool.register(&sb(&runner, "2"), &runner, "fp-a", "wf", "job-1", held())
             .await
             .unwrap();
         pool.release(&sb(&runner, "2")).await.unwrap();
-        assert_eq!(pool.claim(&runner, "fp-b", "job-2").await.unwrap(), None);
         assert_eq!(
-            pool.claim(&runner, "fp-a", "job-2").await.unwrap(),
+            pool.claim(&runner, "fp-b", "job-2", held()).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            pool.claim(&runner, "fp-a", "job-2", held()).await.unwrap(),
             Some(sb(&runner, "2"))
         );
     }
@@ -648,11 +774,11 @@ mod tests {
         let (pool, _s) = test_pool().await;
         let a = runner_id();
         let b = runner_id();
-        pool.register(&sb(&a, "3"), &a, "fp-a", "wf", "job-1")
+        pool.register(&sb(&a, "3"), &a, "fp-a", "wf", "job-1", held())
             .await
             .unwrap();
         pool.release(&sb(&a, "3")).await.unwrap();
-        assert_eq!(pool.claim(&b, "fp-a", "job-2").await.unwrap(), None);
+        assert_eq!(pool.claim(&b, "fp-a", "job-2", held()).await.unwrap(), None);
     }
 
     /// Two dispatchers racing must never be handed the same sandbox — the
@@ -664,7 +790,7 @@ mod tests {
         let runner = runner_id();
         for i in 0..4 {
             let id = format!("sb-race-{i}-{}", crate::vm::new_id());
-            pool.register(&id, &runner, "fp-race", "wf", "job-0")
+            pool.register(&id, &runner, "fp-race", "wf", "job-0", held())
                 .await
                 .unwrap();
             pool.release(&id).await.unwrap();
@@ -676,7 +802,9 @@ mod tests {
             let p = pool.clone();
             let r = runner.clone();
             handles.push(tokio::spawn(async move {
-                p.claim(&r, "fp-race", &format!("job-{i}")).await.unwrap()
+                p.claim(&r, "fp-race", &format!("job-{i}"), held())
+                    .await
+                    .unwrap()
             }));
         }
         let mut claimed = Vec::new();
@@ -691,28 +819,264 @@ mod tests {
         assert_eq!(unique.len(), 4, "no VM was handed out twice: {claimed:?}");
     }
 
-    /// A crash leaves rows claimed by a job that is no longer running; without
-    /// reclaiming them the pool leaks its capacity one restart at a time.
+    /// The lease that a dead instance stopped renewing is what makes its VMs
+    /// reclaimable — not the state of the job it was running.
     #[tokio::test]
     #[ignore = "needs CI_TEST_DATABASE_URL"]
-    async fn orphaned_claims_are_released_at_startup() {
+    async fn a_lapsed_lease_returns_the_vm_to_the_pool() {
         let (pool, _s) = test_pool().await;
         let runner = runner_id();
-        // `job-gone` does not exist in ci_job at all.
-        pool.register(&sb(&runner, "orphan"), &runner, "fp-o", "wf", "job-gone")
-            .await
-            .unwrap();
-        assert_eq!(pool.claim(&runner, "fp-o", "job-x").await.unwrap(), None);
+        // Registered by a process that is now gone, with a lease that has run
+        // out because nobody is renewing it.
+        pool.register(
+            &sb(&runner, "orphan"),
+            &runner,
+            "fp-o",
+            "wf",
+            "job-gone",
+            lapsed("ci-previous-life"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pool.claim(&runner, "fp-o", "job-x", held()).await.unwrap(),
+            None,
+            "claimed rows are not handed out"
+        );
 
         let released = pool
-            .release_orphans(std::slice::from_ref(&runner))
+            .release_orphans(std::slice::from_ref(&runner), INSTANCE)
             .await
             .unwrap();
         assert_eq!(released, 1, "only this runner's orphan");
         assert_eq!(
-            pool.claim(&runner, "fp-o", "job-x").await.unwrap(),
+            pool.claim(&runner, "fp-o", "job-x", held()).await.unwrap(),
             Some(sb(&runner, "orphan")),
-            "a VM held by a dead job must come back"
+            "a VM whose holder stopped renewing must come back"
+        );
+    }
+
+    /// The bug this lease exists to fix.
+    ///
+    /// A restart leaves the job row `running` — nothing marks it otherwise,
+    /// because the process that would have died with it. Keying reclaim on the
+    /// job's status therefore refused to take the VM back, and it stayed
+    /// `claimed` until its sandbox TTL reaped it. The lease says what the job
+    /// status cannot: the holder is gone.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_restart_reclaims_its_own_vm_even_with_the_job_still_running() {
+        let (pool, store) = test_pool().await;
+        let runner = runner_id();
+
+        // A real job row, left exactly as a killed process leaves one.
+        let run_id = crate::vm::new_id();
+        let wf = crate::workflow::Workflow::parse(
+            "wf.yml",
+            "name: t\njobs:\n  build:\n    vm: { driver: firecracker }\n    \
+             steps: [{ run: \"true\" }]\n",
+        )
+        .expect("workflow");
+        let plan = crate::plan::Plan::build(&wf).expect("plan");
+        store
+            .create_run(&run_id, &crate::store::RunRequest::default(), &plan)
+            .await
+            .unwrap();
+        let job = crate::store::job_id(&run_id, "build");
+        store
+            .start_job(&job, &runner, &sb(&runner, "live"), "fp-l", 1)
+            .await
+            .unwrap();
+        let row = store.get_job(&job).await.unwrap().unwrap();
+        assert_eq!(
+            row.status, "running",
+            "the fixture must reproduce the state"
+        );
+
+        // Held by the process that has just been replaced.
+        pool.register(
+            &sb(&runner, "live"),
+            &runner,
+            "fp-l",
+            "wf",
+            &job,
+            lapsed("ci-previous-life"),
+        )
+        .await
+        .unwrap();
+
+        let released = pool
+            .release_orphans(std::slice::from_ref(&runner), INSTANCE)
+            .await
+            .unwrap();
+        assert_eq!(
+            released, 1,
+            "a running job must not pin a VM whose holder is gone"
+        );
+        assert_eq!(
+            pool.claim(&runner, "fp-l", "job-next", held())
+                .await
+                .unwrap(),
+            Some(sb(&runner, "live"))
+        );
+    }
+
+    /// The other half, and the one that must never regress: a VM another
+    /// instance is genuinely holding stays held. Two orchestrators on one
+    /// sandbox is far worse than a VM reclaimed a minute late.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_live_instances_vm_is_left_alone() {
+        let (pool, _s) = test_pool().await;
+        let runner = runner_id();
+        pool.register(
+            &sb(&runner, "theirs"),
+            &runner,
+            "fp-t",
+            "wf",
+            "job-theirs",
+            Lease {
+                instance: "ci-other-instance",
+                ttl: LEASE,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            pool.release_orphans(std::slice::from_ref(&runner), INSTANCE)
+                .await
+                .unwrap(),
+            0,
+            "a lease with time left is somebody still working"
+        );
+
+        // And my own leases are never taken by me, even if the clock says they
+        // lapsed — a slow database must not make this process fight itself.
+        pool.register(
+            &sb(&runner, "mine"),
+            &runner,
+            "fp-m",
+            "wf",
+            "job-mine",
+            lapsed(INSTANCE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pool.release_orphans(std::slice::from_ref(&runner), INSTANCE)
+                .await
+                .unwrap(),
+            0,
+            "an instance must never reclaim a VM it is holding"
+        );
+    }
+
+    /// The keepalive's input: which VMs this instance is running a job on, and
+    /// where each lives. Claimed only — an idle pooled VM is meant to age out.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn held_vms_are_listed_for_the_ttl_keepalive() {
+        let (pool, _s) = test_pool().await;
+        let runner = runner_id();
+        let me = instance_id();
+
+        pool.register(
+            &sb(&runner, "busy"),
+            &runner,
+            "fp-k",
+            "wf",
+            "job-1",
+            Lease {
+                instance: &me,
+                ttl: LEASE,
+            },
+        )
+        .await
+        .unwrap();
+        pool.register(
+            &sb(&runner, "idle"),
+            &runner,
+            "fp-k",
+            "wf",
+            "job-2",
+            Lease {
+                instance: &me,
+                ttl: LEASE,
+            },
+        )
+        .await
+        .unwrap();
+        pool.release(&sb(&runner, "idle")).await.unwrap();
+        // Another instance's VM is not this one's to keep alive.
+        pool.register(
+            &sb(&runner, "theirs"),
+            &runner,
+            "fp-k",
+            "wf",
+            "job-3",
+            Lease {
+                instance: "ci-other-instance",
+                ttl: LEASE,
+            },
+        )
+        .await
+        .unwrap();
+
+        let held = pool.leased_by(&me).await.unwrap();
+        assert_eq!(
+            held,
+            vec![(sb(&runner, "busy"), runner.clone())],
+            "only the claimed VM this instance holds"
+        );
+    }
+
+    /// Renewal is what keeps a lease alive, and it must only touch this
+    /// instance's rows.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn renewing_extends_only_this_instances_leases() {
+        let (pool, _s) = test_pool().await;
+        let runner = runner_id();
+        let me = instance_id();
+        pool.register(
+            &sb(&runner, "mine"),
+            &runner,
+            "fp-r",
+            "wf",
+            "job-1",
+            lapsed(&me),
+        )
+        .await
+        .unwrap();
+        pool.register(
+            &sb(&runner, "theirs"),
+            &runner,
+            "fp-r",
+            "wf",
+            "job-2",
+            lapsed("ci-other-instance"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            pool.renew_leases(Lease {
+                instance: &me,
+                ttl: LEASE
+            })
+            .await
+            .unwrap(),
+            1
+        );
+
+        // Theirs stayed lapsed, so it is reclaimable; mine was renewed, so it
+        // is not.
+        assert_eq!(
+            pool.release_orphans(std::slice::from_ref(&runner), &me)
+                .await
+                .unwrap(),
+            1
         );
     }
 
@@ -723,10 +1087,10 @@ mod tests {
     async fn sweeping_takes_stale_fingerprints_out_of_circulation() {
         let (pool, _s) = test_pool().await;
         let runner = runner_id();
-        pool.register(&sb(&runner, "live"), &runner, "fp-live", "wf", "j")
+        pool.register(&sb(&runner, "live"), &runner, "fp-live", "wf", "j", held())
             .await
             .unwrap();
-        pool.register(&sb(&runner, "dead"), &runner, "fp-dead", "wf", "j")
+        pool.register(&sb(&runner, "dead"), &runner, "fp-dead", "wf", "j", held())
             .await
             .unwrap();
         pool.release(&sb(&runner, "live")).await.unwrap();
@@ -748,10 +1112,13 @@ mod tests {
         );
 
         // Draining, so no longer claimable.
-        assert_eq!(pool.claim(&runner, "fp-dead", "j2").await.unwrap(), None);
+        assert_eq!(
+            pool.claim(&runner, "fp-dead", "j2", held()).await.unwrap(),
+            None
+        );
         // And the wanted one is still there.
         assert_eq!(
-            pool.claim(&runner, "fp-live", "j2").await.unwrap(),
+            pool.claim(&runner, "fp-live", "j2", held()).await.unwrap(),
             Some(sb(&runner, "live"))
         );
 
@@ -767,7 +1134,7 @@ mod tests {
     async fn a_long_idle_vm_is_swept_even_if_its_fingerprint_is_current() {
         let (pool, _s) = test_pool().await;
         let runner = runner_id();
-        pool.register(&sb(&runner, "stale"), &runner, "fp-cur", "wf", "j")
+        pool.register(&sb(&runner, "stale"), &runner, "fp-cur", "wf", "j", held())
             .await
             .unwrap();
         pool.release(&sb(&runner, "stale")).await.unwrap();

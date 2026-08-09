@@ -666,6 +666,10 @@ impl Dispatcher {
             Ok(()) => self.run_steps(msg, &plan, &vm).await,
             Err(e) => Err(e),
         };
+        // Before the release, always: a VM with `reuse: false` is destroyed on
+        // the next line, and the console of the boot that just failed is exactly
+        // what somebody wants when a job dies before its first step.
+        self.capture_vm_log(msg, &plan, &vm).await;
         self.release_vm(&plan, &vm).await;
 
         let status = match &outcome {
@@ -734,7 +738,10 @@ impl Dispatcher {
         let options = self.runners.options_for(runner).await?;
 
         if plan.vm.reuse
-            && let Some(sandbox_id) = self.pool.claim(runner, fingerprint, job_id).await?
+            && let Some(sandbox_id) = self
+                .pool
+                .claim(runner, fingerprint, job_id, self.lease())
+                .await?
         {
             let vm = self.vms.open(options.clone(), sandbox_id.clone()).await?;
             // A pooled VM may have been stopped between jobs, which is normal
@@ -772,9 +779,57 @@ impl Dispatcher {
             )
             .await?;
         self.pool
-            .register(vm.id(), runner, fingerprint, &plan.base_id, job_id)
+            .register(
+                vm.id(),
+                runner,
+                fingerprint,
+                &plan.base_id,
+                job_id,
+                self.lease(),
+            )
             .await?;
         Ok((vm, false))
+    }
+
+    /// Attach the VM's own console to the run.
+    ///
+    /// Recorded as a step at index `-2`, the same trick checkout uses at `-1`:
+    /// it needs a row, a log file on disk and a place in the UI, and a step
+    /// already is all three — including the retention sweep, which walks step
+    /// logs and would otherwise miss a log kept anywhere else.
+    ///
+    /// **Never fails the job.** By the time this runs the steps have already
+    /// decided the outcome, and a job that passed must not be reported as failed
+    /// because a diagnostic could not be fetched.
+    async fn capture_vm_log(&self, msg: &JobMessage, plan: &JobPlan, vm: &Vm) {
+        let sid = format!("{}.vmlog", msg.job_id);
+        if let Err(e) = self
+            .store
+            .create_step(&sid, &msg.job_id, -2, "VM log", None)
+            .await
+        {
+            tracing::warn!(job = %plan.key, "could not record the VM log step: {e}");
+            return;
+        }
+
+        let text = match vm.logs(self.config.vm_log_lines).await {
+            Ok(text) if text.trim().is_empty() => {
+                "[ci] the daemon reported no console output for this VM\n".to_string()
+            }
+            Ok(text) => text,
+            Err(e) => format!("[ci] could not read this VM's logs: {e}\n"),
+        };
+
+        let path = self.store.log_path(&msg.run_id, &plan.key, -2, &sid);
+        if let Err(e) = self.store.append_log(&sid, &path, &text).await {
+            tracing::warn!(job = %plan.key, "could not write the VM log: {e}");
+        }
+        // Always `success`: this step is a place to hang a log, not a verdict on
+        // the job. A red row here would read as the build having failed.
+        let _ = self
+            .store
+            .finish_step(&sid, StepStatus::Success, Some(0), None)
+            .await;
     }
 
     /// Resolve the VM named by `uses: <network>/<node>/<vm>` to a sandbox id.
@@ -1519,11 +1574,118 @@ impl Dispatcher {
         });
     }
 
-    /// Reclaim VMs left claimed by jobs that died with a previous process.
+    /// This instance's claim on a VM: who, and for how long without renewal.
+    fn lease(&self) -> crate::pool::Lease<'_> {
+        crate::pool::Lease {
+            instance: &self.config.instance_id,
+            ttl: self.config.vm_lease,
+        }
+    }
+
+    /// Hold this instance's leases, and reclaim VMs whose holder stopped.
+    ///
+    /// Both halves on one timer because they are two views of the same fact.
+    /// Renewing says "still here"; reclaiming acts on somebody else having
+    /// stopped saying it.
+    ///
+    /// Periodic rather than startup-only, which is the second half of the fix: a
+    /// sibling that dies is reclaimed within a lease period instead of leaking
+    /// until somebody happens to restart this process.
+    pub fn spawn_lease_loop(self: Arc<Self>) {
+        // Comfortably inside the lease, so a slow database or a paused process
+        // gets several chances before its VMs are taken. Losing a lease that is
+        // still in use would put two instances on one VM, which is much worse
+        // than reclaiming a minute late.
+        let every = self.config.vm_lease / 3;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(every.max(Duration::from_secs(5)));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if let Err(e) = self.pool.renew_leases(self.lease()).await {
+                    // Not fatal, and not worth giving up a VM over: the lease
+                    // has time left, and the next tick may well succeed.
+                    tracing::warn!("could not renew VM leases: {e}");
+                }
+                self.renew_vm_ttls().await;
+                if let Err(e) = self.reclaim_pool().await {
+                    tracing::warn!("could not reclaim expired VM leases: {e}");
+                }
+            }
+        });
+    }
+
+    /// Push out the sandbox TTL of every VM this instance is running a job on.
+    ///
+    /// **A job may outlive its VM.** `CI_VM_TTL_SECONDS` defaults to an hour and
+    /// `CI_MAX_JOB_SECONDS` to four, and the TTL was only ever set at creation
+    /// and renewed when a VM was claimed or released — so a build longer than
+    /// the TTL had its machine reaped mid-step, surfacing as a daemon error on a
+    /// job that was doing nothing wrong.
+    ///
+    /// Safe to run while a step is executing because [`Vm::renew_ttl`] does not
+    /// take the sandbox lock, unlike `exec` and `destroy`. If it did, this would
+    /// queue behind the very build it is trying to keep alive.
+    ///
+    /// Only claimed VMs. An idle one in the warm pool is meant to age out — that
+    /// is what the TTL is a backstop for — and renewing those would mean nothing
+    /// this app creates ever expires.
+    async fn renew_vm_ttls(&self) {
+        let held = match self.pool.leased_by(&self.config.instance_id).await {
+            Ok(held) => held,
+            Err(e) => {
+                tracing::warn!("could not list held VMs to renew: {e}");
+                return;
+            }
+        };
+        if held.is_empty() {
+            return;
+        }
+
+        let ttl = self.config.heyvm.vm_ttl;
+        let renewals = held.iter().map(|(sandbox_id, runner)| async move {
+            // Opened per pass rather than cached: the tunnel underneath is
+            // cached by `Runners`, and a handle is a cheap wrapper over it.
+            let options = self.runners.options_for(runner).await?;
+            let vm = self.vms.open(options, sandbox_id.clone()).await?;
+            vm.renew_ttl(ttl).await?;
+            Ok::<_, DispatchError>(())
+        });
+
+        // Concurrent and bounded. One unreachable daemon must not hold up the
+        // renewals of every other VM, nor stall the loop that also renews the
+        // database leases — losing those would hand this instance's VMs away
+        // while it is still using them.
+        let batch = futures::future::join_all(renewals);
+        let results = match tokio::time::timeout(self.config.vm_lease / 6, batch).await {
+            Ok(results) => results,
+            Err(_) => {
+                tracing::warn!(
+                    "renewing {} VM TTL(s) timed out; some may be reaped if this persists",
+                    held.len()
+                );
+                return;
+            }
+        };
+        for ((sandbox_id, _), result) in held.iter().zip(results) {
+            if let Err(e) = result {
+                // Not fatal and not a reason to discard the row: a VM that is
+                // genuinely gone is caught by `acquire_vm`, which already
+                // forgets an unusable pooled VM and builds a fresh one.
+                tracing::warn!(vm = %sandbox_id, "could not renew the TTL: {e}");
+            }
+        }
+    }
+
+    /// Reclaim VMs whose lease has run out — a previous life of this process, or
+    /// a sibling that died.
     pub async fn reclaim_pool(&self) -> Result<(), DispatchError> {
         let pool = self.runners.snapshot();
         let ours: Vec<String> = pool.all_runners().map(|r| r.id.clone()).collect();
-        let released = self.pool.release_orphans(&ours).await?;
+        let released = self
+            .pool
+            .release_orphans(&ours, &self.config.instance_id)
+            .await?;
         if released > 0 {
             tracing::info!("released {released} VM(s) held by jobs that are no longer running");
         }

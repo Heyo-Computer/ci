@@ -306,6 +306,10 @@ async fn healthz() -> &'static str {
     "ok\n"
 }
 
+/// Where the executor records a VM's own console. Mirrors checkout at `-1`; see
+/// `Dispatcher::capture_vm_log`.
+const VM_LOG_STEP_IDX: i32 = -2;
+
 /// How many runs the landing page shows. A dashboard is for "what happened
 /// recently"; anything older is a query, not a scroll.
 const RECENT_RUNS: i64 = 50;
@@ -334,7 +338,28 @@ async fn run_page(
         Ok(Some(run)) => {
             let jobs = state.store.jobs_of(&run_id).await.unwrap_or_default();
             let artifacts = state.store.artifacts_of(&run_id).await.unwrap_or_default();
-            pages::run_page(&state.config.name, name, &run, &jobs, &artifacts).into_response()
+
+            // The VM log is the step recorded at index -2 by the executor. Read
+            // from the same place as any other step log, so a swept run shows
+            // the row with the bytes gone rather than vanishing from the page.
+            let mut vm_logs = Vec::new();
+            for job in &jobs {
+                let steps = state.store.steps_of(&job.id).await.unwrap_or_default();
+                if let Some(step) = steps.iter().find(|s| s.idx == VM_LOG_STEP_IDX) {
+                    vm_logs.push((job.display.clone(), state.store.read_log(step).await));
+                }
+            }
+
+            pages::run_page(
+                &state.config.name,
+                name,
+                &run,
+                &jobs,
+                &artifacts,
+                &vm_logs,
+                state.config.log_retention.map(|d| d.as_secs() / 86_400),
+            )
+            .into_response()
         }
         Ok(None) => not_found(&state, who.as_ref(), &format!("No run {run_id}.")),
         Err(e) => page_error(&state, who.as_ref(), &e.to_string()),

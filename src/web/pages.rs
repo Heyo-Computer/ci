@@ -597,6 +597,8 @@ pub fn run_page(
     run: &Run,
     jobs: &[JobRow],
     artifacts: &[ArtifactRow],
+    vm_logs: &[(String, Option<String>)],
+    retention_days: Option<u64>,
 ) -> Markup {
     let body = html! {
         section {
@@ -648,6 +650,42 @@ pub fn run_page(
                 @for j in jobs {
                     @if let Some(err) = &j.error {
                         div .banner { strong { (j.display) ": " } (err) }
+                    }
+                }
+            }
+        }
+
+        // The VM's own console, captured when each job released its machine.
+        // On the run page rather than only the job page because "the VM never
+        // came up" is a property of the run somebody is looking at, and it is
+        // the one failure with no step log to read.
+        @if !vm_logs.is_empty() {
+            section {
+                h2 { "VM logs" }
+                p .sub {
+                    "Each job's machine, as its daemon saw it — boot and console output, \
+                     captured before the VM was released."
+                    @if let Some(days) = retention_days {
+                        " Discarded after " (days) " day" (if days == 1 { "" } else { "s" }) "."
+                    }
+                }
+                @for (job_key, log) in vm_logs {
+                    details .step {
+                        summary {
+                            span .grow { (job_key) }
+                            @if log.is_none() {
+                                span .meta { "no longer retained" }
+                            }
+                        }
+                        @match log {
+                            Some(text) => pre .log { (text) },
+                            // A job whose log has aged out is different from one
+                            // that never had a VM, and the row says which.
+                            None => p .empty {
+                                "This log has been discarded. Step results are kept; \
+                                 only the bytes age out."
+                            },
+                        }
                     }
                 }
             }
@@ -1278,6 +1316,8 @@ mod page_tests {
             &run("success"),
             &[job("build", "success"), job("deploy", "skipped")],
             &artifacts,
+            &[],
+            Some(2),
         )
         .into_string();
         assert!(html.contains("build"));
@@ -1293,7 +1333,7 @@ mod page_tests {
     fn a_job_error_is_surfaced_on_the_run_page() {
         let mut j = job("build", "failure");
         j.error = Some("step \"Build\" exited 101".into());
-        let html = run_page("ci", None, &run("failure"), &[j], &[]).into_string();
+        let html = run_page("ci", None, &run("failure"), &[j], &[], &[], Some(2)).into_string();
         assert!(html.contains("exited 101"), "{html}");
     }
 
@@ -1389,9 +1429,55 @@ mod page_tests {
     fn a_hostile_job_name_is_escaped() {
         let mut j = job("build", "success");
         j.display = "<img src=x onerror=alert(1)>".into();
-        let html = run_page("ci", None, &run("success"), &[j], &[]).into_string();
+        let html = run_page("ci", None, &run("success"), &[j], &[], &[], Some(2)).into_string();
         assert!(!html.contains("<img src=x"));
         assert!(html.contains("&lt;img"));
+    }
+
+    /// The VM log is the one failure with no step log to read — a machine that
+    /// never came up produces no step output at all — so the run page has to
+    /// carry it.
+    #[test]
+    fn the_run_page_shows_each_jobs_vm_log_and_the_retention() {
+        let logs = [
+            (
+                "build".to_string(),
+                Some("[    0.00] Linux version".to_string()),
+            ),
+            ("deploy".to_string(), None),
+        ];
+        let html = run_page(
+            "ci",
+            None,
+            &run("failure"),
+            &[job("build", "failure")],
+            &[],
+            &logs,
+            Some(2),
+        )
+        .into_string();
+
+        assert!(html.contains("VM logs"));
+        assert!(html.contains("Linux version"));
+        assert!(html.contains("Discarded after 2 days"));
+        // A swept log is a different state from a job that never had a VM, and
+        // the page has to say which rather than rendering an empty box.
+        assert!(html.contains("no longer retained"), "{html}");
+        assert!(html.contains("Step results are kept"));
+    }
+
+    /// With retention off there is nothing to promise, so the page must not
+    /// claim a period it will not honour.
+    #[test]
+    fn retention_is_only_mentioned_when_it_applies() {
+        let logs = [("build".to_string(), Some("boot".to_string()))];
+        let html = run_page("ci", None, &run("success"), &[], &[], &logs, None).into_string();
+        assert!(html.contains("VM logs"));
+        assert!(!html.contains("Discarded after"), "{html}");
+
+        // And the section is absent entirely when no job captured one.
+        let html = run_page("ci", None, &run("success"), &[], &[], &[], Some(2)).into_string();
+        assert!(!html.contains("VM logs"), "{html}");
     }
 
     #[test]

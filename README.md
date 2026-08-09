@@ -314,6 +314,48 @@ Two decisions in there:
 The pool table survives a restart. Without it a crash orphans every VM until its
 TTL, and the next run builds a second pool beside the one already sitting there.
 
+### A claimed VM is held by a lease, not by a job
+
+Each instance takes a **random id at startup** and stamps it, with an expiry, on
+every VM it claims — renewing on a timer while it holds them. Reclaim keys on
+that expiry.
+
+The obvious alternative does not work, and this is the bug it caused: asking
+whether the *job* is still `running` cannot distinguish "another instance is
+running it" from "the process that was running it died". A restart leaves the row
+`running` either way, so reclaim had to leave the VM alone — an orchestrator
+could not take back even its own VMs. They stayed `claimed` until the sandbox TTL
+reaped them (`CI_VM_TTL_SECONDS`, an hour by default), and the row leaked until
+some later restart happened to find the job terminal.
+
+A lease is a fact about the holder rather than an inference from the work. Three
+properties follow:
+
+- **A restarted instance reclaims its own previous life**, because the id is
+  fresh per process — a stable one would inherit the dead process's leases and
+  reclaim nothing.
+- **An instance never reclaims what it is holding**, whatever the clock says. A
+  slow database must not make a process fight itself; two dispatchers on one
+  sandbox is far worse than a VM reclaimed a minute late.
+- **Reclaim runs on a timer, not only at startup**, so a dead sibling's VMs come
+  back within a lease period instead of waiting for somebody to restart this one.
+
+`CI_VM_LEASE_SECS` (default 180) is the window between an instance dying and its
+VMs becoming reclaimable; renewal runs at a third of it.
+
+The same loop **renews the sandbox TTL of every VM it is running a job on**, and
+that is a fix rather than a nicety: `CI_VM_TTL_SECONDS` defaults to an hour and
+`CI_MAX_JOB_SECONDS` to four, while the TTL was only ever set at creation and
+touched again when a VM was claimed or released. A build longer than the TTL had
+its machine reaped mid-step, surfacing as a daemon error on a job doing nothing
+wrong.
+
+Only *claimed* VMs are kept alive. An idle one in the warm pool is meant to age
+out — that is what the TTL is a backstop for, and renewing those would mean
+nothing this app creates ever expires. It works while a step is running because
+`Vm::renew_ttl` does not take the sandbox lock that `exec` holds; if it did, the
+keepalive would queue behind the build it exists to protect.
+
 ## Workflow objects
 
 ```bash
@@ -465,6 +507,26 @@ local-only loop.
 Postgres for runs, jobs, steps, artifacts and the pool; **step logs go to disk**
 with the path and byte count on the row. A build log is megabytes, and putting it
 in a column means every listing query drags all of it across the wire.
+
+**A run's page also carries each job's VM log** — the machine's own console as
+its daemon saw it, read from `GET /sandboxes/{id}/logs` and captured *before* the
+VM is released, because a job with `reuse: false` destroys it on the next line.
+It is recorded as a step at index `-2`, the same trick checkout uses at `-1`: it
+needs a row, a file and a place in the UI, and a step is already all three. That
+also puts it inside the retention sweep rather than somewhere the sweep would
+miss. Capturing it never fails a job — by then the steps have decided the
+outcome, and a green build must not go red because a diagnostic could not be
+fetched.
+
+**Logs are swept after `CI_LOG_RETENTION_DAYS`, default 2.** Nothing else prunes
+them, and an orchestrator that fills its disk stops being an orchestrator. The
+sweep is driven by rows rather than by walking the directory, so it converges —
+once a run's paths are nulled it is not offered again — and it is batched, since
+a first pass over months of history would otherwise be one burst of unlinks on
+the disk a build is writing to. **The rows stay**: a step that ran and its exit
+code are the run's history, and dropping those with the bytes would make an old
+run look as though it never happened. `CI_LOG_RETENTION_DAYS=0` keeps everything,
+which is a decision about disk somebody should make on purpose.
 
 ## Tests
 

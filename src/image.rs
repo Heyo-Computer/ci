@@ -1,45 +1,34 @@
 //! Building a runner's VM image from a Dockerfile in the submitted tree.
 //!
-//! ## Why this is not `docker build`
+//! The build itself runs **on the runner, by its daemon**: `ci` uploads the
+//! Dockerfile and its build context to `POST /images/build`, and heyvmd runs
+//! the same `docker build → docker export → mke2fs` pipeline `heyvm mvm build`
+//! runs locally, writing `~/.heyo/images/firecracker/{name}.ext4` into the
+//! host's own catalog. `ci` never parses the Dockerfile and never boots a
+//! builder VM — docker's semantics apply in full (multi-stage, `COPY --from`,
+//! `ADD`, everything), and the host's docker layer cache makes a rebuild of a
+//! mostly-unchanged Dockerfile incremental.
 //!
-//! `heyvm mvm build` is a local CLI — `docker build` → `docker export` →
-//! `mke2fs`, writing `~/.heyo/images/firecracker/{name}.ext4` on the machine it
-//! runs on. It has no remote form, the daemon exposes no image-build route, and
-//! `SandboxCreateOptions` has no mounts, so nothing produced inside a sandbox
-//! can be written to a host path. An orchestrator that reaches a runner only
-//! through the daemon's HTTP API therefore cannot run that pipeline there, and
-//! giving a CI job the host access that would let it — write permission on the
-//! directory every VM's root filesystem is read from — hands over the runner.
+//! Two consequences of `docker export` are inherited from the pipeline and are
+//! the image author's to handle, exactly as they are for a hand-built image:
 //!
-//! What the daemon *does* expose is `POST /sandboxes/{id}/snapshot-image`, which
-//! copies a live sandbox's rootfs into that same catalog. So the pipeline here
-//! is the one shape that fits the available primitives:
-//!
-//! ```text
-//! FROM  →  create a sandbox from the base image
-//! COPY  →  upload the file to its destination through exec, in chunks
-//! RUN   →  an exec-operation, with the step timeout the daemon honours
-//! ENV   →  a line in /etc/profile.d, because the export discards OCI metadata
-//!          anyway and every step runs under `sh -lc`
-//!          →  sync, then snapshot-image, then destroy the builder
-//! ```
-//!
-//! The result is a real `.ext4` in the runner's catalog: it outlives the warm
-//! VM pool, survives a reboot, and is shared by every later VM built from it.
-//! That is the difference between this and folding the Dockerfile into
-//! `setup_hooks`, which would re-run the whole install on every cold VM.
+//! - **OCI metadata is discarded** — `ENV`, `CMD`, `ENTRYPOINT` do not survive
+//!   into the rootfs. An environment variable that steps need must be written
+//!   to `/etc/profile.d` by a `RUN` (steps run under `sh -lc`, which reads it).
+//! - **The VM boots `init=/init.sh`** and must print `HEYVM_READY`. An image
+//!   without an init script builds fine and then fails every boot; see
+//!   `deploy/image/init.sh` for the contract.
 //!
 //! ## The name is the cache key
 //!
-//! An image is named `ci-img-<12 hex>`, hashed over the Dockerfile's directives
-//! and the bytes of every file in its context. Identical inputs name an image
-//! the host already has; any change names one it does not. There is no
-//! invalidation step and nothing to remember to bump — "reused until cache
-//! busted" is what content addressing does on its own.
-//!
-//! The daemon refusing to overwrite an existing name is what makes two jobs
-//! racing to build the same image safe: the loser is told the name exists,
-//! which is exactly the outcome it wanted.
+//! An image is named `ci-img-<12 hex>`, hashed over the Dockerfile bytes,
+//! every file in the build context, and the size override. Identical inputs
+//! name an image the host already has; any change names one it does not.
+//! There is no invalidation step and nothing to remember to bump — "reused
+//! until cache busted" is what content addressing does on its own. The daemon
+//! returning `ready` for a name that already exists is what makes two jobs
+//! racing to build the same image safe: the loser is told it is done, which
+//! is the outcome it wanted.
 //!
 //! ## What is left in the catalog
 //!
@@ -51,428 +40,124 @@
 //! file went away forgets the row and rebuilds, the same way `acquire_vm`
 //! already recovers from a pooled VM the daemon lost.
 
-use crate::vm::{ImageBuild, Vm, VmError, VmSpec};
+use crate::vm::{ImageBuild, VmSpec};
+use heyo_sdk::{HeyoClient, HeyoClientOptions, RequestOptions};
+use reqwest::Method;
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 /// Hex characters kept from the digest, matching the VM pool's fingerprint.
 const FINGERPRINT_LEN: usize = 12;
 
-/// Per-`RUN` ceiling. A cold `apt-get install build-essential` plus a rustup
-/// toolchain is minutes; anything past this is a Dockerfile that hangs, and
-/// waiting out the job timeout for it would burn the whole budget with no
-/// output.
-const RUN_TIMEOUT: Duration = Duration::from_secs(45 * 60);
-
 /// How long a build may hold its catalog claim without renewal.
 ///
 /// Longer than the VM lease because it bounds something slower: a whole image
 /// build, not a boot. A claim that lapses under a live build only costs a
-/// duplicate build, which the daemon's name check then collapses.
+/// duplicate build request, which the daemon's own idempotency then collapses.
 pub const BUILD_LEASE: Duration = Duration::from_secs(30 * 60);
 
-// ---- the Dockerfile ----------------------------------------------------
+// ---- what gets uploaded ------------------------------------------------
 
-/// One instruction, reduced to what can be replayed inside a booted VM.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Directive {
-    Run(String),
-    Env(String, String),
-    Workdir(String),
-    /// `COPY <src>… <dest>`. Sources are context-relative; `dest` is a guest path.
-    Copy {
-        sources: Vec<String>,
-        dest: String,
-    },
+/// A resolved `vm.build`: the name the image will have, and the bytes that
+/// name was derived from — which are also the bytes the daemon builds from,
+/// so the name can never describe inputs other than the ones sent.
+#[derive(Debug)]
+pub struct BuildPlan {
+    pub name: String,
+    pub dockerfile: String,
+    /// Gzipped tar of the context directory. `None` when the context is empty,
+    /// which is legal: a Dockerfile that copies nothing needs no context.
+    pub context_tar_gz: Option<Vec<u8>>,
 }
 
-/// A parsed Dockerfile: the base image, and the steps to replay on top of it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Dockerfile {
-    pub from: String,
-    pub directives: Vec<Directive>,
-    /// Instructions that parsed but cannot survive the pipeline, kept so the
-    /// build log can say so rather than leaving the author to notice.
-    pub ignored: Vec<String>,
-}
-
-impl Dockerfile {
-    /// Parse the subset that a rootfs build can honour.
-    ///
-    /// **Unknown instructions are an error, not a shrug.** This file decides
-    /// what a build runs, and a silently-dropped `RUN` is a machine that is
-    /// missing a dependency for reasons nothing states. The ignorable set is
-    /// enumerated rather than open: those are the instructions the heyvm
-    /// pipeline genuinely discards.
-    pub fn parse(text: &str) -> Result<Self, ImageError> {
-        // `docker build` discards OCI metadata on export, so these describe a
-        // container image this pipeline never produces. Reported, not obeyed.
-        const IGNORABLE: &[&str] = &[
-            "CMD",
-            "ENTRYPOINT",
-            "EXPOSE",
-            "LABEL",
-            "MAINTAINER",
-            "STOPSIGNAL",
-            "HEALTHCHECK",
-            "VOLUME",
-            "SHELL",
-        ];
-
-        let mut from: Option<String> = None;
-        let mut directives = Vec::new();
-        let mut ignored = Vec::new();
-
-        for (lineno, logical) in logical_lines(text) {
-            let (verb, rest) = match logical.split_once(char::is_whitespace) {
-                Some((v, r)) => (v.to_ascii_uppercase(), r.trim().to_string()),
-                None => (logical.to_ascii_uppercase(), String::new()),
-            };
-            if rest.is_empty() && verb != "USER" {
-                return Err(ImageError::Instruction {
-                    line: lineno,
-                    detail: format!("{verb} needs an argument"),
-                });
-            }
-
-            match verb.as_str() {
-                "FROM" => {
-                    if from.is_some() {
-                        // Multi-stage needs a builder that can copy between
-                        // stages, which a single booted VM is not.
-                        return Err(ImageError::Instruction {
-                            line: lineno,
-                            detail: "a second FROM starts a multi-stage build, which is not \
-                                     supported: this builds one VM from one base image"
-                                .into(),
-                        });
-                    }
-                    // `AS name` is only meaningful with stages, which is
-                    // already refused above.
-                    from = Some(
-                        rest.split_whitespace()
-                            .next()
-                            .unwrap_or_default()
-                            .to_string(),
-                    );
-                }
-                "RUN" => directives.push(Directive::Run(rest)),
-                "WORKDIR" => directives.push(Directive::Workdir(rest)),
-                "ENV" => {
-                    for (k, v) in parse_env(&rest, lineno)? {
-                        directives.push(Directive::Env(k, v));
-                    }
-                }
-                "COPY" | "ADD" => {
-                    // `--from=` is a stage reference and `ADD <url>` is a
-                    // fetch; both need machinery this does not have, and
-                    // guessing at them would produce an image missing files.
-                    if rest.starts_with("--") {
-                        return Err(ImageError::Instruction {
-                            line: lineno,
-                            detail: format!(
-                                "{verb} flags are not supported; use a plain \
-                                             `{verb} <src>… <dest>`"
-                            ),
-                        });
-                    }
-                    let mut parts: Vec<String> =
-                        rest.split_whitespace().map(str::to_string).collect();
-                    if parts.len() < 2 {
-                        return Err(ImageError::Instruction {
-                            line: lineno,
-                            detail: format!("{verb} needs at least one source and a destination"),
-                        });
-                    }
-                    if verb == "ADD" && parts.iter().any(|p| p.contains("://")) {
-                        return Err(ImageError::Instruction {
-                            line: lineno,
-                            detail: "ADD from a URL is not supported; fetch it in a RUN so the \
-                                     download is part of the build log"
-                                .into(),
-                        });
-                    }
-                    let dest = parts.pop().expect("checked above");
-                    directives.push(Directive::Copy {
-                        sources: parts,
-                        dest,
-                    });
-                }
-                // `ARG` before `FROM` is the common use and it only affects the
-                // base image tag, which is spelled out here anyway.
-                "ARG" => ignored.push(format!("line {lineno}: ARG is not substituted")),
-                v if IGNORABLE.contains(&v) => ignored.push(format!(
-                    "line {lineno}: {v} is discarded — the rootfs export keeps no OCI metadata, \
-                     and the VM boots through the heyvm init contract"
-                )),
-                other => {
-                    return Err(ImageError::Instruction {
-                        line: lineno,
-                        detail: format!(
-                            "{other} is not supported. This replays a Dockerfile inside a booted \
-                             VM, so FROM, RUN, ENV, WORKDIR and COPY are what it can honour."
-                        ),
-                    });
-                }
-            }
-        }
-
-        let from = from.ok_or(ImageError::NoFrom)?;
-        if !directives.iter().any(|d| matches!(d, Directive::Run(_))) && directives.is_empty() {
-            return Err(ImageError::Empty);
-        }
-        Ok(Self {
-            from,
-            directives,
-            ignored,
-        })
-    }
-
-    /// Every context-relative path this Dockerfile copies in.
-    pub fn copied_paths(&self) -> Vec<String> {
-        self.directives
-            .iter()
-            .filter_map(|d| match d {
-                Directive::Copy { sources, .. } => Some(sources.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect()
-    }
-
-    /// The image name: `ci-img-<12 hex>` over the directives and the context.
-    ///
-    /// The *parsed* directives rather than the file's bytes, so a reformatted
-    /// comment does not rebuild a three-gigabyte image — but every byte of
-    /// every copied file, because those are what the image ends up containing.
-    /// Sorted by path, so the order `COPY` lines appear in cannot change the
-    /// hash of an otherwise identical build.
-    pub fn fingerprint(&self, context: &Path, spec: &VmSpec) -> Result<String, ImageError> {
-        let mut h = Sha256::new();
-        h.update(b"ci-image-v1\0");
-        h.update(self.from.as_bytes());
-        h.update([0]);
-        for d in &self.directives {
-            match d {
-                Directive::Run(cmd) => {
-                    h.update(b"RUN\0");
-                    h.update(cmd.as_bytes());
-                }
-                Directive::Env(k, v) => {
-                    h.update(b"ENV\0");
-                    h.update(k.as_bytes());
-                    h.update([0]);
-                    h.update(v.as_bytes());
-                }
-                Directive::Workdir(w) => {
-                    h.update(b"WORKDIR\0");
-                    h.update(w.as_bytes());
-                }
-                Directive::Copy { sources, dest } => {
-                    h.update(b"COPY\0");
-                    for s in sources {
-                        h.update(s.as_bytes());
-                        h.update([0]);
-                    }
-                    h.update(dest.as_bytes());
-                }
-            }
-            h.update([0]);
-        }
-
-        // The driver and size decide the rootfs this is snapshotted from, so
-        // two spec shapes must not share an image.
-        h.update(format!("{:?}\0", spec.driver).as_bytes());
-
-        let mut files = collect_context(context, &self.copied_paths())?;
-        files.sort_by(|a, b| a.0.cmp(&b.0));
-        for (rel, bytes) in &files {
-            h.update(rel.as_bytes());
-            h.update([0]);
-            let mut fh = Sha256::new();
-            fh.update(bytes);
-            h.update(fh.finalize());
-        }
-
-        Ok(format!(
-            "ci-img-{}",
-            &hex::encode(h.finalize())[..FINGERPRINT_LEN]
-        ))
-    }
-}
-
-/// Fold continuations and strip comments, keeping the first physical line
-/// number of each instruction so an error can point at it.
-fn logical_lines(text: &str) -> Vec<(usize, String)> {
-    let mut out: Vec<(usize, String)> = Vec::new();
-    let mut current = String::new();
-    let mut start = 0usize;
-
-    for (i, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        // A comment inside a continuation is dropped by docker too.
-        if line.starts_with('#') {
-            continue;
-        }
-        if current.is_empty() {
-            if line.is_empty() {
-                continue;
-            }
-            start = i + 1;
-        }
-        if let Some(head) = line.strip_suffix('\\') {
-            current.push_str(head.trim_end());
-            current.push(' ');
-            continue;
-        }
-        current.push_str(line);
-        let done = std::mem::take(&mut current);
-        let done = done.trim().to_string();
-        if !done.is_empty() {
-            out.push((start, done));
-        }
-    }
-    // A trailing backslash with nothing after it.
-    let rest = current.trim().to_string();
-    if !rest.is_empty() {
-        out.push((start, rest));
-    }
-    out
-}
-
-/// `ENV k=v k2=v2` and the legacy `ENV k v`.
-fn parse_env(rest: &str, line: usize) -> Result<Vec<(String, String)>, ImageError> {
-    if !rest.contains('=') {
-        // `ENV key value` — everything after the first space is the value.
-        let (k, v) = rest
-            .split_once(char::is_whitespace)
-            .ok_or(ImageError::Instruction {
-                line,
-                detail: "ENV needs a name and a value".into(),
-            })?;
-        return Ok(vec![(k.to_string(), unquote(v.trim()).to_string())]);
-    }
-    let mut out = Vec::new();
-    for pair in split_env_pairs(rest) {
-        let (k, v) = pair.split_once('=').ok_or(ImageError::Instruction {
-            line,
-            detail: format!("ENV entry {pair:?} is not `name=value`"),
-        })?;
-        if k.is_empty() {
-            return Err(ImageError::Instruction {
-                line,
-                detail: "ENV has an empty name".into(),
-            });
-        }
-        out.push((k.to_string(), unquote(v).to_string()));
-    }
-    Ok(out)
-}
-
-/// Split on whitespace that is not inside quotes, so `ENV A="x y" B=z` is two
-/// pairs rather than three tokens.
-fn split_env_pairs(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut quote: Option<char> = None;
-    for c in s.chars() {
-        match (quote, c) {
-            (Some(q), c) if c == q => {
-                quote = None;
-                cur.push(c);
-            }
-            (Some(_), c) => cur.push(c),
-            (None, '"') | (None, '\'') => {
-                quote = Some(c);
-                cur.push(c);
-            }
-            (None, c) if c.is_whitespace() => {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
-            }
-            (None, c) => cur.push(c),
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
-fn unquote(s: &str) -> &str {
-    let s = s.trim();
-    for q in ['"', '\''] {
-        if s.len() >= 2 && s.starts_with(q) && s.ends_with(q) {
-            return &s[1..s.len() - 1];
-        }
-    }
-    s
-}
-
-/// Read every file a `COPY` names, expanding a directory to its contents.
+/// Resolve a job's `vm.build` against the checkout: read the Dockerfile, pack
+/// the context, and derive the image name from their content.
 ///
-/// Paths are re-checked here even though the workflow validated the build
-/// block, because these come out of the Dockerfile rather than the YAML and
-/// this function reads files out of a tree somebody submitted.
-fn collect_context(
-    context: &Path,
-    sources: &[String],
-) -> Result<Vec<(String, Vec<u8>)>, ImageError> {
-    let mut out = Vec::new();
-    for src in sources {
-        if src.starts_with('/') || src.split('/').any(|s| s == "..") {
-            return Err(ImageError::EscapingCopy(src.clone()));
-        }
-        // `COPY . /dest` is the common spelling for "the whole context".
-        let root = if src == "." {
-            context.to_path_buf()
-        } else {
-            context.join(src)
-        };
-        let meta = std::fs::metadata(&root).map_err(|e| ImageError::MissingContextFile {
-            path: src.clone(),
+/// The fingerprint hashes the Dockerfile's raw bytes rather than anything
+/// parsed — `ci` no longer understands Dockerfiles, docker does — so a comment
+/// edit does rebuild. That trade is deliberate: the daemon's docker layer
+/// cache makes the rebuild cheap, and a parser kept only to avoid it would be
+/// a second implementation of Dockerfile semantics waiting to disagree with
+/// the first.
+///
+/// The whole context directory is hashed and shipped, as `docker build` ships
+/// it. `.dockerignore` is honoured by docker *during* the build but not by
+/// this hash, so editing an ignored file rebuilds needlessly — mildly wasteful,
+/// never wrong.
+pub fn plan_for(
+    build: &ImageBuild,
+    spec: &VmSpec,
+    workspace: &Path,
+) -> Result<BuildPlan, ImageError> {
+    let dockerfile_path = workspace.join(&build.dockerfile);
+    let dockerfile =
+        std::fs::read_to_string(&dockerfile_path).map_err(|e| ImageError::NoDockerfile {
+            path: build.dockerfile.clone(),
             reason: e.to_string(),
         })?;
-        if meta.is_dir() {
-            walk(&root, context, &mut out)?;
-        } else {
-            let rel = rel_of(&root, context);
-            let bytes = std::fs::read(&root).map_err(|e| ImageError::MissingContextFile {
-                path: src.clone(),
-                reason: e.to_string(),
-            })?;
-            out.push((rel, bytes));
-        }
+
+    let context_dir = workspace.join(build.context_dir());
+    let mut files = Vec::new();
+    if context_dir.is_dir() {
+        walk(&context_dir, &context_dir, &mut files)?;
     }
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out.dedup_by(|a, b| a.0 == b.0);
-    Ok(out)
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut h = Sha256::new();
+    // Versioned, so a change to what the hash covers renames every image
+    // rather than colliding new inputs onto old files.
+    h.update(b"ci-image-v2\0");
+    h.update(dockerfile.as_bytes());
+    h.update([0]);
+    // The size override changes the ext4 the daemon writes, and the driver
+    // decides which catalog the name resolves against.
+    h.update(format!("{:?}\0{}\0", spec.driver, build.size_mb.unwrap_or(0)).as_bytes());
+    for (rel, bytes) in &files {
+        h.update(rel.as_bytes());
+        h.update([0]);
+        let mut fh = Sha256::new();
+        fh.update(bytes);
+        h.update(fh.finalize());
+    }
+    let name = format!("ci-img-{}", &hex::encode(h.finalize())[..FINGERPRINT_LEN]);
+
+    let context_tar_gz = if files.is_empty() {
+        None
+    } else {
+        Some(pack_context(&files)?)
+    };
+
+    Ok(BuildPlan {
+        name,
+        dockerfile,
+        context_tar_gz,
+    })
 }
 
+/// Read every file under `dir`, as context-relative paths.
+///
+/// Symlinks are skipped rather than followed: a link out of the context would
+/// ship a file the fingerprint never hashed — and the tree this walks was
+/// submitted by whoever ran `git submit`.
 fn walk(dir: &Path, context: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Result<(), ImageError> {
-    let entries = std::fs::read_dir(dir).map_err(|e| ImageError::MissingContextFile {
+    let entries = std::fs::read_dir(dir).map_err(|e| ImageError::UnreadableContext {
         path: rel_of(dir, context),
         reason: e.to_string(),
     })?;
     for entry in entries.flatten() {
         let path = entry.path();
-        // Symlinks are not followed: a link out of the context would copy a
-        // file the fingerprint never hashed.
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
+        let Ok(meta) = entry.metadata() else { continue };
         if meta.is_symlink() {
             continue;
         }
         if meta.is_dir() {
             walk(&path, context, out)?;
         } else if meta.is_file() {
-            let bytes = std::fs::read(&path).map_err(|e| ImageError::MissingContextFile {
+            let bytes = std::fs::read(&path).map_err(|e| ImageError::UnreadableContext {
                 path: rel_of(&path, context),
                 reason: e.to_string(),
             })?;
@@ -489,187 +174,209 @@ fn rel_of(path: &Path, context: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// Resolve a job's `vm.build` against the checkout: parse the Dockerfile and
-/// work out what the image would be called.
-pub fn plan_for(
-    build: &ImageBuild,
-    spec: &VmSpec,
-    workspace: &Path,
-) -> Result<(Dockerfile, PathBuf, String), ImageError> {
-    let dockerfile_path = workspace.join(&build.dockerfile);
-    let text = std::fs::read_to_string(&dockerfile_path).map_err(|e| ImageError::NoDockerfile {
-        path: build.dockerfile.clone(),
-        reason: e.to_string(),
-    })?;
-    let parsed = Dockerfile::parse(&text)?;
-    let context = workspace.join(build.context_dir());
-    let name = parsed.fingerprint(&context, spec)?;
-    Ok((parsed, context, name))
+/// Tar and gzip the context files for upload.
+fn pack_context(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, ImageError> {
+    use std::io::Write;
+    let mut ar = tar::Builder::new(Vec::new());
+    for (rel, bytes) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        ar.append_data(&mut header, rel, bytes.as_slice())
+            .map_err(|e| ImageError::Pack(e.to_string()))?;
+    }
+    let tar_bytes = ar
+        .into_inner()
+        .map_err(|e| ImageError::Pack(e.to_string()))?;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    gz.write_all(&tar_bytes)
+        .map_err(|e| ImageError::Pack(e.to_string()))?;
+    gz.finish().map_err(|e| ImageError::Pack(e.to_string()))
 }
 
-// ---- running the build -------------------------------------------------
+// ---- driving the daemon ------------------------------------------------
 
-/// What a build produced, for the log attached to the job.
+/// `POST /images/build` / `GET /images/build/status` response body. One shape
+/// for both: the daemon answers `{status, name}` plus `error` on failure and
+/// `size_bytes` when a ready image's size is known.
+#[derive(Debug, Deserialize)]
+struct BuildStatus {
+    status: String,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    size_bytes: Option<u64>,
+}
+
+/// What a finished remote build reports back.
 pub struct Built {
     pub size_bytes: u64,
+    /// A short transcript of what happened, for the log attached to the job.
     pub log: String,
 }
 
-/// Replay a Dockerfile inside `vm`, then snapshot it as `name`.
+/// Ask `runner`'s daemon to build `plan` and wait for the result.
 ///
-/// `vm` is a builder booted from the Dockerfile's `FROM`; it is destroyed by
-/// the caller either way. Every step's output is collected into the returned
-/// log, because a build that fails is exactly when somebody needs to see what
-/// the base image did and did not have.
-pub async fn build(
-    vm: &Vm,
-    parsed: &Dockerfile,
-    context: &Path,
-    name: &str,
-    op_prefix: &str,
-) -> Result<Built, ImageError> {
-    use std::collections::HashMap;
+/// `options` point at the runner's tunnel, exactly as VM operations do. The
+/// call is fire-and-poll: the POST returns immediately and status is polled
+/// until `ready` or `failed`, bounded by `deadline`. `renew` is called on each
+/// poll so the catalog claim in Postgres outlives a long build — a claim that
+/// lapsed mid-build would invite a second job to start a duplicate.
+///
+/// An `unknown` status after a POST means the daemon restarted or the failure
+/// state aged out; the POST is simply re-sent — it is idempotent, and if the
+/// image landed before the restart the re-POST answers `ready`.
+pub async fn build_remote<F, Fut>(
+    options: HeyoClientOptions,
+    plan: &BuildPlan,
+    size_mb: Option<u64>,
+    deadline: Duration,
+    mut renew: F,
+) -> Result<Built, ImageError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    use base64::Engine;
     use std::fmt::Write as _;
 
+    const POLL: Duration = Duration::from_secs(3);
+
+    let client = HeyoClient::new(options).map_err(|e| ImageError::Daemon {
+        what: "building a client for the runner",
+        detail: e.to_string(),
+    })?;
+
+    let body = serde_json::json!({
+        "name": plan.name,
+        "dockerfile": plan.dockerfile,
+        "context_tar_gz": plan.context_tar_gz.as_deref().map(|b| {
+            base64::engine::general_purpose::STANDARD.encode(b)
+        }),
+        "size_mb": size_mb,
+    });
+
     let mut log = String::new();
-    let _ = writeln!(log, "[ci] building image {name} from {}", parsed.from);
-    for note in &parsed.ignored {
-        let _ = writeln!(log, "[ci] {note}");
-    }
-
-    // Carried across directives the way a Dockerfile does: WORKDIR sets the
-    // directory for later RUNs, ENV the environment.
-    let mut workdir = String::new();
-    let mut env: HashMap<String, String> = HashMap::new();
-    let mut step = 0usize;
-
-    for directive in &parsed.directives {
-        step += 1;
-        let op = format!("{op_prefix}.b{step}");
-        match directive {
-            Directive::Workdir(dir) => {
-                workdir = dir.clone();
-                let _ = writeln!(log, "\n[ci] WORKDIR {dir}");
-                let out = vm
-                    .exec(
-                        &op,
-                        &format!("mkdir -p {}", shell_quote(dir)),
-                        &env,
-                        Duration::from_secs(60),
-                    )
-                    .await?;
-                if !out.succeeded() {
-                    let _ = writeln!(log, "{}", out.combined());
-                    return Err(ImageError::Step {
-                        step,
-                        what: format!("WORKDIR {dir}"),
-                        detail: out.combined(),
-                    });
-                }
-            }
-            Directive::Env(k, v) => {
-                env.insert(k.clone(), v.clone());
-                let _ = writeln!(log, "\n[ci] ENV {k}={v}");
-                // Written to /etc/profile.d as well as held in `env`: the
-                // export discards OCI metadata, so a variable that only lived
-                // in this process would be absent from every step of every job
-                // that later runs on the image. The daemon renders a command as
-                // `sh -lc`, which reads profile.d — the same trick
-                // deploy/image/Dockerfile uses by hand.
-                let line = format!("export {}={}", k, shell_quote(v));
-                let script = format!(
-                    "mkdir -p /etc/profile.d && printf '%s\\n' {} >> /etc/profile.d/10-ci-image.sh \
-                     && chmod 644 /etc/profile.d/10-ci-image.sh",
-                    shell_quote(&line)
-                );
-                let out = vm.exec(&op, &script, &env, Duration::from_secs(60)).await?;
-                if !out.succeeded() {
-                    return Err(ImageError::Step {
-                        step,
-                        what: format!("ENV {k}"),
-                        detail: out.combined(),
-                    });
-                }
-            }
-            Directive::Copy { sources, dest } => {
-                let _ = writeln!(log, "\n[ci] COPY {} {dest}", sources.join(" "));
-                let files = collect_context(context, sources)?;
-                for (i, (rel, bytes)) in files.iter().enumerate() {
-                    // A single source that is a file copies *to* `dest`; a
-                    // directory or several sources copy *into* it, as docker
-                    // does.
-                    let target = if files.len() == 1 && !dest.ends_with('/') {
-                        dest.clone()
-                    } else {
-                        format!("{}/{}", dest.trim_end_matches('/'), rel)
-                    };
-                    vm.upload_bytes(&format!("{op}.f{i}"), &target, bytes)
-                        .await?;
-                    let _ = writeln!(log, "  {rel} → {target} ({} bytes)", bytes.len());
-                }
-            }
-            Directive::Run(cmd) => {
-                let _ = writeln!(log, "\n[ci] RUN {cmd}");
-                let script = if workdir.is_empty() {
-                    cmd.clone()
-                } else {
-                    format!("cd {} || exit 1\n{cmd}", shell_quote(&workdir))
-                };
-                let out = vm.exec(&op, &script, &env, RUN_TIMEOUT).await?;
-                let _ = writeln!(log, "{}", out.combined());
-                if !out.succeeded() {
-                    return Err(ImageError::Step {
-                        step,
-                        what: format!("RUN {cmd}"),
-                        detail: format!("exited {}", out.exit_code),
-                    });
-                }
-            }
+    let _ = writeln!(
+        log,
+        "[ci] building image {} on the runner: {} byte Dockerfile, {} byte context{}",
+        plan.name,
+        plan.dockerfile.len(),
+        plan.context_tar_gz.as_ref().map(|c| c.len()).unwrap_or(0),
+        match size_mb {
+            Some(mb) => format!(", rootfs {mb} MB"),
+            None => ", rootfs auto-sized".to_string(),
         }
-    }
+    );
 
-    // The daemon copies the live rootfs without pausing the VM, so anything
-    // still in page cache would be missing from the image. This is the
-    // quiesce its documentation asks the caller for.
-    let _ = writeln!(log, "\n[ci] sync");
-    let out = vm
-        .exec(
-            &format!("{op_prefix}.sync"),
-            "sync; sleep 1; sync",
-            &env,
-            Duration::from_secs(300),
-        )
-        .await?;
-    if !out.succeeded() {
-        return Err(ImageError::Step {
-            step: step + 1,
-            what: "sync".into(),
-            detail: out.combined(),
+    let post = |client: &HeyoClient, body: serde_json::Value| {
+        let client = client.clone();
+        async move {
+            client
+                .request::<BuildStatus>(
+                    Method::POST,
+                    "/images/build",
+                    Some(&body),
+                    RequestOptions {
+                        // The context rides in this request; give a large one
+                        // time to cross the tunnel. The build itself is not
+                        // waited on here — the route returns on acceptance.
+                        timeout: Some(Duration::from_secs(120)),
+                        query: Vec::new(),
+                    },
+                )
+                .await
+        }
+    };
+
+    let first = post(&client, body.clone())
+        .await
+        .map_err(|e| ImageError::Daemon {
+            what: "starting the image build",
+            detail: e.to_string(),
+        })?;
+    if first.status == "ready" {
+        // The daemon already had it — the whole point of content-hashed names.
+        let _ = writeln!(log, "[ci] the runner already has this image");
+        return Ok(Built {
+            size_bytes: first.size_bytes.unwrap_or(0),
+            log,
         });
     }
 
-    let _ = writeln!(log, "[ci] snapshotting the rootfs as {name}");
-    let size_bytes = match vm.snapshot_to_image(name).await {
-        Ok(size) => size,
-        // Another job built the identical image while this one was working.
-        // Both wanted the same bytes under the same name, so the race has no
-        // loser — this one just did the work for nothing.
-        Err(VmError::ImageExists(_)) => {
-            let _ = writeln!(
-                log,
-                "[ci] another build finished this image first; using theirs"
-            );
-            0
+    let started = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(POLL).await;
+        renew().await;
+
+        let status: BuildStatus = client
+            .request(
+                Method::GET,
+                "/images/build/status",
+                None::<&()>,
+                RequestOptions {
+                    timeout: Some(Duration::from_secs(30)),
+                    query: vec![("name".to_string(), plan.name.clone())],
+                },
+            )
+            .await
+            .map_err(|e| ImageError::Daemon {
+                what: "polling the image build",
+                detail: e.to_string(),
+            })?;
+
+        match status.status.as_str() {
+            "ready" => {
+                let _ = writeln!(
+                    log,
+                    "[ci] image {} is ready after {:?}",
+                    plan.name,
+                    started.elapsed()
+                );
+                return Ok(Built {
+                    size_bytes: status.size_bytes.unwrap_or(0),
+                    log,
+                });
+            }
+            "failed" => {
+                let detail = status
+                    .error
+                    .unwrap_or_else(|| "the daemon reported no reason".to_string());
+                let _ = writeln!(log, "[ci] build failed: {detail}");
+                return Err(ImageError::Build {
+                    name: plan.name.clone(),
+                    detail,
+                });
+            }
+            "building" => {}
+            // The daemon restarted, or a terminal state aged out of its
+            // tracker. Re-POST: idempotent, and it re-answers `ready` if the
+            // image landed before the restart.
+            _ => {
+                let _ = writeln!(log, "[ci] build state lost on the runner; re-requesting");
+                let re = post(&client, body.clone())
+                    .await
+                    .map_err(|e| ImageError::Daemon {
+                        what: "re-requesting the image build",
+                        detail: e.to_string(),
+                    })?;
+                if re.status == "ready" {
+                    return Ok(Built {
+                        size_bytes: re.size_bytes.unwrap_or(0),
+                        log,
+                    });
+                }
+            }
         }
-        Err(e) => return Err(ImageError::Vm(e)),
-    };
 
-    let _ = writeln!(log, "[ci] image {name} is ready");
-    Ok(Built { size_bytes, log })
-}
-
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
+        if started.elapsed() >= deadline {
+            return Err(ImageError::BuildTimeout {
+                name: plan.name.clone(),
+                after: deadline,
+            });
+        }
+    }
 }
 
 // ---- the catalog -------------------------------------------------------
@@ -888,23 +595,25 @@ pub enum ImageError {
         path: String,
         reason: String,
     },
-    Instruction {
-        line: usize,
-        detail: String,
-    },
-    NoFrom,
-    Empty,
-    EscapingCopy(String),
-    MissingContextFile {
+    UnreadableContext {
         path: String,
         reason: String,
     },
-    Step {
-        step: usize,
-        what: String,
+    Pack(String),
+    /// The daemon could not be asked, or stopped answering.
+    Daemon {
+        what: &'static str,
         detail: String,
     },
-    Vm(VmError),
+    /// The daemon ran the build and it failed — a Dockerfile problem, named.
+    Build {
+        name: String,
+        detail: String,
+    },
+    BuildTimeout {
+        name: String,
+        after: Duration,
+    },
     Sql(String),
     /// Somebody else's build did not finish inside the window this job could
     /// wait for it.
@@ -920,12 +629,6 @@ impl ImageError {
     }
 }
 
-impl From<VmError> for ImageError {
-    fn from(e: VmError) -> Self {
-        Self::Vm(e)
-    }
-}
-
 impl fmt::Display for ImageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -933,24 +636,18 @@ impl fmt::Display for ImageError {
                 f,
                 "vm.build.dockerfile {path:?} could not be read from the submitted tree: {reason}"
             ),
-            Self::Instruction { line, detail } => {
-                write!(f, "Dockerfile line {line}: {detail}")
+            Self::UnreadableContext { path, reason } => {
+                write!(f, "build context file {path:?} could not be read: {reason}")
             }
-            Self::NoFrom => write!(f, "the Dockerfile has no FROM, so there is no base image"),
-            Self::Empty => write!(f, "the Dockerfile has no instructions to run"),
-            Self::EscapingCopy(p) => write!(
-                f,
-                "COPY source {p:?} escapes the build context; it must be a relative path \
-                 with no `..` segments"
-            ),
-            Self::MissingContextFile { path, reason } => {
-                write!(f, "COPY source {path:?} could not be read: {reason}")
+            Self::Pack(e) => write!(f, "could not pack the build context: {e}"),
+            Self::Daemon { what, detail } => write!(f, "{what}: {detail}"),
+            Self::Build { name, detail } => {
+                write!(f, "the runner could not build image {name}: {detail}")
             }
-            Self::Step { step, what, detail } => write!(
+            Self::BuildTimeout { name, after } => write!(
                 f,
-                "image build failed at instruction {step} ({what}): {detail}"
+                "the runner did not finish building image {name} within {after:?}"
             ),
-            Self::Vm(e) => write!(f, "{e}"),
             Self::Sql(e) => write!(f, "database error: {e}"),
             Self::WaitTimeout { name, waited } => write!(
                 f,
@@ -969,6 +666,7 @@ mod tests {
     use super::*;
     use heyo_sdk::{SandboxDriver, SandboxSize};
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
 
     fn spec() -> VmSpec {
         VmSpec {
@@ -986,85 +684,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_dockerfile_parses_into_replayable_directives() {
-        let d = Dockerfile::parse(
-            "# a comment\n\
-             FROM ubuntu:24.04\n\
-             RUN apt-get update \\\n    && apt-get install -y curl\n\
-             ENV A=1 B=\"two words\"\n\
-             WORKDIR /src\n\
-             COPY init.sh /init.sh\n\
-             EXPOSE 22\n\
-             CMD [\"/init.sh\"]\n",
-        )
-        .unwrap();
-
-        assert_eq!(d.from, "ubuntu:24.04");
-        assert_eq!(
-            d.directives,
-            vec![
-                Directive::Run("apt-get update && apt-get install -y curl".into()),
-                Directive::Env("A".into(), "1".into()),
-                Directive::Env("B".into(), "two words".into()),
-                Directive::Workdir("/src".into()),
-                Directive::Copy {
-                    sources: vec!["init.sh".into()],
-                    dest: "/init.sh".into()
-                },
-            ]
-        );
-        // Discarded by the pipeline, but said out loud.
-        assert_eq!(d.ignored.len(), 2, "{:?}", d.ignored);
-        assert!(d.ignored.iter().any(|n| n.contains("EXPOSE")));
-        assert!(d.ignored.iter().any(|n| n.contains("CMD")));
+    fn build(dockerfile: &str) -> ImageBuild {
+        ImageBuild {
+            dockerfile: dockerfile.into(),
+            context: None,
+            size_mb: None,
+        }
     }
 
-    /// The house rule everywhere else in this codebase: an instruction nobody
-    /// implemented must not look like one that worked.
-    #[test]
-    fn an_unsupported_instruction_is_refused_rather_than_dropped() {
-        let e = Dockerfile::parse("FROM ubuntu\nONBUILD RUN true\n").unwrap_err();
-        assert!(e.to_string().contains("ONBUILD"), "{e}");
-        assert!(e.to_string().contains("line 2"), "{e}");
-
-        // A second FROM is multi-stage, which one booted VM cannot express.
-        let e = Dockerfile::parse("FROM a\nRUN true\nFROM b\n").unwrap_err();
-        assert!(e.to_string().contains("multi-stage"), "{e}");
-
-        // A stage reference or a URL fetch would silently produce an image
-        // missing files.
-        let e = Dockerfile::parse("FROM a\nCOPY --from=build /x /y\n").unwrap_err();
-        assert!(e.to_string().contains("flags are not supported"), "{e}");
-        let e = Dockerfile::parse("FROM a\nADD https://x/y.tar /y\n").unwrap_err();
-        assert!(e.to_string().contains("URL"), "{e}");
-
-        assert!(matches!(
-            Dockerfile::parse("RUN true\n").unwrap_err(),
-            ImageError::NoFrom
-        ));
-    }
-
-    #[test]
-    fn env_parses_both_spellings_and_keeps_quoted_spaces() {
-        let d = Dockerfile::parse("FROM a\nENV LEGACY some value here\n").unwrap();
-        assert_eq!(
-            d.directives,
-            vec![Directive::Env("LEGACY".into(), "some value here".into())]
-        );
-
-        let d = Dockerfile::parse("FROM a\nENV A=1 B='x y' C=\"z\"\n").unwrap();
-        assert_eq!(
-            d.directives,
-            vec![
-                Directive::Env("A".into(), "1".into()),
-                Directive::Env("B".into(), "x y".into()),
-                Directive::Env("C".into(), "z".into()),
-            ]
-        );
-    }
-
-    fn ctx(files: &[(&str, &str)]) -> PathBuf {
+    fn ws(files: &[(&str, &str)]) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ci-img-{}", crate::vm::new_id()));
         for (rel, body) in files {
             let p = dir.join(rel);
@@ -1079,107 +707,128 @@ mod tests {
     /// unchanged Dockerfile reuses and any change rebuilds.
     #[test]
     fn the_image_name_is_the_hash_of_the_dockerfile_and_its_context() {
-        let text = "FROM ubuntu:24.04\nCOPY init.sh /init.sh\nRUN chmod +x /init.sh\n";
-        let d = Dockerfile::parse(text).unwrap();
-        let c = ctx(&[("init.sh", "#!/bin/sh\necho hi\n")]);
+        let files = [
+            (
+                "img/Dockerfile",
+                "FROM debian\nCOPY marker.txt /etc/marker\n",
+            ),
+            ("img/marker.txt", "one\n"),
+        ];
+        let w = ws(&files);
+        let b = build("img/Dockerfile");
 
-        let first = d.fingerprint(&c, &spec()).unwrap();
-        assert!(first.starts_with("ci-img-"), "{first}");
-        assert_eq!(first.len(), "ci-img-".len() + FINGERPRINT_LEN);
+        let first = plan_for(&b, &spec(), &w).unwrap();
+        assert!(first.name.starts_with("ci-img-"), "{}", first.name);
+        assert_eq!(first.name.len(), "ci-img-".len() + FINGERPRINT_LEN);
         assert_eq!(
-            first,
-            d.fingerprint(&c, &spec()).unwrap(),
+            first.name,
+            plan_for(&b, &spec(), &w).unwrap().name,
             "the same inputs must name the same image, or nothing is ever reused"
         );
+        // The Dockerfile itself is part of the context dir here, and the
+        // context rides along for the daemon to build from.
+        assert!(first.context_tar_gz.is_some());
 
-        // A copied file changing is a different image.
-        std::fs::write(c.join("init.sh"), "#!/bin/sh\necho changed\n").unwrap();
-        let after_file = d.fingerprint(&c, &spec()).unwrap();
+        // A context file changing is a different image.
+        std::fs::write(w.join("img/marker.txt"), "two\n").unwrap();
+        let after_file = plan_for(&b, &spec(), &w).unwrap();
         assert_ne!(
-            first, after_file,
-            "a changed COPY source must bust the cache"
+            first.name, after_file.name,
+            "a changed context file must bust the cache"
         );
 
-        // So is an instruction changing.
-        let d2 = Dockerfile::parse(
-            "FROM ubuntu:24.04\nCOPY init.sh /init.sh\nRUN chmod +x /init.sh && true\n",
+        // So is the Dockerfile changing — including only a comment, because
+        // the hash is over raw bytes now that docker owns the semantics.
+        std::fs::write(
+            w.join("img/Dockerfile"),
+            "# c\nFROM debian\nCOPY marker.txt /etc/marker\n",
         )
         .unwrap();
-        assert_ne!(after_file, d2.fingerprint(&c, &spec()).unwrap());
+        assert_ne!(after_file.name, plan_for(&b, &spec(), &w).unwrap().name);
 
-        // And so is the base image.
-        let d3 = Dockerfile::parse(text.replace("24.04", "22.04").as_str()).unwrap();
-        assert_ne!(after_file, d3.fingerprint(&c, &spec()).unwrap());
-
-        // A comment is not.
-        let d4 = Dockerfile::parse(&format!("# hello\n{text}")).unwrap();
-        assert_eq!(
-            after_file,
-            d4.fingerprint(&c, &spec()).unwrap(),
-            "reformatting must not rebuild a multi-gigabyte image"
-        );
-
-        std::fs::remove_dir_all(&c).ok();
-    }
-
-    /// The build reads files out of a tree somebody submitted, so this is the
-    /// same rule `cache_key_files` has and for the same reason.
-    #[test]
-    fn a_copy_cannot_escape_the_context() {
-        let c = ctx(&[("ok.txt", "x")]);
-        for bad in ["../secrets", "/etc/passwd", "a/../../b"] {
-            let d = Dockerfile::parse(&format!("FROM a\nCOPY {bad} /dest\n")).unwrap();
-            assert!(
-                matches!(d.fingerprint(&c, &spec()), Err(ImageError::EscapingCopy(_))),
-                "{bad} must be refused"
-            );
-        }
-        std::fs::remove_dir_all(&c).ok();
-    }
-
-    #[test]
-    fn a_directory_source_hashes_every_file_under_it() {
-        let c = ctx(&[("app/a.txt", "one"), ("app/nested/b.txt", "two")]);
-        let d = Dockerfile::parse("FROM a\nCOPY app /app\n").unwrap();
-        let before = d.fingerprint(&c, &spec()).unwrap();
-
-        std::fs::write(c.join("app/nested/b.txt"), "changed").unwrap();
+        // And so is the size override: a different ext4 is a different image.
+        let mut sized = build("img/Dockerfile");
+        sized.size_mb = Some(6144);
         assert_ne!(
-            before,
-            d.fingerprint(&c, &spec()).unwrap(),
-            "a file deep in a copied directory still busts the cache"
+            plan_for(&sized, &spec(), &w).unwrap().name,
+            plan_for(&build("img/Dockerfile"), &spec(), &w)
+                .unwrap()
+                .name
         );
-        std::fs::remove_dir_all(&c).ok();
+
+        std::fs::remove_dir_all(&w).ok();
     }
 
     #[test]
-    fn a_missing_copy_source_names_the_path() {
-        let c = ctx(&[("present", "x")]);
-        let d = Dockerfile::parse("FROM a\nCOPY absent /dest\n").unwrap();
-        let e = d.fingerprint(&c, &spec()).unwrap_err();
-        assert!(e.to_string().contains("absent"), "{e}");
-        std::fs::remove_dir_all(&c).ok();
+    fn a_dockerfile_with_no_context_files_ships_none() {
+        let w = ws(&[]);
+        std::fs::write(w.join("Dockerfile"), "FROM debian\nRUN true\n").unwrap();
+        // Context defaults to the Dockerfile's directory — which here contains
+        // only the Dockerfile itself, so it *is* shipped (docker would too).
+        let plan = plan_for(&build("Dockerfile"), &spec(), &w).unwrap();
+        assert!(plan.context_tar_gz.is_some());
+        std::fs::remove_dir_all(&w).ok();
+    }
+
+    #[test]
+    fn a_directory_deep_in_the_context_still_busts_the_cache() {
+        let w = ws(&[
+            ("img/Dockerfile", "FROM debian\nCOPY . /app\n"),
+            ("img/nested/deep/b.txt", "two"),
+        ]);
+        let b = build("img/Dockerfile");
+        let before = plan_for(&b, &spec(), &w).unwrap();
+        std::fs::write(w.join("img/nested/deep/b.txt"), "changed").unwrap();
+        assert_ne!(before.name, plan_for(&b, &spec(), &w).unwrap().name);
+        std::fs::remove_dir_all(&w).ok();
+    }
+
+    #[test]
+    fn a_missing_dockerfile_names_the_path() {
+        let w = ws(&[]);
+        let e = plan_for(&build("absent/Dockerfile"), &spec(), &w).unwrap_err();
+        assert!(e.to_string().contains("absent/Dockerfile"), "{e}");
+        std::fs::remove_dir_all(&w).ok();
     }
 
     /// `heyvm mvm build -f x/Dockerfile` defaults its context to `x`, and a
     /// workflow that says only `dockerfile:` should mean the same thing.
     #[test]
     fn the_context_defaults_to_the_dockerfiles_directory() {
-        let b = ImageBuild {
-            dockerfile: "deploy/image/Dockerfile".into(),
-            context: None,
-        };
+        let b = build("deploy/image/Dockerfile");
         assert_eq!(b.context_dir(), "deploy/image");
-        let b = ImageBuild {
-            dockerfile: "Dockerfile".into(),
-            context: None,
-        };
-        assert_eq!(b.context_dir(), ".");
-        let b = ImageBuild {
-            dockerfile: "deploy/image/Dockerfile".into(),
-            context: Some("deploy".into()),
-        };
+        assert_eq!(build("Dockerfile").context_dir(), ".");
+        let mut b = build("deploy/image/Dockerfile");
+        b.context = Some("deploy".into());
         assert_eq!(b.context_dir(), "deploy");
+    }
+
+    /// The packed context round-trips through tar+gzip, which is what the
+    /// daemon unpacks on the other side.
+    #[test]
+    fn the_context_archive_round_trips() {
+        let w = ws(&[
+            ("img/Dockerfile", "FROM debian\n"),
+            ("img/a.txt", "alpha"),
+            ("img/sub/b.txt", "beta"),
+        ]);
+        let plan = plan_for(&build("img/Dockerfile"), &spec(), &w).unwrap();
+        let gz = plan.context_tar_gz.expect("context");
+
+        let mut seen = std::collections::BTreeMap::new();
+        let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(std::io::Cursor::new(gz)));
+        for entry in ar.entries().unwrap() {
+            use std::io::Read;
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().to_string_lossy().to_string();
+            let mut body = String::new();
+            entry.read_to_string(&mut body).unwrap();
+            seen.insert(path, body);
+        }
+        assert_eq!(seen.get("a.txt").map(String::as_str), Some("alpha"));
+        assert_eq!(seen.get("sub/b.txt").map(String::as_str), Some("beta"));
+        assert!(seen.contains_key("Dockerfile"));
+        std::fs::remove_dir_all(&w).ok();
     }
 
     // ---- the catalog ----------------------------------------------------
@@ -1308,36 +957,5 @@ mod tests {
         ));
         c.forget(name, &runner).await.unwrap();
         assert!(c.inventory(&[runner]).await.unwrap().is_empty());
-    }
-
-    /// This repository's own image, which is the worked example the README
-    /// points at — it has to survive the parser.
-    #[test]
-    fn this_repositorys_own_dockerfile_parses() {
-        let text = include_str!("../deploy/image/Dockerfile");
-        let d = Dockerfile::parse(text).expect("deploy/image/Dockerfile parses");
-        assert_eq!(d.from, "ubuntu:24.04");
-        assert!(
-            d.directives
-                .iter()
-                .filter(|d| matches!(d, Directive::Run(_)))
-                .count()
-                >= 5
-        );
-        assert!(
-            d.directives.contains(&Directive::Copy {
-                sources: vec!["init.sh".into()],
-                dest: "/init.sh".into()
-            }),
-            "{:?}",
-            d.directives
-        );
-        // ENV RUSTUP_HOME/CARGO_HOME must survive as directives — the whole
-        // reason the hand-written image needs its profile.d hack.
-        assert!(
-            d.directives
-                .iter()
-                .any(|x| matches!(x, Directive::Env(k, _) if k == "CARGO_HOME"))
-        );
     }
 }

@@ -3,12 +3,16 @@
 A Firecracker rootfs with a Rust toolchain, which is what `.ci/workflows/build.yml`
 runs in.
 
-**`ci` builds this itself.** The workflow points `vm.build.dockerfile` at this
-file, and the first job to land on a host boots a VM from `FROM`, replays the
-Dockerfile inside it, and snapshots the result into that host's image catalog as
-`ci-img-<hash of this file and its context>`. Later jobs boot straight from it;
-editing this file names a new image, so the next run rebuilds. Nothing has to be
-run by hand on a runner, and no host needs `docker`.
+**`ci` builds this itself, through the runner's daemon.** The workflow points
+`vm.build.dockerfile` at this file, and the first job to land on a host uploads
+it (plus the build context) to the daemon's `POST /images/build`, which runs
+the same `docker build → docker export → mke2fs` pipeline `heyvm mvm build`
+runs, installing the result into that host's image catalog as
+`ci-img-<hash of this file, its context and size_mb>`. Later jobs boot straight
+from it; editing this file names a new image, so the next run rebuilds — and
+the host's docker layer cache makes that rebuild incremental. Nothing has to be
+run by hand on a runner. The runner host needs `docker`, `mke2fs` and (when
+heyvmd is not root) `fakeroot`, which the build checks for and names if absent.
 
 That is a change. It used to be built out of band:
 
@@ -27,44 +31,27 @@ the way to make an image by hand; `heyvm mvm images` lists what a host has.
 
 ## What `ci` honours in this file
 
-`FROM`, `RUN`, `ENV`, `WORKDIR` and `COPY`. `CMD`, `ENTRYPOINT`, `EXPOSE` and
-`LABEL` are reported as discarded — see below, they were never going to survive
-anyway. Anything else is a parse error rather than a silent drop. Multi-stage
-builds, `COPY --from=` and `ADD <url>` are refused by name.
+Everything docker does — the build *is* `docker build`, run by the daemon on
+the runner host, so multi-stage builds, `COPY --from=`, `ADD`, `ARG` and
+`.dockerignore` all behave exactly as they do locally. `ci` does not parse the
+Dockerfile at all; it hashes the bytes and ships them.
 
-`RUN` is an exec-operation in the booted VM rather than a docker layer, so there
-is no layer cache: a rebuild re-runs the whole file. That is the trade for
-building on a machine that has no docker, and it is why the cache key is the
-whole file rather than a per-instruction hash.
+What still does not survive is what `docker export` has never carried: **OCI
+metadata**. `ENV`, `CMD` and `ENTRYPOINT` build fine and then vanish from the
+rootfs, which is why this file writes its environment to `/etc/profile.d` in a
+`RUN` and why the VM boots `init=/init.sh` (the kernel's `init=` parameter, not
+an entrypoint). An image without an `/init.sh` that prints `HEYVM_READY` builds
+successfully and then fails every boot.
 
-## Sizing the rootfs — the open blocker
+## Sizing the rootfs
 
-**`vm.build` cannot build *this* image yet.** A VM created from a public base
-image gets whatever rootfs that image ships. Measured against the daemon:
-
-```
-$ df -h /            # a firecracker VM created from `ubuntu`
-/dev/root       176M  126M   36M  78% /
-```
-
-A Rust toolchain is several gigabytes, so the `RUN curl … rustup` below fails on
-ENOSPC. `disk_size_gb` in the workflow does not help: that is the *data* disk
-mounted at `/var/cache/ci`, and `snapshot-image` copies the **rootfs**, which is
-a different file. The daemon's `POST /sandboxes/{id}/resize` grows the workspace
-disk (`resize_workspace_disk`), not the rootfs, and there is no create-time
-rootfs size option.
-
-So `vm.build` works today for images that add little to their base — which is
-what `ci`'s own end-to-end test covers — and not for a toolchain. Until that
-changes, this image is built by hand with the `heyvm mvm build --size-mb 6144`
-above and named with `image:`.
-
-The fix is small and lives in `mvm-ctrl`, which already has the pieces:
-`grow_ext4_image` (`src/linux_vm_image.rs`) does exactly the
-`set_len` → `e2fsck -fp` → `resize2fs` dance on an unmounted ext4. Wiring a
-`rootfs_size_gb` through `SandboxCreateOptions` to call it on the freshly-copied
-rootfs before first boot would lift the cap, and `ci` would then pass the
-workflow's own figure through the way it already passes `disk_size_gb`.
+`vm.build.size_mb` in the workflow is the old `--size-mb`, carried through to
+the same `mke2fs` call: this workflow sets `6144`, because the crate registry
+under `CARGO_HOME` grows into the rootfs at runtime and the auto-size
+(exported tree × 1.2 + 64 MB) would leave it no headroom. It is part of the
+image fingerprint — changing it builds a new image. Too small shows up as a
+build failing on no space rather than as anything about the image, so leave
+headroom.
 
 ## What the pipeline discards, and what that forces
 
@@ -91,14 +78,7 @@ warm VM relinks instead of recompiling three hundred crates. A cold VM starts
 empty, which is correct — that is what the pool's fingerprint is deciding.
 
 `CARGO_HOME` stays on the rootfs at `/usr/local/cargo`, so the registry cache is
-sized into the `--size-mb` above rather than the data disk.
-
-## Sizing
-
-`--size-mb 6144` covers the base, the toolchain, `build-essential` and room for
-the crate registry to grow. The build cache is not in it — that is the data disk.
-Too small shows up as a build failing on no space rather than as anything about
-the image, so leave headroom.
+sized into `size_mb` rather than the data disk.
 
 ## Changing it
 
@@ -118,4 +98,6 @@ rm ~/.heyo/images/firecracker/ci-img-*.ext4
 
 `ci` notices the next create failing, forgets its record of the image, and
 builds it again. Images are otherwise never swept — a rootfs is expensive to
-rebuild and carries no state from the run that made it.
+rebuild and carries no state from the run that made it. The docker images and
+containers the pipeline makes on the host are cleaned up per build; the layer
+cache stays, which is what keeps rebuilds fast.

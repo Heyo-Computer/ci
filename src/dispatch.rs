@@ -845,9 +845,17 @@ impl Dispatcher {
     /// Dockerfile asks for an image the host already has, and any change asks
     /// for one it does not.
     ///
-    /// Concurrency is settled in the catalog rather than here — [`Catalog::claim`]
-    /// hands exactly one job the build and tells the rest to wait, so N jobs
-    /// landing on a cold host produce one image build and not N.
+    /// The build itself runs on the runner — its daemon runs the same
+    /// docker → export → mke2fs pipeline `heyvm mvm build` runs locally, so
+    /// the host's docker layer cache applies and no builder VM is booted.
+    /// This process only uploads the inputs and polls.
+    ///
+    /// Concurrency is settled twice, at two scopes. [`crate::image::Catalog::claim`]
+    /// hands exactly one *job* the build and tells the rest to wait, so N jobs
+    /// landing on a cold host produce one build request and not N. And the
+    /// daemon's own route is idempotent by name, so even the claim being lost
+    /// — a lapsed lease handing the build to a second dispatcher — collapses
+    /// into one docker build rather than two racing for the same tag.
     async fn ensure_image(
         &self,
         runner: &str,
@@ -856,15 +864,17 @@ impl Dispatcher {
         workspace: &std::path::Path,
         msg: &JobMessage,
     ) -> Result<String, DispatchError> {
-        /// How long to wait for somebody else's build of the same image.
-        /// Generous, because the alternative to waiting is building a second
-        /// copy of a multi-gigabyte rootfs on the same disk.
-        const WAIT_BUDGET: Duration = Duration::from_secs(40 * 60);
-        const POLL: Duration = Duration::from_secs(10);
+        /// How long to wait — for somebody else's build of the same image, and
+        /// for one this job runs itself. One bound for both, because a waiter
+        /// that gives up before the builder finishes fails a job the next
+        /// delivery would have found ready.
+        const BUILD_BUDGET: Duration = Duration::from_secs(40 * 60);
+        const WAIT_POLL: Duration = Duration::from_secs(10);
 
-        let (parsed, context, name) = crate::image::plan_for(build, &plan.vm, workspace)?;
+        let build_plan = crate::image::plan_for(build, &plan.vm, workspace)?;
+        let name = build_plan.name.clone();
 
-        let deadline = std::time::Instant::now() + WAIT_BUDGET;
+        let deadline = std::time::Instant::now() + BUILD_BUDGET;
         loop {
             match self
                 .images
@@ -886,7 +896,7 @@ impl Dispatcher {
                     if std::time::Instant::now() >= deadline {
                         return Err(crate::image::ImageError::WaitTimeout {
                             name,
-                            waited: WAIT_BUDGET,
+                            waited: BUILD_BUDGET,
                         }
                         .into());
                     }
@@ -894,16 +904,36 @@ impl Dispatcher {
                         job = %plan.key,
                         "another job is building image {name} on {runner}; waiting"
                     );
-                    tokio::time::sleep(POLL).await;
+                    tokio::time::sleep(WAIT_POLL).await;
                 }
             }
         }
 
         // This job owns the build.
-        tracing::info!(job = %plan.key, runner, "building image {name} from {}", build.dockerfile);
-        let outcome = self
-            .run_image_build(runner, plan, &parsed, &context, &name, msg)
-            .await;
+        tracing::info!(
+            job = %plan.key, runner,
+            "asking the runner to build image {name} from {}", build.dockerfile
+        );
+        let options = self.runners.options_for(runner).await?;
+        let outcome = crate::image::build_remote(
+            options,
+            &build_plan,
+            build.size_mb,
+            BUILD_BUDGET,
+            // Renewed on every poll so the catalog claim outlives a long
+            // build; the daemon is doing the work, so there is no VM lease or
+            // heartbeat task to piggyback on.
+            || async {
+                if let Err(e) = self
+                    .images
+                    .renew(&name, runner, crate::image::BUILD_LEASE)
+                    .await
+                {
+                    tracing::warn!("could not renew the image build claim: {e}");
+                }
+            },
+        )
+        .await;
 
         match outcome {
             Ok(built) => {
@@ -929,114 +959,6 @@ impl Dispatcher {
                 Err(e.into())
             }
         }
-    }
-
-    /// Boot a builder VM, replay the Dockerfile in it, snapshot it, and tear it
-    /// down.
-    ///
-    /// The builder is deliberately *not* pooled. It is a scaffold whose only
-    /// product is the image, and leaving it in the pool would hand the next job
-    /// a machine with the whole build context and package cache still in it —
-    /// which is the thing the snapshot was taken to avoid.
-    async fn run_image_build(
-        &self,
-        runner: &str,
-        plan: &JobPlan,
-        parsed: &crate::image::Dockerfile,
-        context: &std::path::Path,
-        name: &str,
-        msg: &JobMessage,
-    ) -> Result<crate::image::Built, crate::image::ImageError> {
-        let options =
-            self.runners
-                .options_for(runner)
-                .await
-                .map_err(|e| crate::image::ImageError::Step {
-                    step: 0,
-                    what: "reaching the runner".into(),
-                    detail: e.to_string(),
-                })?;
-
-        // The builder takes the job's shape — driver, size, disk — because the
-        // rootfs it produces is the one the job's VMs boot from, and a snapshot
-        // taken from a smaller disk than the job asked for would be too small.
-        let mut spec = plan.vm.clone();
-        spec.build = None;
-        spec.image = Some(parsed.from.clone());
-        spec.setup_hooks.clear();
-        spec.env_vars.clear();
-        spec.working_directory = None;
-
-        let builder_name = crate::vm::sandbox_name(
-            &format!("imgbuild-{}", plan.base_id),
-            name.trim_start_matches("ci-img-"),
-            NONCE.fetch_add(1, Ordering::Relaxed),
-        );
-        // Recorded on /vms like any other VM being created: this is the longest
-        // thing a cold job does, and it must not be invisible for the same
-        // reason a boot must not be.
-        let building = self
-            .pool
-            .begin_build(
-                &format!("{}.image", msg.job_id),
-                runner,
-                name,
-                &plan.base_id,
-                self.lease(),
-            )
-            .await
-            .ok();
-
-        let created = self
-            .vms
-            .create(
-                options,
-                &builder_name,
-                &spec,
-                // Its own TTL, comfortably past a long build, rather than the
-                // pool's: this VM is never handed to a job, so the pool's
-                // idle-ageing backstop is the wrong bound for it.
-                crate::image::BUILD_LEASE * 2,
-                BOOT_TIMEOUT,
-            )
-            .await;
-
-        if let Some(id) = &building {
-            let _ = self.pool.forget(id).await;
-        }
-        let vm = created?;
-
-        // A build outlasts a catalog lease, so hold it for as long as this runs
-        // or another job will decide the build was abandoned and start a second.
-        let keepalive = {
-            let images = self.images.clone();
-            let name = name.to_string();
-            let runner = runner.to_string();
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(crate::image::BUILD_LEASE / 3);
-                ticker.tick().await;
-                loop {
-                    ticker.tick().await;
-                    if let Err(e) = images
-                        .renew(&name, &runner, crate::image::BUILD_LEASE)
-                        .await
-                    {
-                        tracing::warn!("could not renew the image build claim: {e}");
-                    }
-                }
-            })
-        };
-
-        let result =
-            crate::image::build(&vm, parsed, context, name, &format!("{}.img", msg.job_id)).await;
-
-        keepalive.abort();
-        // Always, on both paths: a builder left running is a machine nothing
-        // will ever claim, holding a whole rootfs until its TTL.
-        if let Err(e) = vm.destroy().await {
-            tracing::warn!(vm = vm.id(), "could not destroy the image builder: {e}");
-        }
-        result
     }
 
     /// Attach an image build's log to the job, as a step at index `-3`.
@@ -3006,6 +2928,15 @@ mod tests {
     //     cargo test --bin ci -- --ignored --nocapture end_to_end
 
     async fn test_dispatcher(workspace_root: &std::path::Path) -> Arc<Dispatcher> {
+        // So `--nocapture` shows what the dispatcher actually did; RUST_LOG
+        // applies as usual. try_init because a second e2e in one process is
+        // not an error.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "warn".into()),
+            )
+            .try_init();
         let db = std::env::var("CI_TEST_DATABASE_URL").expect("CI_TEST_DATABASE_URL");
         let nats =
             std::env::var("CI_TEST_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into());
@@ -3171,17 +3102,18 @@ jobs:
         run: cat /etc/ci-marker; echo "marker=$CI_IMAGE_MARKER"
 "#;
 
-    /// The whole `vm.build` path against a real daemon: parse a Dockerfile,
-    /// boot a builder from its `FROM`, replay COPY/RUN/ENV in it, snapshot it
-    /// into the runner's catalog, and run a job on the result — then prove the
-    /// second run reuses the image rather than building it again.
+    /// The whole `vm.build` path against a real daemon: upload a Dockerfile
+    /// and its context to `POST /images/build`, let the daemon run docker →
+    /// export → mke2fs into its catalog, and run a job on the result — then
+    /// prove the second run reuses the image rather than building it again.
     ///
-    /// The three assertions on the marker file are the three transports this
-    /// depends on: COPY goes through chunked exec, RUN through an
-    /// exec-operation, and ENV through `/etc/profile.d` because the rootfs
-    /// carries no OCI metadata. A snapshot that missed any of them would still
-    /// boot, which is exactly why each is checked in the guest rather than
-    /// inferred from the build log.
+    /// The Dockerfile ships its own `/init.sh`, and that is not test
+    /// scaffolding: docker-built images boot `init=/init.sh` and must print
+    /// `HEYVM_READY`, exactly like a hand-built one. The in-guest assertions
+    /// cover what has to survive `docker export`: a COPY'd file, a RUN layer,
+    /// and an environment variable — which does NOT survive as OCI `ENV` and
+    /// must be written to `/etc/profile.d` by a RUN, which is exactly what the
+    /// test's Dockerfile does.
     #[tokio::test]
     #[ignore = "needs Postgres, NATS and a local heyvmd"]
     async fn end_to_end_an_image_is_built_from_a_dockerfile_and_then_reused() {
@@ -3210,9 +3142,9 @@ jobs:
         }
     }
 
-    /// Where the daemon writes a snapshotted image, mirroring
+    /// Where the daemon installs a built image, mirroring
     /// `get_firecracker_images_dir`. Test-only: the app never touches the
-    /// runner's filesystem, which is the whole reason `snapshot-image` exists.
+    /// runner's filesystem, which is the whole reason `/images/build` exists.
     fn dirs_image_path(name: &str) -> std::path::PathBuf {
         let base = std::env::var("MVM_DATA_DIR")
             .map(std::path::PathBuf::from)
@@ -3223,20 +3155,44 @@ jobs:
     }
 
     async fn e2e_image_body(d: Arc<Dispatcher>) {
-        const DOCKERFILE: &str = "FROM debian\n\
+        // A docker-built image boots `init=/init.sh` with no catalog base to
+        // inherit one from, so the Dockerfile ships its own — the same
+        // obligation deploy/image/Dockerfile discharges for the real build
+        // image. The `ENV` is written through `RUN` into /etc/profile.d
+        // because `docker export` discards OCI metadata; an `ENV` directive
+        // would build fine and silently vanish.
+        const DOCKERFILE: &str = "FROM debian:bookworm-slim\n\
              COPY marker.txt /etc/ci-marker\n\
              RUN echo 'and-a-run-layer' >> /etc/ci-marker\n\
-             ENV CI_IMAGE_MARKER=from-the-image\n";
+             RUN mkdir -p /etc/profile.d \\\n\
+              && printf 'export CI_IMAGE_MARKER=from-the-image\\n' > /etc/profile.d/10-e2e.sh\n\
+             COPY init.sh /init.sh\n\
+             RUN chmod +x /init.sh\n";
+
+        /// PID 1 for the built VM: the minimum that satisfies the heyvm boot
+        /// contract. Mount the API filesystems, quiet the serial console the
+        /// exec protocol runs over, print the ready marker, and keep a shell
+        /// alive on the console — bash specifically, as the serial exec
+        /// protocol's output framing is exercised against bash and a dash
+        /// console loses step output.
+        const INIT_SH: &str = "#!/bin/sh\n\
+             mount -t proc proc /proc\n\
+             mount -t sysfs sysfs /sys\n\
+             mount -t devtmpfs devtmpfs /dev 2>/dev/null\n\
+             mkdir -p /dev/pts && mount -t devpts devpts /dev/pts\n\
+             dmesg -n 1 2>/dev/null\n\
+             mkdir -p /workspace\n\
+             echo HEYVM_READY\n\
+             while :; do /bin/bash --login; sleep 0.1; done\n";
+
+        let files: &[(&str, &str)] = &[
+            ("img/Dockerfile", DOCKERFILE),
+            ("img/init.sh", INIT_SH),
+            ("img/marker.txt", "a-copied-file\n"),
+        ];
 
         let run1_id = crate::vm::new_id();
-        seed_workspace(
-            &d,
-            &run1_id,
-            &[
-                ("img/Dockerfile", DOCKERFILE),
-                ("img/marker.txt", "a-copied-file\n"),
-            ],
-        );
+        seed_workspace(&d, &run1_id, files);
         let (run1, status1) = run_workflow_with_id(&d, E2E_IMAGE_YAML, &run1_id).await;
         assert_eq!(
             status1,
@@ -3269,7 +3225,7 @@ jobs:
         assert!(log.contains("and-a-run-layer"), "RUN did not land: {log:?}");
         assert!(
             log.contains("marker=from-the-image"),
-            "ENV did not survive into the image: {log:?}"
+            "the profile.d environment did not survive into the image: {log:?}"
         );
 
         // The build log is attached to the job, so a failing Dockerfile is
@@ -3279,7 +3235,7 @@ jobs:
             .find(|s| s.name.starts_with("Image ci-img-"))
             .expect("the build log is attached to the job");
         let build_log = d.store.read_log(img_step).await.unwrap_or_default();
-        for want in ["COPY marker.txt", "RUN echo", "snapshotting the rootfs"] {
+        for want in ["building image ci-img-", "is ready after"] {
             assert!(
                 build_log.contains(want),
                 "build log is missing {want:?}: {build_log:?}"
@@ -3288,14 +3244,7 @@ jobs:
 
         // ---- run 2: the same Dockerfile must not build a second image.
         let run2_id = crate::vm::new_id();
-        seed_workspace(
-            &d,
-            &run2_id,
-            &[
-                ("img/Dockerfile", DOCKERFILE),
-                ("img/marker.txt", "a-copied-file\n"),
-            ],
-        );
+        seed_workspace(&d, &run2_id, files);
         let (run2, status2) = run_workflow_with_id(&d, E2E_IMAGE_YAML, &run2_id).await;
         assert_eq!(status2, crate::store::RunStatus::Success, "run 2: {run2}");
 
@@ -3313,14 +3262,9 @@ jobs:
 
         // ---- run 3: editing the context busts it.
         let run3_id = crate::vm::new_id();
-        seed_workspace(
-            &d,
-            &run3_id,
-            &[
-                ("img/Dockerfile", DOCKERFILE),
-                ("img/marker.txt", "a-changed-file\n"),
-            ],
-        );
+        let mut changed: Vec<(&str, &str)> = files.to_vec();
+        changed[2] = ("img/marker.txt", "a-changed-file\n");
+        seed_workspace(&d, &run3_id, &changed);
         let (_run3, status3) = run_workflow_with_id(&d, E2E_IMAGE_YAML, &run3_id).await;
         assert_eq!(status3, crate::store::RunStatus::Success);
 

@@ -69,13 +69,6 @@ const POLL_SLACK: Duration = Duration::from_secs(30);
 /// comes from — it is measured against a real guest, not chosen.
 const UPLOAD_CHUNK: usize = 24 * 1024;
 
-/// How long the daemon may take to copy a rootfs into the image catalog.
-///
-/// This is a file copy of the whole image — gigabytes on a build image with a
-/// toolchain in it — on the runner's own disk, so it is bounded in minutes
-/// rather than the seconds a control call gets.
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(20 * 60);
-
 /// One line of a VM's own log, as `GET /sandboxes/{id}/logs` returns it.
 ///
 /// Re-declared rather than imported: the daemon's `LogEntry` lives in
@@ -121,6 +114,13 @@ pub struct ImageBuild {
     /// Defaults to the Dockerfile's own directory, as `docker build` does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
+    /// Rootfs size in MB. Absent means the daemon auto-sizes from the exported
+    /// tree (× 1.2 + 64 MB) — right for an image that only ever reads itself,
+    /// too tight for one whose workload writes into the rootfs at runtime, the
+    /// way a crate registry cache under `CARGO_HOME` does. Part of the image
+    /// fingerprint: a different ext4 size is a different image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_mb: Option<u64>,
 }
 
 impl ImageBuild {
@@ -196,11 +196,8 @@ impl VmSpec {
         if self.driver == SandboxDriver::Libvirt {
             return Err(VmSpecError::UnsupportedDriver);
         }
-        // The daemon's `snapshot-image` route is Firecracker and KVM only —
-        // libvirt publishes qcow2 through a stop-cycle that does not match
-        // snapshotting a running VM — so a build could not finish anywhere the
-        // driver check above does not already refuse. Stated separately anyway,
-        // because "both are set" is an authoring mistake with its own fix.
+        // "Both are set" is an authoring mistake with its own fix, so it is
+        // stated separately from everything else.
         if let Some(build) = &self.build {
             if self.image.is_some() {
                 return Err(VmSpecError::ImageAndBuild);
@@ -212,6 +209,9 @@ impl VmSpec {
             }
             if build.dockerfile.trim().is_empty() {
                 return Err(VmSpecError::EmptyDockerfilePath);
+            }
+            if build.size_mb == Some(0) {
+                return Err(VmSpecError::ZeroImageSize);
             }
         }
         if let Some(d) = self.disk_size_gb
@@ -248,6 +248,7 @@ pub enum VmSpecError {
     ImageAndBuild,
     EscapingBuildPath(String),
     EmptyDockerfilePath,
+    ZeroImageSize,
 }
 
 impl fmt::Display for VmSpecError {
@@ -285,6 +286,7 @@ impl fmt::Display for VmSpecError {
             Self::EmptyDockerfilePath => {
                 write!(f, "vm.build.dockerfile must name a file in the repository")
             }
+            Self::ZeroImageSize => write!(f, "vm.build.size_mb must be greater than zero"),
         }
     }
 }
@@ -803,75 +805,6 @@ impl Vm {
         Ok(out)
     }
 
-    /// Copy this VM's rootfs into the runner's image catalog under `name`.
-    ///
-    /// `POST /sandboxes/{id}/snapshot-image` — the daemon writes
-    /// `~/.heyo/images/firecracker/{name}.ext4`, which is the same directory a
-    /// bare `image:` resolves against. So this is the whole of "build an image
-    /// on a runner": boot a base VM, do the work in it, snapshot it, and every
-    /// later job on that host names the result.
-    ///
-    /// **Not in the SDK**, so it goes through the raw client like the exec
-    /// routes. And not a route `ci` could do without: `heyvm mvm build` is a
-    /// local CLI over `docker build → docker export → mke2fs`, there is no
-    /// remote build API, and the daemon exposes no way to run a command on the
-    /// *host* — an orchestrator that only reaches a runner through this API has
-    /// no other path from a Dockerfile to a rootfs on that machine.
-    ///
-    /// **The daemon refuses a name that already exists**, and that refusal is
-    /// load-bearing rather than an inconvenience: names are content hashes, so
-    /// "already there" means another job built the identical image first and
-    /// the right move is to use it. [`VmError::ImageExists`] is separated out
-    /// so the caller can tell that from a real failure.
-    ///
-    /// The copy is taken from the live rootfs without pausing the VM, so the
-    /// caller must quiesce writers first — see `image::build`, which runs
-    /// `sync` as its last step.
-    pub async fn snapshot_to_image(&self, name: &str) -> Result<u64, VmError> {
-        #[derive(Deserialize)]
-        struct SnapshotResult {
-            #[serde(default)]
-            size_bytes: u64,
-        }
-
-        let path = format!("/sandboxes/{}/snapshot-image", encode_segment(&self.id));
-        // Serialized against exec for the same reason `destroy` is: the daemon
-        // reads the rootfs file this sandbox is running on.
-        let _guard = self.lock.lock().await;
-        let result: Result<SnapshotResult, HeyoError> = self
-            .sandbox
-            .client()
-            .request(
-                Method::POST,
-                &path,
-                Some(&serde_json::json!({ "name": name })),
-                RequestOptions {
-                    // A multi-gigabyte file copy on the runner's disk, not a
-                    // control call — the default client timeout is far too
-                    // short for it.
-                    timeout: Some(SNAPSHOT_TIMEOUT),
-                    query: Vec::new(),
-                },
-            )
-            .await;
-
-        match result {
-            Ok(r) => Ok(r.size_bytes),
-            // The daemon reports this as a 400 with the name in the message.
-            // Matching on the text is unlovely, but it is the only signal it
-            // gives, and treating "somebody already built this" as a build
-            // failure would fail a job over a race it won.
-            Err(e) if e.to_string().contains("already exists") => {
-                Err(VmError::ImageExists(name.to_string()))
-            }
-            Err(e) => Err(VmError::Daemon {
-                sandbox: self.id.clone(),
-                what: "snapshotting the rootfs into an image",
-                source: e,
-            }),
-        }
-    }
-
     pub async fn renew_ttl(&self, ttl: Duration) -> Result<(), VmError> {
         self.sandbox
             .set_ttl(ttl.as_secs())
@@ -997,9 +930,6 @@ pub enum VmError {
         of: usize,
         detail: String,
     },
-    /// The runner already has an image under this name. Because names are
-    /// content hashes, this is a race won by somebody else rather than a fault.
-    ImageExists(String),
 }
 
 impl fmt::Display for VmError {
@@ -1066,11 +996,6 @@ impl fmt::Display for VmError {
                 f,
                 "writing {path} into {sandbox} failed on chunk {} of {of}: {detail}",
                 chunk + 1
-            ),
-            Self::ImageExists(name) => write!(
-                f,
-                "this runner already has an image named {name:?}; it does not need \
-                 building again"
             ),
         }
     }

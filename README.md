@@ -186,68 +186,55 @@ vm:
   build:                           # a Dockerfile in the submitted tree
     dockerfile: deploy/image/Dockerfile
     context: deploy/image          # defaults to the Dockerfile's own directory
+    size_mb: 6144                  # rootfs size; absent = auto from the tree
 ```
 
 The two are mutually exclusive and saying both is a parse error: a built image's
 name is the hash of its Dockerfile and context, so an author-supplied one could
 only disagree with it.
 
-**`build:` builds the image on the runner, once.** The first job to want it on a
-given host boots a VM from the Dockerfile's `FROM`, replays the file inside it,
-snapshots the result into that host's image catalog, and throws the builder
-away. Every later job naming the same Dockerfile boots straight from the image.
-Edit the Dockerfile or anything it copies and the name changes, so the next run
-builds a new one — there is nothing to remember to invalidate.
+**`build:` builds the image on the runner, once, by the runner's own daemon.**
+The first job to want it on a given host uploads the Dockerfile and its context
+to heyvmd's `POST /images/build`, which runs the `heyvm mvm build` pipeline —
+`docker build → docker export → mke2fs` — on the host and installs the result
+into that host's image catalog. Every later job naming the same Dockerfile
+boots straight from the image. Edit the Dockerfile, anything in its context, or
+`size_mb` and the name changes, so the next run builds a new one — there is
+nothing to remember to invalidate, and the host's docker layer cache keeps the
+rebuild incremental.
 
-It exists because the alternative was a footgun. `image: ci-rust` names a rootfs
-that has to be built by hand with `heyvm mvm build` on every runner, and a host
-that never had that run fails every job at VM creation — which, before the
-`building` row above, looked exactly like a run nothing had picked up.
+It exists because the alternative was a footgun. `image: ci-rust` names a
+rootfs that has to be built by hand with `heyvm mvm build` on every runner, and
+a host that never had that run fails every job at VM creation — which, before
+the `building` row above, looked exactly like a run nothing had picked up.
 
-`FROM`, `RUN`, `ENV`, `WORKDIR` and `COPY` are honoured. `CMD`, `ENTRYPOINT`,
-`EXPOSE`, `LABEL` and friends parse and are reported as discarded, because the
-rootfs carries no OCI metadata and the VM boots through heyvm's init contract.
-**Anything else is a parse error**, on the house rule that a silently-dropped
-`RUN` is a machine missing a dependency for reasons nothing states. Multi-stage
-builds, `COPY --from=`, and `ADD <url>` are refused by name.
+Because the build *is* `docker build`, docker's semantics apply in full —
+multi-stage, `COPY --from=`, `ADD`, `ARG`, `.dockerignore`. `ci` does not parse
+the Dockerfile; it hashes the bytes and ships them. What does not survive is
+what `docker export` has never carried: **OCI metadata**. `ENV`, `CMD` and
+`ENTRYPOINT` build fine and then vanish from the rootfs — an environment
+variable steps need must be written to `/etc/profile.d` by a `RUN` (steps run
+under `sh -lc`, which reads it), and the VM boots the kernel's `init=/init.sh`,
+which must print `HEYVM_READY`. An image without an init script builds
+successfully and then fails every boot; `deploy/image/init.sh` is the contract.
 
-`ENV` is written to `/etc/profile.d` as well as applied during the build. That
-is not belt-and-braces: the export keeps no OCI metadata, so a variable that
-only lived in the builder would be absent from every step of every job that
-later runs on the image. The daemon renders each step as `sh -lc`, which reads
-`profile.d` — the same trick `deploy/image/Dockerfile` used to do by hand.
+The runner host needs `docker`, `mke2fs` and — when heyvmd does not run as
+root — `fakeroot`. Each is checked by the build and named if absent, and the
+failure lands on the job and on `/vms` like any other build failure.
 
-Concurrency is settled in `ci_vm_image`: an upsert hands exactly one job the
-build and tells the rest to wait, so ten jobs landing on a cold host produce one
-image and not ten. A claim whose lease has lapsed is taken over, so a dispatcher
-that died mid-build does not block the image for ever, and the daemon's refusal
-to overwrite an existing name collapses the remaining race — the loser is told
-the name is taken, which is the outcome it wanted.
+Concurrency is settled twice, at two scopes. `ci_vm_image`'s upsert hands
+exactly one *job* the build and tells the rest to wait, so ten jobs landing on
+a cold host produce one build request and not ten; a claim whose lease has
+lapsed is taken over, so a dispatcher that died mid-build does not block the
+image for ever. And the daemon's route is idempotent by name — a second request
+for an image already in the catalog answers `ready` without building — so even
+a lost claim collapses into one docker build rather than two racing for the
+same tag.
 
 Nothing sweeps images. A rootfs is expensive to rebuild and cheap to keep, and
 unlike a pooled VM it carries no state from the run that made it. To force a
 rebuild, delete it on the host (`rm ~/.heyo/images/firecracker/ci-img-*.ext4`);
 the next job finds the file gone, forgets the row and builds it again.
-
-#### Why it is not `docker build`
-
-`heyvm mvm build` is a local CLI over `docker build → docker export → mke2fs`.
-It has no remote form, the daemon exposes no image-build route, and
-`SandboxCreateOptions` has no mounts — so nothing produced inside a sandbox can
-be written to a host path. An orchestrator that reaches a runner only through
-the daemon's HTTP API cannot run that pipeline there, and the access that would
-let it (write permission on the directory every VM's root filesystem is read
-from) is the runner itself.
-
-`POST /sandboxes/{id}/snapshot-image` is what makes the remote build possible at
-all: it copies a live sandbox's rootfs into that same catalog. Replaying the
-Dockerfile in a booted VM and snapshotting it is the one shape that fits the
-primitives — and it produces a real `.ext4` that outlives the warm pool and
-survives a reboot, which folding the Dockerfile into `setup_hooks` would not.
-
-The copy is taken without pausing the VM, so the build runs `sync` as its last
-step before snapshotting, which is the quiesce the daemon's own documentation
-asks callers for.
 
 **A named VM is somebody else's machine**, and the executor treats it that way.
 It is resolved on the pinned node by id or name, started if it is merely stopped,

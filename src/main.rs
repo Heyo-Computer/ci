@@ -16,6 +16,7 @@ mod bus;
 mod config;
 mod dispatch;
 mod expr;
+mod image;
 mod nats_auth;
 mod objects;
 mod plan;
@@ -184,6 +185,7 @@ async fn main() {
         config: config.clone(),
         store: store.clone(),
         pool: Pool::new(store.pool().clone()),
+        images: image::Catalog::new(store.pool().clone()),
         bus: bus.clone(),
         runners: runners.clone(),
         vms: Arc::new(Vms::new()),

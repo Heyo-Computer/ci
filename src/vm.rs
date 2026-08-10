@@ -69,6 +69,13 @@ const POLL_SLACK: Duration = Duration::from_secs(30);
 /// comes from — it is measured against a real guest, not chosen.
 const UPLOAD_CHUNK: usize = 24 * 1024;
 
+/// How long the daemon may take to copy a rootfs into the image catalog.
+///
+/// This is a file copy of the whole image — gigabytes on a build image with a
+/// toolchain in it — on the runner's own disk, so it is bounded in minutes
+/// rather than the seconds a control call gets.
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
 /// One line of a VM's own log, as `GET /sandboxes/{id}/logs` returns it.
 ///
 /// Re-declared rather than imported: the daemon's `LogEntry` lives in
@@ -96,6 +103,39 @@ fn unknown_source() -> String {
     "?".to_string()
 }
 
+/// `vm.build` — the Dockerfile a job's image is made from.
+///
+/// Both paths are repository-relative and validated like `cache_key_files`: the
+/// build runs against a tree somebody submitted, so a path that escapes it is
+/// refused when the workflow is parsed rather than when a build reads a file.
+///
+/// The resulting image name is *derived*, never written by the author — it is
+/// the content hash of the Dockerfile and its context (see
+/// [`crate::image::Dockerfile::fingerprint`]). That is what makes "reused until
+/// cache busted" fall out: identical inputs name an image the host already has,
+/// and any change names one it does not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageBuild {
+    pub dockerfile: String,
+    /// Defaults to the Dockerfile's own directory, as `docker build` does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+}
+
+impl ImageBuild {
+    /// The context directory, defaulted the way `docker build -f` does.
+    pub fn context_dir(&self) -> &str {
+        match self.context.as_deref() {
+            Some(c) => c,
+            None => match self.dockerfile.rsplit_once('/') {
+                Some((dir, _)) => dir,
+                None => ".",
+            },
+        }
+    }
+}
+
 /// The `vm:` block of a workflow job.
 ///
 /// Mirrors the subset of `SandboxCreateOptions` that makes sense to declare in a
@@ -107,6 +147,14 @@ pub struct VmSpec {
     pub driver: SandboxDriver,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// Build the image from a Dockerfile in the submitted tree instead of
+    /// naming one the host already has.
+    ///
+    /// Mutually exclusive with `image`, and refused at parse time when both are
+    /// set: the name is derived from the Dockerfile, so an author-supplied one
+    /// could only disagree with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<ImageBuild>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_class: Option<SandboxSize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -148,6 +196,24 @@ impl VmSpec {
         if self.driver == SandboxDriver::Libvirt {
             return Err(VmSpecError::UnsupportedDriver);
         }
+        // The daemon's `snapshot-image` route is Firecracker and KVM only —
+        // libvirt publishes qcow2 through a stop-cycle that does not match
+        // snapshotting a running VM — so a build could not finish anywhere the
+        // driver check above does not already refuse. Stated separately anyway,
+        // because "both are set" is an authoring mistake with its own fix.
+        if let Some(build) = &self.build {
+            if self.image.is_some() {
+                return Err(VmSpecError::ImageAndBuild);
+            }
+            for path in [build.dockerfile.as_str(), build.context_dir()] {
+                if path.starts_with('/') || path.split('/').any(|s| s == "..") {
+                    return Err(VmSpecError::EscapingBuildPath(path.to_string()));
+                }
+            }
+            if build.dockerfile.trim().is_empty() {
+                return Err(VmSpecError::EmptyDockerfilePath);
+            }
+        }
         if let Some(d) = self.disk_size_gb
             && d == 0
         {
@@ -179,6 +245,9 @@ pub enum VmSpecError {
     ZeroTtl,
     InvalidEnvKey(String),
     EscapingCacheKeyFile(String),
+    ImageAndBuild,
+    EscapingBuildPath(String),
+    EmptyDockerfilePath,
 }
 
 impl fmt::Display for VmSpecError {
@@ -201,6 +270,21 @@ impl fmt::Display for VmSpecError {
                 "vm.cache_key_files entry {p:?} must be a relative path inside the \
                  repository, with no `..` segments"
             ),
+            Self::ImageAndBuild => write!(
+                f,
+                "vm.image and vm.build cannot both be set: a built image's name is \
+                 the hash of its Dockerfile and context, so naming one as well \
+                 could only disagree with it. Drop `image:` to build, or drop \
+                 `build:` to use an image the host already has."
+            ),
+            Self::EscapingBuildPath(p) => write!(
+                f,
+                "vm.build path {p:?} must be a relative path inside the repository, \
+                 with no `..` segments"
+            ),
+            Self::EmptyDockerfilePath => {
+                write!(f, "vm.build.dockerfile must name a file in the repository")
+            }
         }
     }
 }
@@ -719,6 +803,75 @@ impl Vm {
         Ok(out)
     }
 
+    /// Copy this VM's rootfs into the runner's image catalog under `name`.
+    ///
+    /// `POST /sandboxes/{id}/snapshot-image` — the daemon writes
+    /// `~/.heyo/images/firecracker/{name}.ext4`, which is the same directory a
+    /// bare `image:` resolves against. So this is the whole of "build an image
+    /// on a runner": boot a base VM, do the work in it, snapshot it, and every
+    /// later job on that host names the result.
+    ///
+    /// **Not in the SDK**, so it goes through the raw client like the exec
+    /// routes. And not a route `ci` could do without: `heyvm mvm build` is a
+    /// local CLI over `docker build → docker export → mke2fs`, there is no
+    /// remote build API, and the daemon exposes no way to run a command on the
+    /// *host* — an orchestrator that only reaches a runner through this API has
+    /// no other path from a Dockerfile to a rootfs on that machine.
+    ///
+    /// **The daemon refuses a name that already exists**, and that refusal is
+    /// load-bearing rather than an inconvenience: names are content hashes, so
+    /// "already there" means another job built the identical image first and
+    /// the right move is to use it. [`VmError::ImageExists`] is separated out
+    /// so the caller can tell that from a real failure.
+    ///
+    /// The copy is taken from the live rootfs without pausing the VM, so the
+    /// caller must quiesce writers first — see `image::build`, which runs
+    /// `sync` as its last step.
+    pub async fn snapshot_to_image(&self, name: &str) -> Result<u64, VmError> {
+        #[derive(Deserialize)]
+        struct SnapshotResult {
+            #[serde(default)]
+            size_bytes: u64,
+        }
+
+        let path = format!("/sandboxes/{}/snapshot-image", encode_segment(&self.id));
+        // Serialized against exec for the same reason `destroy` is: the daemon
+        // reads the rootfs file this sandbox is running on.
+        let _guard = self.lock.lock().await;
+        let result: Result<SnapshotResult, HeyoError> = self
+            .sandbox
+            .client()
+            .request(
+                Method::POST,
+                &path,
+                Some(&serde_json::json!({ "name": name })),
+                RequestOptions {
+                    // A multi-gigabyte file copy on the runner's disk, not a
+                    // control call — the default client timeout is far too
+                    // short for it.
+                    timeout: Some(SNAPSHOT_TIMEOUT),
+                    query: Vec::new(),
+                },
+            )
+            .await;
+
+        match result {
+            Ok(r) => Ok(r.size_bytes),
+            // The daemon reports this as a 400 with the name in the message.
+            // Matching on the text is unlovely, but it is the only signal it
+            // gives, and treating "somebody already built this" as a build
+            // failure would fail a job over a race it won.
+            Err(e) if e.to_string().contains("already exists") => {
+                Err(VmError::ImageExists(name.to_string()))
+            }
+            Err(e) => Err(VmError::Daemon {
+                sandbox: self.id.clone(),
+                what: "snapshotting the rootfs into an image",
+                source: e,
+            }),
+        }
+    }
+
     pub async fn renew_ttl(&self, ttl: Duration) -> Result<(), VmError> {
         self.sandbox
             .set_ttl(ttl.as_secs())
@@ -844,6 +997,9 @@ pub enum VmError {
         of: usize,
         detail: String,
     },
+    /// The runner already has an image under this name. Because names are
+    /// content hashes, this is a race won by somebody else rather than a fault.
+    ImageExists(String),
 }
 
 impl fmt::Display for VmError {
@@ -911,6 +1067,11 @@ impl fmt::Display for VmError {
                 "writing {path} into {sandbox} failed on chunk {} of {of}: {detail}",
                 chunk + 1
             ),
+            Self::ImageExists(name) => write!(
+                f,
+                "this runner already has an image named {name:?}; it does not need \
+                 building again"
+            ),
         }
     }
 }
@@ -925,6 +1086,7 @@ mod tests {
         VmSpec {
             driver: SandboxDriver::Firecracker,
             image: Some("ubuntu:24.04".into()),
+            build: None,
             size_class: Some(SandboxSize::Medium),
             disk_size_gb: Some(20),
             working_directory: Some("/workspace".into()),
@@ -1240,6 +1402,7 @@ mod tests {
         let spec = VmSpec {
             driver,
             image: Some(image),
+            build: None,
             size_class: Some(SandboxSize::Micro),
             disk_size_gb: None,
             working_directory: None,

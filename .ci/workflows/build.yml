@@ -21,11 +21,29 @@ jobs:
     uses: default
     vm:
       driver: firecracker
-      # Built from deploy/image/Dockerfile with `heyvm mvm build`. Not a public
-      # base image: the daemon resolves a bare name against
-      # ~/.heyo/images/firecracker/{name}.ext4, so this must be built on any
-      # host that runs this job. See deploy/image/README.md.
-      image: ci-rust
+      # !! NOT USABLE FOR THIS WORKFLOW YET — see "Sizing the rootfs" in
+      #    deploy/image/README.md. A VM created from a public base image gets a
+      #    ~176 MB rootfs with ~36 MB free, and the daemon has no route to
+      #    provision a larger one; `disk_size_gb` below is the *data* disk
+      #    (/dev/vdb), which `snapshot-image` does not capture. Installing a
+      #    Rust toolchain into 36 MB fails on ENOSPC. Switch back to
+      #    `image: ci-rust` until heyvmd can size a rootfs at create time.
+      #
+      # Built by `ci` itself, on whichever host the job lands on, the first time
+      # it lands there. The image is named for the hash of this Dockerfile and
+      # its context, so an unchanged one is reused and any edit builds a new
+      # image — there is nothing to remember to bump.
+      #
+      # This replaces `image: ci-rust`, which named a rootfs that had to be
+      # built by hand with `heyvm mvm build` on every runner. A host that had
+      # never had that run failed every job at VM creation, and because nothing
+      # recorded the attempt it looked exactly like a run that was never picked
+      # up. See deploy/image/README.md.
+      build:
+        dockerfile: deploy/image/Dockerfile
+        # Defaulted to the Dockerfile's own directory, as `docker build -f`
+        # does; spelled out because init.sh being in it is the point.
+        context: deploy/image
       size_class: medium
       # Mounted at /var/cache/ci by the image's init, which is where
       # CARGO_TARGET_DIR points — deliberately *not* /workspace, which `ci`

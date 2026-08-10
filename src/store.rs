@@ -760,7 +760,73 @@ impl Store {
         Ok(row.as_ref().map(JobRow::from_row))
     }
 
-    /// Move a job to `running` and record where it landed.
+    /// Mark a job as picked up by a runner, before it has a VM.
+    ///
+    /// **The gap this closes is the whole of VM acquisition.** `start_job` runs
+    /// only once a sandbox exists, and getting one means an iroh dial and a boot
+    /// that together can take minutes — during which the row still said `queued`
+    /// with no runner on it. Three things read that as "nobody took this job":
+    /// the run page, which showed a build that was busy booting as not started;
+    /// [`Self::jobs_waiting_longer_than`], which is a queue-for-an-offline-host
+    /// reaper and would fail the job with a message blaming a host that was in
+    /// fact online and working on it; and whoever was watching, for whom a
+    /// failing-and-retrying create was indistinguishable from silence.
+    ///
+    /// So the transition to `running` happens when a consumer commits to the
+    /// job, and `start_job` below is left to fill in *where* it ended up.
+    /// `sandbox_id` and `fingerprint` stay null until then, which is the honest
+    /// reading: running, no machine yet.
+    ///
+    /// Returns false when the job was already terminal — cancelled while it sat
+    /// on the queue, or finished by a delivery whose ack was lost.
+    pub async fn claim_job(
+        &self,
+        job_id: &str,
+        runner_hd_id: &str,
+        attempt: i32,
+    ) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE ci_job
+                SET status = 'running', runner_hd_id = $2, attempt = $3,
+                    started_at = COALESCE(started_at, now())
+              WHERE id = $1
+                AND status NOT IN ('success','failure','skipped','cancelled')",
+        )
+        .bind(job_id)
+        .bind(runner_hd_id)
+        .bind(attempt)
+        .execute(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Record why an attempt failed, without deciding the job's fate.
+    ///
+    /// A failed delivery is negative-acked and retried on the backoff ladder —
+    /// 60s, then 5 minutes, then 15 — and until this existed the reason was
+    /// written to the row only by the *last* attempt. So the first twenty
+    /// minutes of a job that could never work (a VM image that is not on the
+    /// host, a daemon refusing the driver) showed an empty error and a status of
+    /// `queued`, and the log on the orchestrator was the only place the cause
+    /// appeared at all.
+    ///
+    /// Guarded on non-terminal so a late-arriving attempt cannot scribble over
+    /// the outcome of one that finished.
+    pub async fn note_job_error(&self, job_id: &str, error: &str) -> Result<(), StoreError> {
+        sqlx::query(
+            "UPDATE ci_job SET error = $2
+              WHERE id = $1 AND status NOT IN ('success','failure','skipped','cancelled')",
+        )
+        .bind(job_id)
+        .bind(error)
+        .execute(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
+        Ok(())
+    }
+
+    /// Record which machine a running job landed on.
     ///
     /// Returns false when the job was already terminal, which is how a
     /// redelivery of work that finished just before the ack is dropped instead

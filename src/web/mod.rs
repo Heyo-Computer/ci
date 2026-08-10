@@ -1153,11 +1153,22 @@ async fn render_vms(
     who: Option<&Identity>,
     notice: pages::Notice,
 ) -> axum::response::Response {
-    match state.dispatcher.vm_inventory().await {
-        Ok(vms) => pages::vms_page(&state.config.name, who.map(|i| i.display()), &vms, &notice)
-            .into_response(),
-        Err(e) => page_error(state, who, &e.to_string()),
-    }
+    let vms = match state.dispatcher.vm_inventory().await {
+        Ok(vms) => vms,
+        Err(e) => return page_error(state, who, &e.to_string()),
+    };
+    // Read separately and never fatal: the images table is context for the
+    // pool, and a page that refuses to render the VMs because the image
+    // catalog was unreadable would hide the more important half.
+    let images = state.dispatcher.image_inventory().await.unwrap_or_default();
+    pages::vms_page(
+        &state.config.name,
+        who.map(|i| i.display()),
+        &vms,
+        &images,
+        &notice,
+    )
+    .into_response()
 }
 
 async fn destroy_vm(
@@ -1341,6 +1352,7 @@ mod tests {
             config: config.clone(),
             store: store.clone(),
             pool: crate::pool::Pool::new(store.pool().clone()),
+            images: crate::image::Catalog::new(store.pool().clone()),
             bus: Arc::new(
                 // A fixed prefix, not a fresh one per test: these tests never
                 // publish, so sharing one stream pair is harmless, and minting

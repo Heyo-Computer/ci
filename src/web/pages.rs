@@ -69,7 +69,7 @@ a { color: var(--accent); }
 tr.link:hover { background: var(--card); cursor: pointer; }
 td a.row { display: block; color: inherit; text-decoration: none; }
 .pill.success { color: var(--ok); } .pill.failure { color: var(--bad); }
-.pill.running { color: var(--accent); } .pill.queued, .pill.pending { color: var(--idle); }
+.pill.running, .pill.building { color: var(--accent); } .pill.queued, .pill.pending { color: var(--idle); }
 .pill.skipped, .pill.cancelled { color: var(--idle); }
 .meta { color: var(--muted); font-size: 0.85rem; }
 .meta code { color: var(--fg); }
@@ -314,13 +314,19 @@ pub fn vms_page(
     app_name: &str,
     who: Option<&str>,
     vms: &[crate::pool::PooledVmView],
+    images: &[crate::image::CatalogEntry],
     notice: &Notice,
 ) -> Markup {
     // A fingerprint appearing twice on one host means two VMs that could have
     // been one — the pool missing, not doing its job.
+    //
+    // One being *built* does not count towards that. A job builds precisely
+    // because no idle VM matched, and the row disappears the moment the daemon
+    // answers; flagging it would put a red "not reused" against every cold
+    // start, which is the pool working rather than failing.
     let mut seen: std::collections::BTreeMap<(&str, &str), usize> =
         std::collections::BTreeMap::new();
-    for v in vms {
+    for v in vms.iter().filter(|v| v.status != "building") {
         *seen
             .entry((v.runner_hd_id.as_str(), v.fingerprint.as_str()))
             .or_default() += 1;
@@ -358,7 +364,9 @@ pub fn vms_page(
 
             @if vms.is_empty() {
                 p .empty {
-                    "Nothing is pooled. A VM appears here once a job builds or claims one."
+                    "Nothing is pooled. A VM appears here as soon as a job starts building \
+                     one — if a run is going and this is empty, no job has reached a runner \
+                     yet, and the run's own page says why."
                 }
             } @else {
                 div .scroll {
@@ -371,7 +379,16 @@ pub fn vms_page(
                             @for v in vms {
                                 tr {
                                     td .mono {
-                                        (v.sandbox_id)
+                                        // A VM being created has no id yet — the
+                                        // daemon assigns one — so its row is
+                                        // keyed on a placeholder that would be
+                                        // meaningless here. Say what it is
+                                        // instead.
+                                        @if v.status == "building" {
+                                            span .meta { "creating…" }
+                                        } @else {
+                                            (v.sandbox_id)
+                                        }
                                         // What the VM was built for. Part of its
                                         // identity, and the first thing to look
                                         // at when a fingerprint is unfamiliar.
@@ -414,11 +431,79 @@ pub fn vms_page(
                                     td {
                                         // A claimed VM has a job on it; destroying
                                         // it would fail that build from underneath.
-                                        @if v.status != "claimed" {
+                                        // A building one has no sandbox to destroy
+                                        // yet — the id in its row is a placeholder,
+                                        // and the server refuses it for that reason.
+                                        @if !matches!(v.status.as_str(), "claimed" | "building") {
                                             form method="post"
                                                  action={ "/vms/" (v.sandbox_id) "/destroy" } {
                                                 button .quiet type="submit" { "Destroy" }
                                             }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        section {
+            h2 { "Images" }
+            p .sub {
+                "Rootfs images built from a workflow's "
+                code { "vm.build" }
+                " Dockerfile, one row per host that has one. The name is the hash of the \
+                 Dockerfile and its build context, so an unchanged one is reused and any \
+                 change builds a new image. Unlike a warm VM these survive a reboot, and \
+                 nothing sweeps them — remove one on the host to force a rebuild."
+            }
+            @if images.is_empty() {
+                p .empty {
+                    "No image has been built. A workflow with a "
+                    code { "vm.build" }
+                    " block builds one the first time it runs on a host."
+                }
+            } @else {
+                div .scroll {
+                    table {
+                        thead { tr {
+                            th { "Image" } th { "Host" } th { "Status" } th { "Workflow" }
+                            th { "Size" } th { "Built" }
+                        } }
+                        tbody {
+                            @for i in images {
+                                tr {
+                                    td .mono { (i.name) }
+                                    td .mono { (i.runner_hd_id) }
+                                    td {
+                                        (pill(&i.status))
+                                        // The reason belongs next to the status:
+                                        // a failed build is the one row on this
+                                        // page somebody has to act on.
+                                        @if let Some(err) = &i.error {
+                                            div .meta { (err) }
+                                        }
+                                    }
+                                    td .mono { (i.workflow_id) }
+                                    td .mono {
+                                        @if i.size_bytes > 0 {
+                                            (human_bytes(i.size_bytes))
+                                        } @else {
+                                            span .meta { "—" }
+                                        }
+                                    }
+                                    td .mono {
+                                        @match &i.ready_at {
+                                            Some(t) => (t.format("%Y-%m-%d %H:%M").to_string()),
+                                            None => (format!(
+                                                "building for {}",
+                                                (chrono::Utc::now() - i.created_at)
+                                                    .to_std()
+                                                    .map(human_duration)
+                                                    .unwrap_or_else(|_| "—".into())
+                                            )),
                                         }
                                     }
                                 }
@@ -723,7 +808,7 @@ mod tests {
             pooled("sb-2", "hd-1", "fp-aaaa", "idle", Some("failure")),
             pooled("sb-3", "hd-1", "fp-bbbb", "claimed", Some("running")),
         ];
-        let html = vms_page("ci", None, &vms, &Notice::default()).into_string();
+        let html = vms_page("ci", None, &vms, &[], &Notice::default()).into_string();
 
         assert!(
             html.contains("not reused"),
@@ -736,16 +821,103 @@ mod tests {
         assert!(!html.contains(r#"action="/vms/sb-3/destroy""#), "{html}");
     }
 
+    /// The gap this page had: a job spends minutes dialling a runner and booting
+    /// a VM before there is anything to pool, and for the whole of it the page
+    /// said "Nothing is pooled" — which reads as nothing happening, and is
+    /// exactly what a *failing* VM creation looks like too.
+    #[test]
+    fn a_vm_that_is_being_created_is_shown_while_it_is_being_created() {
+        let building = pooled(
+            &crate::pool::Pool::building_id("019fca648a6e-00000001.build"),
+            "hd-1",
+            "fp-cccc",
+            "building",
+            None,
+        );
+        let html = vms_page("ci", None, &[building], &[], &Notice::default()).into_string();
+
+        assert!(!html.contains("Nothing is pooled"), "{html}");
+        assert!(html.contains("creating…"), "{html}");
+        assert!(html.contains(r#"class="pill building""#), "{html}");
+        // The placeholder key is not a sandbox id and must never be shown as
+        // one, nor offered for destruction — there is nothing there to destroy.
+        assert!(!html.contains("building-019fca648a6e"), "{html}");
+        assert!(!html.contains("/destroy"), "{html}");
+    }
+
+    /// A cold start is the pool working, not failing: there was no idle VM to
+    /// match, which is why one is being built. Flagging it would put a red mark
+    /// on every first run of a workflow.
+    #[test]
+    fn building_alongside_a_warm_vm_is_not_a_failure_to_reuse() {
+        let vms = [
+            pooled("sb-1", "hd-1", "fp-aaaa", "claimed", Some("running")),
+            pooled(
+                &crate::pool::Pool::building_id("job-2"),
+                "hd-1",
+                "fp-aaaa",
+                "building",
+                None,
+            ),
+        ];
+        let html = vms_page("ci", None, &vms, &[], &Notice::default()).into_string();
+        assert!(!html.contains("not reused"), "{html}");
+    }
+
+    fn image(name: &str, status: &str, error: Option<&str>) -> crate::image::CatalogEntry {
+        crate::image::CatalogEntry {
+            name: name.into(),
+            runner_hd_id: "hd-1".into(),
+            status: status.into(),
+            workflow_id: "build".into(),
+            built_by_job: None,
+            size_bytes: if status == "ready" { 6_442_450_944 } else { 0 },
+            error: error.map(str::to_string),
+            created_at: chrono::Utc::now(),
+            ready_at: (status == "ready").then(chrono::Utc::now),
+        }
+    }
+
+    /// The image catalog is the answer to "why did this job not start" when the
+    /// Dockerfile is what is broken, so a failed build has to carry its reason.
+    #[test]
+    fn the_image_catalog_shows_what_is_built_building_and_broken() {
+        let images = [
+            image("ci-img-aaaaaaaaaaaa", "ready", None),
+            image("ci-img-bbbbbbbbbbbb", "building", None),
+            image("ci-img-cccccccccccc", "failed", Some("apt-get exited 100")),
+        ];
+        let html = vms_page("ci", None, &[], &images, &Notice::default()).into_string();
+
+        assert!(!html.contains("No image has been built"), "{html}");
+        assert!(html.contains("ci-img-aaaaaaaaaaaa"));
+        assert!(
+            html.contains("6.0 GiB"),
+            "a ready image reports its size: {html}"
+        );
+        assert!(html.contains("building for"), "{html}");
+        assert!(
+            html.contains("apt-get exited 100"),
+            "a failed build must say why: {html}"
+        );
+
+        // And with nothing built, the page says how one comes to exist rather
+        // than showing an empty table.
+        let html = vms_page("ci", None, &[], &[], &Notice::default()).into_string();
+        assert!(html.contains("No image has been built"), "{html}");
+        assert!(html.contains("vm.build"), "{html}");
+    }
+
     /// With nothing left over there is nothing to sweep, so the bulk action is
     /// absent rather than a button that reports doing nothing.
     #[test]
     fn a_healthy_pool_offers_no_cleanup() {
         let vms = [pooled("sb-1", "hd-1", "fp-aaaa", "idle", Some("success"))];
-        let html = vms_page("ci", None, &vms, &Notice::default()).into_string();
+        let html = vms_page("ci", None, &vms, &[], &Notice::default()).into_string();
         assert!(!html.contains("cleanup-failed"), "{html}");
         assert!(!html.contains("not reused"));
 
-        let html = vms_page("ci", None, &[], &Notice::default()).into_string();
+        let html = vms_page("ci", None, &[], &[], &Notice::default()).into_string();
         assert!(html.contains("Nothing is pooled"));
     }
 

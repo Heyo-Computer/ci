@@ -205,6 +205,96 @@ impl Pool {
         Ok(row.map(|r| r.get("sandbox_id")))
     }
 
+    /// The key a not-yet-created VM is recorded under.
+    ///
+    /// Derived from the job rather than minted, so a queue redelivery addresses
+    /// the row the previous attempt left instead of adding a second one. The
+    /// `building-` prefix cannot collide with a daemon-assigned id, which is
+    /// `sb-…` or `dep-…`.
+    pub fn building_id(job_id: &str) -> String {
+        format!("building-{job_id}")
+    }
+
+    /// Record that a VM is being created, before there is one.
+    ///
+    /// This is the row that makes /vms say something during the longest silent
+    /// stretch of a job: the iroh dial and the boot wait inside
+    /// `Sandbox::create`. Written before the attempt and removed by whoever made
+    /// it — replaced by [`Self::register`] when the daemon answers, deleted by
+    /// [`Self::forget`] when it does not.
+    ///
+    /// Leased like a claim, because it needs the same guarantee: if this process
+    /// dies mid-create nothing is renewing, and [`Self::sweep_stale_builds`]
+    /// clears the row. Without a lease a crash would leave a VM that is for ever
+    /// "building" on a page whose whole job is to say what is happening.
+    ///
+    /// Returns the placeholder key, so a caller cannot pass a different one to
+    /// the cleanup than it used here.
+    pub async fn begin_build(
+        &self,
+        job_id: &str,
+        runner: &str,
+        fingerprint: &str,
+        workflow_id: &str,
+        lease: Lease<'_>,
+    ) -> Result<String, PoolError> {
+        let id = Self::building_id(job_id);
+        sqlx::query(
+            "INSERT INTO ci_vm_pool
+                (sandbox_id, runner_hd_id, fingerprint, workflow_id, status, claimed_by_job,
+                 last_job, leased_by, leased_until)
+             VALUES ($1,$2,$3,$4,'building',$5,$5,$6, now() + make_interval(secs => $7))
+             ON CONFLICT (sandbox_id) DO UPDATE
+                SET status='building', runner_hd_id=$2, fingerprint=$3, workflow_id=$4,
+                    claimed_by_job=$5, last_job=$5, last_used_at=now(),
+                    leased_by=$6, leased_until=now() + make_interval(secs => $7)",
+        )
+        .bind(&id)
+        .bind(runner)
+        .bind(fingerprint)
+        .bind(workflow_id)
+        .bind(job_id)
+        .bind(lease.instance)
+        .bind(lease.ttl.as_secs() as f64)
+        .execute(&self.db)
+        .await
+        .map_err(PoolError::sql)?;
+        Ok(id)
+    }
+
+    /// Drop `building` rows whose holder stopped renewing.
+    ///
+    /// The counterpart to [`Self::release_orphans`], and a delete rather than a
+    /// release because there is nothing to release: the row stands for an
+    /// attempt, not for a machine. A sandbox the dead process did manage to
+    /// create before it died is left to its TTL, which is what happened before
+    /// this state existed too.
+    ///
+    /// Scoped to `runners` for the reason every sweep here is: instances own
+    /// disjoint hosts, and one must not clear another's in-flight work.
+    pub async fn sweep_stale_builds(
+        &self,
+        runners: &[String],
+        instance: &str,
+    ) -> Result<u64, PoolError> {
+        if runners.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            "DELETE FROM ci_vm_pool
+              WHERE status = 'building'
+                AND runner_hd_id = ANY($1)
+                AND leased_by IS DISTINCT FROM $2
+                AND (leased_until IS NULL OR leased_until < now())",
+        )
+        .bind(runners)
+        .bind(instance)
+        .execute(&self.db)
+        .await
+        .map_err(PoolError::sql)?;
+        Ok(result.rows_affected())
+    }
+
     /// Record a freshly created VM as claimed by the job that made it.
     ///
     /// Registered `claimed` rather than `idle`: the creating job is about to use
@@ -342,6 +432,10 @@ impl Pool {
     /// A *claimed* VM is refused. It has a job on it, and destroying it would
     /// fail that build from underneath — cleaning up is for what was left
     /// behind, not for what is running.
+    ///
+    /// A `building` one is refused for a harder reason: its `sandbox_id` is a
+    /// placeholder, so draining it would send the daemon a kill for a machine
+    /// that does not exist and strand the row in `draining` when that failed.
     pub async fn take_one_for_sweep(
         &self,
         sandbox_id: &str,
@@ -355,7 +449,7 @@ impl Pool {
                 SET status = 'draining'
               WHERE sandbox_id = $1
                 AND runner_hd_id = ANY($2)
-                AND status <> 'claimed'
+                AND status NOT IN ('claimed','building')
              RETURNING *",
         )
         .bind(sandbox_id)
@@ -463,11 +557,16 @@ impl Pool {
     /// One statement for every VM in flight here, on a timer. What it publishes
     /// is not "this job is fine" but "this process is alive and still holding
     /// these" — which is the only claim another instance can safely act on.
+    ///
+    /// `building` rows are renewed alongside `claimed` ones. A cold boot can
+    /// take minutes and the lease defaults to three, so without this a create
+    /// that is merely slow would have its own placeholder swept out from under
+    /// it and vanish from /vms halfway through.
     pub async fn renew_leases(&self, lease: Lease<'_>) -> Result<u64, PoolError> {
         let result = sqlx::query(
             "UPDATE ci_vm_pool
                 SET leased_until = now() + make_interval(secs => $2)
-              WHERE leased_by = $1 AND status = 'claimed'",
+              WHERE leased_by = $1 AND status IN ('claimed','building')",
         )
         .bind(lease.instance)
         .bind(lease.ttl.as_secs() as f64)
@@ -614,6 +713,7 @@ mod tests {
         VmSpec {
             driver: SandboxDriver::Firecracker,
             image: Some("ubuntu:24.04".into()),
+            build: None,
             size_class: Some(SandboxSize::Medium),
             disk_size_gb: Some(20),
             working_directory: Some("/workspace".into()),
@@ -1363,5 +1463,100 @@ mod tests {
             .unwrap();
         assert!(swept.iter().any(|v| v.sandbox_id == sb(&runner, "stale")));
         pool.forget(&sb(&runner, "stale")).await.unwrap();
+    }
+
+    /// A VM being created is visible, and is not a VM: nothing may claim it,
+    /// sweep it, or try to destroy it, because there is no sandbox behind the
+    /// key yet.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_building_vm_is_shown_but_is_never_handed_out_or_destroyed() {
+        let (pool, _s) = test_pool().await;
+        let runner = runner_id();
+        let ours = std::slice::from_ref(&runner);
+
+        let placeholder = pool
+            .begin_build("job-1", &runner, "fp-a", "wf", held())
+            .await
+            .unwrap();
+        assert_eq!(placeholder, Pool::building_id("job-1"));
+
+        // On the page, which is the whole point of the state.
+        let seen = pool.inventory(ours).await.unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].status, "building");
+        assert_eq!(seen[0].fingerprint, "fp-a");
+
+        // But not a machine anything may take.
+        assert_eq!(
+            pool.claim(&runner, "fp-a", "job-2", held()).await.unwrap(),
+            None,
+            "a VM that does not exist yet must never be claimed"
+        );
+        assert!(
+            pool.take_for_sweep(ours, &[], 0).await.unwrap().is_empty(),
+            "the idle sweep must not take a build in flight"
+        );
+        assert!(
+            pool.take_one_for_sweep(&placeholder, ours)
+                .await
+                .unwrap()
+                .is_none(),
+            "destroying a placeholder would post a kill for a sandbox that does not exist"
+        );
+
+        // And a lease still held is not abandoned.
+        assert_eq!(
+            pool.sweep_stale_builds(ours, "somebody-else")
+                .await
+                .unwrap(),
+            0
+        );
+
+        // The creator clears it either way — replaced by the real row on
+        // success, dropped on failure.
+        pool.forget(&placeholder).await.unwrap();
+        assert!(pool.inventory(ours).await.unwrap().is_empty());
+    }
+
+    /// A cold boot outlasts a lease period, so a build in flight has to be
+    /// renewed like a claim — and one whose process died has to be cleared, or
+    /// it says "creating…" for ever.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_DATABASE_URL"]
+    async fn a_build_is_renewed_while_it_runs_and_swept_once_its_holder_stops() {
+        let (pool, _s) = test_pool().await;
+        let runner = runner_id();
+        let ours = std::slice::from_ref(&runner);
+        let mine = instance_id();
+
+        // Written with a lease that has already run out, standing in for a
+        // process that stopped renewing.
+        pool.begin_build("job-dead", &runner, "fp-a", "wf", lapsed(&mine))
+            .await
+            .unwrap();
+        // Its own instance never reclaims from itself — that is what stops a
+        // slow renewal from pulling a live build out from under itself.
+        assert_eq!(pool.sweep_stale_builds(ours, &mine).await.unwrap(), 0);
+
+        // Renewing puts it back in the future, so a sibling leaves it alone.
+        assert_eq!(
+            pool.renew_leases(Lease {
+                instance: &mine,
+                ttl: LEASE
+            })
+            .await
+            .unwrap(),
+            1,
+            "a building row is renewed alongside claimed ones"
+        );
+        assert_eq!(pool.sweep_stale_builds(ours, "sibling").await.unwrap(), 0);
+
+        // Stop renewing, and it goes.
+        pool.begin_build("job-dead", &runner, "fp-a", "wf", lapsed(&mine))
+            .await
+            .unwrap();
+        assert_eq!(pool.sweep_stale_builds(ours, "sibling").await.unwrap(), 1);
+        assert!(pool.inventory(ours).await.unwrap().is_empty());
     }
 }

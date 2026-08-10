@@ -159,6 +159,10 @@ pub struct HeyvmConfig {
     pub default_node: Option<String>,
     /// Where the co-located daemon listens, for the `uses: default` probe.
     pub local_daemon_url: String,
+    /// `~/.heyo/daemon.json` — heyvmd's persisted identity, and the id it
+    /// registers with the cloud under. The authority for `uses: default`;
+    /// `None` when there is no home directory to resolve it from.
+    pub daemon_state_path: Option<PathBuf>,
     /// Optional iroh relay override for NAT traversal.
     pub relay: Option<String>,
     /// How often the runner set is re-read from the control plane.
@@ -362,6 +366,9 @@ impl Config {
             api_key,
             networks,
             default_node: opt("CI_DEFAULT_NODE"),
+            daemon_state_path: opt("CI_DAEMON_STATE_PATH")
+                .map(PathBuf::from)
+                .or_else(|| heyo_data_dir().map(|d| d.join("daemon.json"))),
             local_daemon_url: opt("CI_LOCAL_DAEMON_URL")
                 .unwrap_or_else(|| heyo_sdk::DEFAULT_LOCAL_BASE_URL.to_string())
                 .trim_end_matches('/')
@@ -548,6 +555,23 @@ impl Config {
             },
         )
     }
+}
+
+/// heyvm's data directory, resolved exactly as `mvm-ctrl` resolves it.
+///
+/// **`MVM_DATA_DIR` first, `~/.heyo` only as the fallback** — the same order as
+/// `utils::get_heyo_data_dir`. A deployment that sets it (this one uses
+/// `/var/lib/heyvm`) keeps `daemon.json` there, and assuming a home directory
+/// would read a path that does not exist and silently fall through to a worse
+/// source of the daemon's identity.
+fn heyo_data_dir() -> Option<PathBuf> {
+    if let Some(dir) = opt("MVM_DATA_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .map(|h| PathBuf::from(h).join(".heyo"))
 }
 
 fn opt(var: &str) -> Option<String> {

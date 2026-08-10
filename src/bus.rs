@@ -625,6 +625,50 @@ mod tests {
         cleanup(&bus).await;
     }
 
+    /// The recovery property: a runner that was offline when work was queued
+    /// must drain that work when it comes back. Messages outlive the absence of
+    /// a consumer — the durable is created with the default `DeliverAll`, so it
+    /// receives everything already on its filter subject rather than only what
+    /// arrives after it binds.
+    #[tokio::test]
+    #[ignore = "needs CI_TEST_NATS_URL"]
+    async fn work_queued_before_a_consumer_existed_is_delivered_when_it_binds() {
+        let prefix = test_prefix();
+        let bus = test_bus(&prefix).await;
+        let route = Route::Runner("hd-comesback".into());
+
+        // Published while the host is offline: nothing is bound to this subject.
+        bus.publish_job(
+            &route,
+            &JobMessage {
+                run_id: "run1".into(),
+                job_id: "run1.build".into(),
+                job_key: "build".into(),
+            },
+        )
+        .await
+        .expect("published");
+        assert_eq!(
+            bus.depth(&route).await.unwrap(),
+            None,
+            "no consumer yet, which is what the dashboard flags"
+        );
+
+        // The host comes back and `spawn_consumers` binds on the next tick.
+        let consumer = bus.consumer_for(&route).await.expect("consumer");
+        let depth = bus.depth(&route).await.unwrap().expect("now bound");
+        assert_eq!(depth.waiting, 1, "the queued job survived the outage");
+
+        use futures::StreamExt;
+        let mut batch = consumer.fetch().max_messages(1).messages().await.unwrap();
+        let msg = batch.next().await.expect("delivered").unwrap();
+        let job: JobMessage = serde_json::from_slice(&msg.payload).unwrap();
+        assert_eq!(job.job_id, "run1.build");
+        msg.ack().await.unwrap();
+
+        cleanup(&bus).await;
+    }
+
     /// The half of this that is easy to ship broken.
     ///
     /// JetStream returns an existing durable and ignores the config passed with

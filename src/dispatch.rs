@@ -59,6 +59,13 @@ const DEFAULT_WORKDIR: &str = "/workspace";
 /// the sandbox id by parsing it as hex.
 static NONCE: AtomicU64 = AtomicU64::new(1);
 
+/// What a submit produced: the runs it started, and anything the submitter
+/// should know that did not stop it starting them.
+pub struct Submitted {
+    pub run_ids: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
 /// Where one job runs, resolved from its `uses:` against the live pool.
 ///
 /// `node: None` is the only case that goes on a network's shared queue; every
@@ -111,7 +118,7 @@ impl Dispatcher {
         req: &crate::trigger::SubmitRequest,
         actor: Option<&crate::web::identity::Identity>,
         repo: Option<&crate::store::Repo>,
-    ) -> Result<Vec<String>, DispatchError> {
+    ) -> Result<Submitted, DispatchError> {
         let run_seed = crate::vm::new_id();
         let workspace = crate::trigger::Workspace::for_run(&self.config, &run_seed);
         tokio::fs::create_dir_all(&self.config.workspace_dir)
@@ -202,6 +209,10 @@ impl Dispatcher {
 
         let mut run_ids = Vec::new();
         let mut patterns_tried = Vec::new();
+        // Carried back to the client. A submit that queued but will not run
+        // until something changes should say so at the terminal that made it,
+        // not only on a page nobody has open.
+        let mut warnings: Vec<String> = Vec::new();
 
         for source in &sources {
             let files = crate::trigger::find_workflows(&workspace.root, &source.pattern)?;
@@ -232,7 +243,7 @@ impl Dispatcher {
                 // network it was scheduled for even if the repository is
                 // reassigned mid-build — the same reason the expanded plan is
                 // stored rather than recomputed.
-                self.assign_network(&mut plan, source.network.as_deref())?;
+                self.assign_network(&mut plan, source.network.as_deref(), &mut warnings)?;
 
                 // The first run reuses the workspace already materialized under
                 // the seed id; the rest get their own copy of the same archive,
@@ -284,7 +295,7 @@ impl Dispatcher {
             ))
             .into());
         }
-        Ok(run_ids)
+        Ok(Submitted { run_ids, warnings })
     }
 
     // ---- scheduling -----------------------------------------------------
@@ -461,6 +472,7 @@ impl Dispatcher {
         &self,
         plan: &mut crate::plan::Plan,
         default_network: Option<&str>,
+        warnings: &mut Vec<String>,
     ) -> Result<(), DispatchError> {
         let pool = self.runners.snapshot();
         for job in &mut plan.jobs {
@@ -478,6 +490,22 @@ impl Dispatcher {
             // at the client, rather than becoming a run whose jobs sit on a
             // queue nobody consumes.
             let placement = Self::place(&pool, job)?;
+            // Warned, never refused. A host that is briefly unreachable is a
+            // blip, and the job should sit on its subject until the host comes
+            // back and its consumer binds — refusing here would turn a recovery
+            // into a lost submit. The wait is bounded by CI_RUNNER_WAIT_SECS.
+            if let Some(node) = placement.node
+                && !node.status.is_dispatchable()
+            {
+                warnings.push(format!(
+                    "{} is pinned to {} ({}), which is not online. The job will wait on \
+                     that host's queue and run when it comes back, or fail after {}s.",
+                    job.key,
+                    node.name,
+                    node.status.as_str(),
+                    self.config.heyvm.runner_wait.as_secs()
+                ));
+            }
             // Canonical names, so the stored plan and the job row say what the
             // dashboard says rather than whichever of an id and a name somebody
             // typed.

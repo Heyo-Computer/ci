@@ -279,7 +279,7 @@ async fn submit(
     let who = Identity::from_headers(&headers);
 
     match state.dispatcher.submit(&req, who.as_ref(), repo).await {
-        Ok(run_ids) => {
+        Ok(submitted) => {
             tracing::info!(
                 "accepted a submit for {} ({}) via {}: {} run(s)",
                 repo.map(|r| r.name.as_str())
@@ -289,13 +289,17 @@ async fn submit(
                     Some(r) => format!("a token for {}", r.name),
                     None => "the shared secret".to_string(),
                 },
-                run_ids.len()
+                submitted.run_ids.len()
             );
             (
                 StatusCode::ACCEPTED,
                 axum::Json(serde_json::json!({
-                    "runs": run_ids,
+                    "runs": submitted.run_ids,
                     "url": format!("{}/", state.config.public_url),
+                    // Warnings, not errors: the runs exist. A job pinned to a
+                    // host that is briefly offline waits rather than failing,
+                    // and the client says so at the terminal that submitted it.
+                    "warnings": submitted.warnings,
                 })),
             )
                 .into_response()

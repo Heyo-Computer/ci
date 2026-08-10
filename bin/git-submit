@@ -296,6 +296,12 @@ fi
 
 printf 'submitted %s on %s (%s bytes)\n' "${sha:0:12}" "$branch" "$size"
 if command -v jq >/dev/null 2>&1 && jq -e . "$response" >/dev/null 2>&1; then
+  # Warnings, not errors: the runs exist. A job pinned to a host that is briefly
+  # offline waits for it rather than failing, and this is the only place the
+  # person who submitted will see that before wondering why nothing moved.
+  jq -r '.warnings // [] | .[]' "$response" | while read -r warning; do
+    [ -n "$warning" ] && printf 'warning: %s\n' "$warning" >&2
+  done
   url_base="$(jq -r '.url // ""' "$response")"
   jq -r '.runs[]' "$response" 2>/dev/null | while read -r run; do
     printf '  run %s  %sruns/%s\n' "$run" "$url_base" "$run"

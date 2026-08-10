@@ -198,6 +198,14 @@ queued for that host and fails after `CI_RUNNER_WAIT_SECS`, because the warm poo
 is host-local — moving the job discards the cache the pin asked for and turns a
 fast build into a slow one for reasons nothing reports. `fallback: any` opts in.
 
+**A submit against an offline host warns rather than refusing.** The job sits on
+that host's subject and runs when the host comes back — messages outlive the
+absence of a consumer, and a durable created later binds with `DeliverAll`, so it
+receives everything already queued rather than only what arrives after it. A
+network blip is survivable by construction; refusing at submit would turn a
+recovery into a lost submit. `git submit` prints the warning, and the run page
+shows the wait.
+
 That timeout matters more than it looks. Consumers are bound only for hosts that
 are **online**, while `route_for` pins a job to its node whatever its status — so
 a job pinned to a host that is not online goes to a subject nothing reads. The
@@ -405,6 +413,15 @@ properties follow:
   sandbox is far worse than a VM reclaimed a minute late.
 - **Reclaim runs on a timer, not only at startup**, so a dead sibling's VMs come
   back within a lease period instead of waiting for somebody to restart this one.
+
+`uses: default` resolves through **`~/.heyo/daemon.json`** — heyvmd mints
+`backend_id` there on first start and registers and heartbeats under it, so it is
+the identity the cloud knows the machine by, and it is the same file
+`heyvm network add-host` reads. The daemon's `/daemon/name` route is *not* the
+authority: it returns `backend_server_id`, a different field fed by the
+`BACKEND_SERVER_ID` environment variable, and trusting it pins jobs to an id the
+cloud may have no live registration for — a queue with no consumer beside a
+daemon that is perfectly healthy. `CI_DEFAULT_NODE` overrides everything.
 
 `CI_VM_LEASE_SECS` (default 180) is the window between an instance dying and its
 VMs becoming reclaimable; renewal runs at a third of it.

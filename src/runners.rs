@@ -56,6 +56,57 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+/// Pick the daemon a name or id refers to.
+///
+/// An exact id is unambiguous and wins outright. A **name is not**: `name`
+/// defaults to the hostname, so a machine that re-registered — a reinstall, a
+/// rebuilt container, a changed `BACKEND_SERVER_ID` — leaves two rows with the
+/// same name, one dead and one live.
+///
+/// Matching those with `.find()` takes whichever the cloud happened to list
+/// first, which can be the dead one: `ci` then pins jobs to a daemon that is not
+/// heartbeating while the real one sits idle, and the only symptom is a queue
+/// nothing consumes. So a live daemon is preferred, and a tie between live ones
+/// is refused rather than guessed — the same stance `CI_NETWORK` takes on an
+/// ambiguous network name, and for the same reason.
+fn pick_daemon<'a>(daemons: &'a [DaemonInfo], wanted: &str) -> Result<&'a DaemonInfo, PickError> {
+    if let Some(exact) = daemons.iter().find(|d| d.id == wanted) {
+        return Ok(exact);
+    }
+    let by_name: Vec<&DaemonInfo> = daemons
+        .iter()
+        .filter(|d| d.name.as_deref() == Some(wanted))
+        .collect();
+    match by_name.len() {
+        0 => Err(PickError::NoMatch),
+        1 => Ok(by_name[0]),
+        _ => {
+            let live: Vec<&DaemonInfo> = by_name
+                .iter()
+                .copied()
+                .filter(|d| d.status == DaemonStatus::Online)
+                .collect();
+            match live.len() {
+                1 => Ok(live[0]),
+                // Nothing live, or several: either way there is no answer that
+                // is not a guess, and guessing is what produced a silent stall.
+                _ => Err(PickError::Ambiguous(
+                    by_name
+                        .iter()
+                        .map(|d| format!("{} ({:?})", d.id, d.status))
+                        .collect(),
+                )),
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PickError {
+    NoMatch,
+    Ambiguous(Vec<String>),
+}
+
 /// How long to wait for an iroh tunnel to a runner before giving up.
 ///
 /// Generous — NAT traversal through a relay is not instant — but finite, which
@@ -447,11 +498,19 @@ impl Runners {
         // co-located with a daemon at all.
         if let Some(wanted) = self.config.heyvm.default_node.as_deref() {
             let wanted = wanted.trim();
-            if let Some(d) = daemons
-                .iter()
-                .find(|d| d.id == wanted || d.name.as_deref() == Some(wanted))
-            {
-                return d.id.clone();
+            match pick_daemon(daemons, wanted) {
+                Ok(d) => return d.id.clone(),
+                Err(PickError::Ambiguous(candidates)) => {
+                    tracing::warn!(
+                        "CI_DEFAULT_NODE={wanted:?} matches {} daemons ({}), and none is \
+                         the obvious live one. Set it to a daemon id — a name defaults \
+                         to the hostname, so a machine that re-registered has two.",
+                        candidates.len(),
+                        candidates.join(", ")
+                    );
+                    return String::new();
+                }
+                Err(PickError::NoMatch) => {}
             }
             tracing::warn!(
                 "CI_DEFAULT_NODE={wanted:?} matches no daemon on this account, so \
@@ -463,6 +522,22 @@ impl Runners {
                     .join(", ")
             );
             return String::new();
+        }
+
+        // `~/.heyo/daemon.json` is the authority, and it is the same file
+        // `heyvm network add-host` consults (`resolve_local_daemon_id`). heyvmd
+        // mints `backend_id` there on first start and *registers and heartbeats
+        // under it* — so it is the identity the cloud knows this machine by.
+        //
+        // The daemon's HTTP API is deliberately not asked first: `/daemon/name`
+        // returns `backend_server_id`, which comes from the `BACKEND_SERVER_ID`
+        // environment and is a different field entirely. Trusting it pins jobs
+        // to an id the cloud may have no live registration for — a queue with
+        // no consumer beside a daemon that is perfectly healthy.
+        if let Some(id) = self.local_daemon_id_from_disk()
+            && daemons.iter().any(|d| d.id == id)
+        {
+            return id;
         }
 
         let Some(probe) = self.probe_local_daemon().await else {
@@ -479,10 +554,21 @@ impl Runners {
         {
             return id.to_string();
         }
-        if let Some(name) = probe.name.as_deref().filter(|s| !s.trim().is_empty())
-            && let Some(d) = daemons.iter().find(|d| d.name.as_deref() == Some(name))
-        {
-            return d.id.clone();
+        if let Some(name) = probe.name.as_deref().filter(|s| !s.trim().is_empty()) {
+            match pick_daemon(daemons, name) {
+                Ok(d) => return d.id.clone(),
+                Err(PickError::Ambiguous(candidates)) => {
+                    tracing::warn!(
+                        "the local daemon calls itself {name:?}, which matches {} daemons \
+                         ({}) — a machine that re-registered keeps both rows. Set \
+                         CI_DEFAULT_NODE to the live daemon id.",
+                        candidates.len(),
+                        candidates.join(", ")
+                    );
+                    return String::new();
+                }
+                Err(PickError::NoMatch) => {}
+            }
         }
 
         tracing::warn!(
@@ -493,6 +579,23 @@ impl Runners {
             probe.name.as_deref().unwrap_or("(unset)")
         );
         String::new()
+    }
+
+    /// The daemon id this machine registered with, read from `~/.heyo/daemon.json`.
+    ///
+    /// Only meaningful for `uses: default`, which is by definition the local
+    /// host — there is no equivalent for a remote one, which is why the network
+    /// member list is the source everywhere else.
+    fn local_daemon_id_from_disk(&self) -> Option<String> {
+        let path = self.config.heyvm.daemon_state_path.clone()?;
+        let text = std::fs::read_to_string(&path).ok()?;
+        let state: serde_json::Value = serde_json::from_str(&text).ok()?;
+        state
+            .get("backend_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     }
 
     /// `GET /daemon/name` on the co-located daemon.
@@ -1203,6 +1306,91 @@ mod tests {
         let (runners, joined) = Runners::project(&m, &[]);
         assert!(runners.is_empty());
         assert!(joined.is_empty());
+    }
+
+    fn daemon(id: &str, name: &str, status: DaemonStatus) -> DaemonInfo {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "name": name,
+            "status": match status {
+                DaemonStatus::Online => "online",
+                DaemonStatus::Stale => "stale",
+                DaemonStatus::Offline => "offline",
+            },
+            "lastSeenAt": "2026-08-08T00:00:00Z",
+            "createdAt": "2026-07-01T00:00:00Z",
+        }))
+        .expect("daemon parses")
+    }
+
+    /// The failure this exists to stop: a machine that re-registered keeps two
+    /// daemon rows with the same hostname-derived name, and taking whichever
+    /// the cloud listed first can pin every job to the dead one — a queue
+    /// nothing consumes, with a locally healthy daemon sitting beside it.
+    #[test]
+    fn a_name_shared_by_a_dead_and_a_live_daemon_resolves_to_the_live_one() {
+        let daemons = [
+            daemon("hd-old", "us2.heyo.computer", DaemonStatus::Stale),
+            daemon(
+                "hd-YdBcLuMVw4mA-zv9",
+                "us2.heyo.computer",
+                DaemonStatus::Online,
+            ),
+        ];
+        assert_eq!(
+            pick_daemon(&daemons, "us2.heyo.computer").unwrap().id,
+            "hd-YdBcLuMVw4mA-zv9",
+            "the live daemon wins, whatever the order"
+        );
+
+        // And regardless of which the cloud lists first.
+        let reversed = [daemons[1].clone(), daemons[0].clone()];
+        assert_eq!(
+            pick_daemon(&reversed, "us2.heyo.computer").unwrap().id,
+            "hd-YdBcLuMVw4mA-zv9"
+        );
+    }
+
+    /// An exact id is unambiguous even when a name collides with it.
+    #[test]
+    fn an_exact_daemon_id_wins_outright() {
+        let daemons = [
+            daemon("hd-old", "us2.heyo.computer", DaemonStatus::Online),
+            daemon("hd-new", "us2.heyo.computer", DaemonStatus::Stale),
+        ];
+        assert_eq!(pick_daemon(&daemons, "hd-new").unwrap().id, "hd-new");
+    }
+
+    /// With no live candidate — or several — there is no answer that is not a
+    /// guess, and guessing is what produced the silent stall.
+    #[test]
+    fn an_unresolvable_name_is_refused_rather_than_guessed() {
+        let both_dead = [
+            daemon("hd-a", "box", DaemonStatus::Stale),
+            daemon("hd-b", "box", DaemonStatus::Offline),
+        ];
+        match pick_daemon(&both_dead, "box") {
+            Err(PickError::Ambiguous(c)) => {
+                assert_eq!(c.len(), 2);
+                assert!(c.iter().any(|s| s.contains("hd-a")), "{c:?}");
+            }
+            Ok(d) => panic!("guessed {}", d.id),
+            Err(e) => panic!("{e:?}"),
+        }
+
+        let both_live = [
+            daemon("hd-a", "box", DaemonStatus::Online),
+            daemon("hd-b", "box", DaemonStatus::Online),
+        ];
+        assert!(matches!(
+            pick_daemon(&both_live, "box"),
+            Err(PickError::Ambiguous(_))
+        ));
+
+        assert!(matches!(
+            pick_daemon(&both_live, "nope"),
+            Err(PickError::NoMatch)
+        ));
     }
 
     /// A network name has to be spellable in `uses: <network>/<runner>`, which

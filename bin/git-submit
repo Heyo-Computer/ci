@@ -37,7 +37,7 @@
 #   CI_WEBHOOK_SECRET / git config ci.secret     the shared HMAC secret
 set -euo pipefail
 
-GIT_SUBMIT_VERSION="0.3.0"
+GIT_SUBMIT_VERSION="0.4.0"
 
 # `git-submit` invoked as `git submit`, `git-ci` invoked as `git ci`. Only used
 # in messages, but a script that tells you to run a command that does not exist
@@ -49,13 +49,15 @@ die() { printf '%s: %s\n' "$cmd" "$*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
-Usage: $cmd [--dirty] [--ref <rev>] [--workflow <id>] [--dry-run]
+Usage: $cmd [--dirty] [--ref <rev>] [--workflow <id>] [--dry-run] [--submit-empty]
 
 Submits a tarball of the tree to the CI orchestrator and prints the runs it
 started.
 
 Options:
   --dirty          include uncommitted tracked changes
+  --submit-empty   submit even when the tree is identical to the default
+                   branch — a run that rebuilds what main already is
   --archive        send a tree-only tarball instead of a git bundle (no .git in
                    the guest, but a payload that does not carry history)
   --ref <rev>      submit some other commit (default HEAD)
@@ -77,10 +79,12 @@ rev="HEAD"
 dirty=0
 dry_run=0
 archive=0
+submit_empty=0
 workflow=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dirty)    dirty=1; shift ;;
+    --submit-empty) submit_empty=1; shift ;;
     --archive)  archive=1; shift ;;
     --dry-run)  dry_run=1; shift ;;
     --ref)      rev="${2:?--ref needs a revision}"; shift 2 ;;
@@ -167,6 +171,38 @@ if [ "$dirty" -eq 1 ]; then
   sha="$sha-dirty"
 else
   send_sha="$sha"
+fi
+
+# A submission whose tree is identical to the default branch builds something
+# CI has already built. That is almost always a forgotten commit or a missing
+# --dirty rather than a decision, so it is refused with the reason — before any
+# packing or upload — and `--submit-empty` is how the decision is spelled when
+# it is one. Compared as trees, not commits: an empty commit or a merge that
+# changes nothing is still an empty run. The comparison is against what will
+# actually travel (`send_sha`), so --dirty changes count.
+if [ "$submit_empty" -eq 0 ]; then
+  base_ref=""
+  for cand in ${default_branch:+"refs/remotes/origin/$default_branch" "refs/heads/$default_branch"} \
+              refs/remotes/origin/main refs/remotes/origin/master \
+              refs/heads/main refs/heads/master; do
+    if git rev-parse --verify --quiet "$cand^{commit}" >/dev/null 2>&1; then
+      base_ref="$cand"
+      break
+    fi
+  done
+  # No main to compare against is not an empty submission, it is an
+  # unanswerable question; such a repository submits as it always did.
+  if [ -n "$base_ref" ] && git diff --quiet "$base_ref" "$send_sha" 2>/dev/null; then
+    if git diff-index --quiet HEAD -- 2>/dev/null; then
+      die "nothing to run: the tree of $rev is identical to $base_ref and the
+    worktree is clean. Pass --submit-empty to start a run anyway."
+    else
+      die "nothing to run: the tree of $rev is identical to $base_ref. The
+    worktree has uncommitted changes, but they only travel with --dirty.
+    Use --dirty to include them, commit them, or pass --submit-empty to
+    run this tree as it is."
+    fi
+  fi
 fi
 
 if [ "$archive" -eq 1 ]; then

@@ -43,7 +43,10 @@ jobs:
         # crate registry under CARGO_HOME grows into the rootfs at runtime, so
         # auto-sizing (tree × 1.2 + 64MB) would leave it no headroom.
         size_mb: 6144
-      size_class: medium
+      # `large`, because the one step is a cold cargo build of ~300 crates and
+      # rustc parallelizes to the cores it is given. The class is part of the
+      # pool fingerprint, so changing it retires the warm medium VMs on its own.
+      size_class: large
       # Mounted at /var/cache/ci by the image's init, which is where
       # CARGO_TARGET_DIR points — deliberately *not* /workspace, which `ci`
       # wipes on every checkout. This disk is what makes reusing a warm VM

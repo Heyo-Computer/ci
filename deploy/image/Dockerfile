@@ -107,6 +107,11 @@ RUN chmod +x /init.sh
 #
 # Compiling something real, not just `--version`: a toolchain missing its linker
 # or OpenSSL headers passes every version check and fails on the first crate.
+#
+# CARGO_TARGET_DIR is pinned back to the local tree for the build: 10-rust.sh
+# points it at /var/cache/ci/target, so without the override the binary lands
+# there and `./target/release/smoke` is a 127 — and the throwaway build's
+# artifacts would be baked into the shipped rootfs.
 RUN set -eu; \
     . /etc/profile.d/10-rust.sh; \
     cargo --version; rustc --version; \
@@ -114,7 +119,7 @@ RUN set -eu; \
     git --version; pkg-config --modversion openssl; \
     tmp="$(mktemp -d)"; cd "$tmp"; \
     cargo init --quiet --name smoke; \
-    cargo build --quiet --release; \
+    CARGO_TARGET_DIR="$tmp/target" cargo build --quiet --release; \
     ./target/release/smoke; \
     cd /; rm -rf "$tmp"
 

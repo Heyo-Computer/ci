@@ -245,7 +245,7 @@ where
 
     let client = HeyoClient::new(options).map_err(|e| ImageError::Daemon {
         what: "building a client for the runner",
-        detail: e.to_string(),
+        source: e,
     })?;
 
     let body = serde_json::json!({
@@ -294,7 +294,7 @@ where
         .await
         .map_err(|e| ImageError::Daemon {
             what: "starting the image build",
-            detail: e.to_string(),
+            source: e,
         })?;
     if first.status == "ready" {
         // The daemon already had it — the whole point of content-hashed names.
@@ -323,7 +323,7 @@ where
             .await
             .map_err(|e| ImageError::Daemon {
                 what: "polling the image build",
-                detail: e.to_string(),
+                source: e,
             })?;
 
         match status.status.as_str() {
@@ -359,7 +359,7 @@ where
                     .await
                     .map_err(|e| ImageError::Daemon {
                         what: "re-requesting the image build",
-                        detail: e.to_string(),
+                        source: e,
                     })?;
                 if re.status == "ready" {
                     return Ok(Built {
@@ -600,10 +600,12 @@ pub enum ImageError {
         reason: String,
     },
     Pack(String),
-    /// The daemon could not be asked, or stopped answering.
+    /// The daemon could not be asked, or stopped answering. The source is kept
+    /// typed so a transport-level failure — the tunnel, not the build — can be
+    /// told from the daemon actually refusing.
     Daemon {
         what: &'static str,
-        detail: String,
+        source: heyo_sdk::HeyoError,
     },
     /// The daemon ran the build and it failed — a Dockerfile problem, named.
     Build {
@@ -629,6 +631,15 @@ impl ImageError {
     }
 }
 
+impl ImageError {
+    /// True when the failure was reaching the daemon at all — see
+    /// [`crate::vm::is_transport`]. A build the daemon refused or failed is
+    /// never this; those answers arrived.
+    pub fn is_transport(&self) -> bool {
+        matches!(self, Self::Daemon { source, .. } if crate::vm::is_transport(source))
+    }
+}
+
 impl fmt::Display for ImageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -640,7 +651,7 @@ impl fmt::Display for ImageError {
                 write!(f, "build context file {path:?} could not be read: {reason}")
             }
             Self::Pack(e) => write!(f, "could not pack the build context: {e}"),
-            Self::Daemon { what, detail } => write!(f, "{what}: {detail}"),
+            Self::Daemon { what, source } => write!(f, "{what}: {source}"),
             Self::Build { name, detail } => {
                 write!(f, "the runner could not build image {name}: {detail}")
             }

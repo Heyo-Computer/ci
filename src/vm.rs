@@ -891,6 +891,17 @@ fn encode_segment(s: &str) -> String {
     out
 }
 
+/// Whether an SDK error is the transport, not the request.
+///
+/// The SDK folds every failure to *send* a request into `Api { status: 0 }`
+/// ("network error calling …"); a real HTTP answer always carries its status.
+/// `Connection` is the same condition on the shell WebSocket. Either one over a
+/// cached iroh tunnel means the tunnel is dead — the daemon restarted, the
+/// relay dropped it — and retrying through it can only fail the same way.
+pub(crate) fn is_transport(e: &HeyoError) -> bool {
+    matches!(e, HeyoError::Api { status: 0, .. } | HeyoError::Connection(_))
+}
+
 #[derive(Debug)]
 pub enum VmError {
     Create {
@@ -930,6 +941,18 @@ pub enum VmError {
         of: usize,
         detail: String,
     },
+}
+
+impl VmError {
+    /// True when the failure was reaching the daemon at all, not anything the
+    /// daemon said. See [`is_transport`] — the caller's right move is to drop
+    /// the tunnel this rode in on so the retry redials.
+    pub fn is_transport(&self) -> bool {
+        match self {
+            Self::Create { source, .. } | Self::Daemon { source, .. } => is_transport(source),
+            _ => false,
+        }
+    }
 }
 
 impl fmt::Display for VmError {
@@ -1079,6 +1102,35 @@ mod tests {
         let mut s = spec();
         s.ttl_seconds = Some(0);
         assert_eq!(s.validate(), Err(VmSpecError::ZeroTtl));
+    }
+
+    /// The SDK marks a failure to *send* a request as `Api { status: 0 }`; a
+    /// real answer always carries its status. Only the former means the cached
+    /// tunnel is dead and worth evicting — treating a daemon's 500 as a tunnel
+    /// failure would redial on every genuine error.
+    #[test]
+    fn only_a_transport_failure_reads_as_one() {
+        let api = |status: u16| HeyoError::Api {
+            status,
+            message: "network error calling /sandbox-deploy".into(),
+            body: None,
+        };
+        let dead = VmError::Create {
+            name: "vm".into(),
+            source: api(0),
+        };
+        assert!(dead.is_transport());
+        let refused = VmError::Create {
+            name: "vm".into(),
+            source: api(500),
+        };
+        assert!(!refused.is_transport(), "a 500 arrived; the tunnel works");
+        let exec = VmError::ExecFailed {
+            sandbox: "vm".into(),
+            operation: "op".into(),
+            reason: "exit 1".into(),
+        };
+        assert!(!exec.is_transport(), "a failed step is not a dead link");
     }
 
     /// The fingerprint hashes the serialized spec, so map ordering has to be

@@ -661,11 +661,39 @@ impl Dispatcher {
             tracing::info!(job = %msg.job_key, "already {}; dropping redelivery", row.status);
             return Ok(JobStatus::Success);
         }
-        let mut plan: JobPlan = serde_json::from_value(row.plan.clone())
+        let plan: JobPlan = serde_json::from_value(row.plan.clone())
             .map_err(|e| DispatchError::BadPlan(e.to_string()))?;
 
         let (runner, existing_vm) = self.pick_runner(&plan).await?;
 
+        // The one place a job's failure and its runner are both in hand. A
+        // transport-level failure means the cached iroh tunnel is dead — the
+        // daemon restarted, the host rebooted — and every request over it fails
+        // identically, so without this the NAK'd retries only rediscover the
+        // same dead local port four times. Evicting makes the next attempt
+        // redial, which is the repair.
+        let result = self
+            .run_claimed(msg, attempt, plan, runner.clone(), existing_vm)
+            .await;
+        if let Err(e) = &result
+            && e.is_tunnel_failure()
+        {
+            self.runners.evict(&runner).await;
+        }
+        result
+    }
+
+    /// The claimed half of [`Self::run_job`]: everything after a runner is
+    /// chosen, split out so its errors can be inspected with the runner id
+    /// still in hand.
+    async fn run_claimed(
+        &self,
+        msg: &JobMessage,
+        attempt: i32,
+        mut plan: JobPlan,
+        runner: String,
+        existing_vm: Option<String>,
+    ) -> Result<JobStatus, DispatchError> {
         // Said before the VM exists, not after. Getting one means an iroh dial
         // and a boot, and until this the job stayed `queued` with no runner for
         // the whole of it — so a build that was three minutes into booting and
@@ -776,6 +804,16 @@ impl Dispatcher {
         // what somebody wants when a job dies before its first step.
         self.capture_vm_log(msg, &plan, &vm).await;
         self.release_vm(&plan, &vm).await;
+
+        // A tunnel that dies mid-job fails the job rather than propagating —
+        // the match below absorbs the error into a status — so the eviction in
+        // `run_job` never sees it. Done here so the *next* job redials instead
+        // of inheriting the dead port.
+        if let Some(e) = outcome.as_ref().err()
+            && e.is_tunnel_failure()
+        {
+            self.runners.evict(&runner).await;
+        }
 
         let status = match &outcome {
             Ok(outputs) => {
@@ -2438,6 +2476,20 @@ from_err!(crate::bus::BusError, Bus);
 from_err!(crate::runners::RunnerError, Runner);
 from_err!(VmError, Vm);
 from_err!(crate::image::ImageError, Image);
+
+impl DispatchError {
+    /// The iroh tunnel to the runner, not the work: a transport-level failure
+    /// to reach the daemon, never anything the daemon answered. The holder of
+    /// the runner id should evict its cached tunnel on this — a NAK'd retry
+    /// that redials can succeed, one that reuses the dead local port cannot.
+    pub fn is_tunnel_failure(&self) -> bool {
+        match self {
+            Self::Vm(e) => e.is_transport(),
+            Self::Image(e) => e.is_transport(),
+            _ => false,
+        }
+    }
+}
 
 impl std::fmt::Display for DispatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

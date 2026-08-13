@@ -777,7 +777,7 @@ impl Dispatcher {
             .await?
         {
             // Something else finished this job while we were booting a VM.
-            self.release_vm(&plan, &vm).await;
+            self.release_vm(&plan, &vm, false).await;
             return Ok(JobStatus::Success);
         }
         self.bus
@@ -803,7 +803,11 @@ impl Dispatcher {
         // the next line, and the console of the boot that just failed is exactly
         // what somebody wants when a job dies before its first step.
         self.capture_vm_log(msg, &plan, &vm).await;
-        self.release_vm(&plan, &vm).await;
+        let guest_corrupted = outcome
+            .as_ref()
+            .err()
+            .is_some_and(DispatchError::indicates_guest_corruption);
+        self.release_vm(&plan, &vm, guest_corrupted).await;
 
         // A tunnel that dies mid-job fails the job rather than propagating —
         // the match below absorbs the error into a status — so the eviction in
@@ -1233,17 +1237,37 @@ impl Dispatcher {
     /// Failures here are logged, never propagated: the job's result is already
     /// decided, and turning a green build red because a TTL renewal failed would
     /// be worse than a VM that expires on its own.
-    async fn release_vm(&self, plan: &JobPlan, vm: &Vm) {
+    /// `guest_corrupted` is the job's verdict on the VM itself, not on the
+    /// work: the guest filesystem returned an error no retry can survive, so
+    /// the VM is destroyed even though `reuse` asked for pooling. Repooling it
+    /// would hand the next attempt — which prefers an idle VM with the same
+    /// fingerprint on the same runner — the same broken ext4, and the job
+    /// would burn every delivery on one sick machine.
+    async fn release_vm(&self, plan: &JobPlan, vm: &Vm, guest_corrupted: bool) {
         // A VM named in `uses:` is not ours. It was not created for this job,
         // it is not in the pool, and somebody else's long-lived machine must not
         // be destroyed because a workflow happened to set `reuse: false` in a
         // `vm:` block that never applied to it. Its TTL is left alone for the
         // same reason — renewing it would be this app quietly extending the life
-        // of something it does not own.
+        // of something it does not own. That holds even for corruption: the
+        // owner gets a warning, not a destroyed machine.
         if plan.target.is_existing_vm() {
+            if guest_corrupted {
+                tracing::warn!(
+                    vm = vm.id(),
+                    "this job saw guest filesystem corruption, but the VM is a `uses:` \
+                     target this instance does not own — leaving it as it is"
+                );
+            }
             return;
         }
-        if !plan.vm.reuse {
+        if guest_corrupted {
+            tracing::warn!(
+                vm = vm.id(),
+                "guest filesystem corruption; destroying the VM instead of repooling it"
+            );
+        }
+        if !plan.vm.reuse || guest_corrupted {
             if let Err(e) = vm.destroy().await {
                 tracing::warn!(vm = vm.id(), "could not destroy: {e}");
             }
@@ -2489,6 +2513,34 @@ impl DispatchError {
             _ => false,
         }
     }
+
+    /// The guest's own filesystem died underneath the job: its command output
+    /// names an ext4 error no retry on the same VM can survive. The holder of
+    /// the VM should destroy it on this rather than repool it.
+    ///
+    /// Only the plumbing variants are scanned — checkout and the VM transport,
+    /// whose messages embed the output of commands *this app* ran (`mkdir`,
+    /// `tar`, the chunked upload). A step failure carries its exit code and
+    /// nothing else, so a build that merely *prints* one of these strings can
+    /// never match.
+    pub fn indicates_guest_corruption(&self) -> bool {
+        let text = match self {
+            Self::Checkout(_) | Self::Vm(_) => self.to_string(),
+            _ => return false,
+        };
+        [
+            // EBADMSG: ext4 metadata failed its checksum.
+            "Bad message",
+            // EUCLEAN: the filesystem is asking for fsck.
+            "Structure needs cleaning",
+            // EROFS: ext4 already hit an error and remounted itself read-only.
+            "Read-only file system",
+            // EIO: the virtio device refused the read or write outright.
+            "Input/output error",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker))
+    }
 }
 
 impl std::fmt::Display for DispatchError {
@@ -2821,6 +2873,54 @@ mod tests {
             !built.target.is_existing_vm(),
             "a job that built its own VM must still be released"
         );
+    }
+
+    /// A guest whose ext4 has died must not go back into the pool — the next
+    /// attempt prefers the same idle VM and would fail identically. The
+    /// classification is on the plumbing's own errors, never a step's, so a
+    /// build that merely prints one of the marker strings cannot get its
+    /// healthy warm VM destroyed.
+    #[test]
+    fn only_the_plumbing_can_declare_the_guest_filesystem_dead() {
+        // The observed failure, verbatim: chunked upload during checkout.
+        let corrupt = DispatchError::Vm(VmError::UploadFailed {
+            sandbox: "sb-2e3c4317".into(),
+            path: "/workspace/.ci-source.tar.gz".into(),
+            chunk: 26,
+            of: 529,
+            detail: "mkdir: cannot create directory '/workspace': Bad message".into(),
+        });
+        assert!(corrupt.indicates_guest_corruption());
+
+        // The same output wrapped the way `checkout` reports it.
+        let checkout = DispatchError::Checkout(
+            "tar: dist/index.html: Cannot open: Structure needs cleaning".into(),
+        );
+        assert!(checkout.indicates_guest_corruption());
+
+        // A checkout that failed for an ordinary reason keeps its VM.
+        let plain = DispatchError::Checkout("extracting the source exited 2".into());
+        assert!(!plain.indicates_guest_corruption());
+
+        // A step failure carries only the exit code — but even if output ever
+        // leaked into it, a step is the user's code and must not match.
+        let step = DispatchError::StepFailed(
+            "step \"Build\" exited 1: cp: cannot stat 'x': Input/output error".into(),
+        );
+        assert!(!step.indicates_guest_corruption());
+
+        // A dead tunnel is the runner being unreachable, not the guest dying;
+        // it has its own remedy (evict and redial) and must not destroy VMs.
+        let tunnel = DispatchError::Vm(VmError::Create {
+            name: "vm".into(),
+            source: heyo_sdk::HeyoError::Api {
+                status: 0,
+                message: "network error calling /sandbox-deploy".into(),
+                body: None,
+            },
+        });
+        assert!(!tunnel.indicates_guest_corruption());
+        assert!(tunnel.is_tunnel_failure(), "still classified as transport");
     }
 
     /// The node and the VM are one decision. Reading `target` twice is how the

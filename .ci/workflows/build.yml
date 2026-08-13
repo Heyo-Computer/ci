@@ -51,7 +51,7 @@ jobs:
       # CARGO_TARGET_DIR points — deliberately *not* /workspace, which `ci`
       # wipes on every checkout. This disk is what makes reusing a warm VM
       # worth anything.
-      disk_size_gb: 20
+      disk_size_gb: 40
       # No setup_hooks: the toolchain, git and the OpenSSL headers are in the
       # image. Hooks run on every cold VM, so baking them in is the difference
       # between a build that starts in seconds and one that apt-gets a
@@ -68,6 +68,19 @@ jobs:
     env:
       CARGO_TERM_COLOR: never
     steps:
+      # The image's init runs the same guard, but only at boot — a warm VM
+      # serves many runs between boots, and the disk fills *while* warm. This
+      # step is the per-run half: without it, a pooled VM that crosses the
+      # threshold mid-lifetime fails every build with SIGBUS (rustc writes its
+      # output through mmap, and a mapped page that can't be backed on a full
+      # filesystem kills the process) until the VM happens to be retired.
+      - name: Guard the cache disk
+        run: |
+          usage=$(df -P "$CARGO_TARGET_DIR" | awk 'NR==2 {gsub(/%/,""); print $5}')
+          if [ -n "$usage" ] && [ "$usage" -ge 85 ]; then
+            echo "cache disk at ${usage}%, wiping $CARGO_TARGET_DIR"
+            rm -rf "$CARGO_TARGET_DIR"
+          fi
       - name: Build
         # No `. "$HOME/.cargo/env"`: the image puts cargo on PATH through
         # /etc/profile.d, and the daemon runs every step as `sh -lc`, which is a

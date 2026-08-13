@@ -68,6 +68,17 @@ if [ -b /dev/vdb ]; then
     fi
     mkdir -p /var/cache/ci
     mount /dev/vdb /var/cache/ci 2>/dev/null
+    # Self-heal a nearly full cache disk. Cargo never garbage-collects a
+    # target/, so across enough reuse it grows to fill the disk — at which
+    # point rustc dies with SIGBUS, because its output files are written
+    # through mmap and a mapped page that can't be backed on a full
+    # filesystem kills the process. Wiping costs one cold build; a full disk
+    # costs every build until someone shells in.
+    usage=$(df -P /var/cache/ci 2>/dev/null | awk 'NR==2 {gsub(/%/,""); print $5}')
+    if [ -n "$usage" ] && [ "$usage" -ge 85 ]; then
+        echo "init: cache disk at ${usage}%, wiping /var/cache/ci/target"
+        rm -rf /var/cache/ci/target
+    fi
 fi
 # Both created either way. Without a data disk the cache lands on the rootfs,
 # which works but is sized for a toolchain rather than for a `target/`.

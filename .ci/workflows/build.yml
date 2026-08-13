@@ -74,8 +74,18 @@ jobs:
       # threshold mid-lifetime fails every build with SIGBUS (rustc writes its
       # output through mmap, and a mapped page that can't be backed on a full
       # filesystem kills the process) until the VM happens to be retired.
+      # It also refuses to build without the data disk. If /dev/vdb never
+      # attached, /var/cache/ci sits on the 6GB rootfs, the build fills it,
+      # and rustc dies with an unreadable SIGBUS mid-compile. Failing here
+      # instead names the actual problem in one line, twenty minutes earlier.
       - name: Guard the cache disk
         run: |
+          df -P "$CARGO_TARGET_DIR" /
+          if [ "$(stat -c %d "$CARGO_TARGET_DIR")" = "$(stat -c %d /)" ]; then
+            echo "FATAL: $CARGO_TARGET_DIR is on the rootfs — the data disk (/dev/vdb) is not attached." >&2
+            echo "The rootfs cannot hold a release target dir; check disk creation on the runner host." >&2
+            exit 1
+          fi
           usage=$(df -P "$CARGO_TARGET_DIR" | awk 'NR==2 {gsub(/%/,""); print $5}')
           if [ -n "$usage" ] && [ "$usage" -ge 85 ]; then
             echo "cache disk at ${usage}%, wiping $CARGO_TARGET_DIR"

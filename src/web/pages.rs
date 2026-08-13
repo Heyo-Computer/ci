@@ -1108,22 +1108,59 @@ fn short_ref(git_ref: &str) -> &str {
 // ---- runs list ----------------------------------------------------------
 
 /// `GET /` — recent runs.
-pub fn runs_page(app_name: &str, who: Option<&str>, runs: &[Run]) -> Markup {
+pub fn runs_page(
+    app_name: &str,
+    who: Option<&str>,
+    runs: &[Run],
+    repos: &[Repo],
+    repo_filter: Option<&str>,
+) -> Markup {
+    // The filter's label, resolved from the registrations rather than the runs:
+    // a filter that matches no runs still has a name to show.
+    let filter_name = repo_filter
+        .and_then(|id| repos.iter().find(|rp| rp.id == id))
+        .map(|rp| rp.name.as_str());
     let body = html! {
         section {
             h2 { "Runs" }
+            // Present only once something is registered — on a fresh install
+            // the empty-state text below already points at /repos, and a
+            // dropdown with no options is furniture.
+            @if !repos.is_empty() {
+                form .row method="get" action="/" {
+                    select name="repo" {
+                        option value="" selected[repo_filter.is_none()] { "All repositories" }
+                        @for rp in repos {
+                            option value=(rp.id) selected[repo_filter == Some(rp.id.as_str())] {
+                                (rp.name)
+                            }
+                        }
+                    }
+                    button type="submit" { "Filter" }
+                }
+            }
             @if runs.is_empty() {
-                p .empty {
-                    "Nothing has been submitted yet. Register a repository on "
-                    a href="/repos" { "Repositories" }
-                    " for a token, then from a clone with "
-                    code .mono { ".ci/workflows/*.yml" } " run " code .mono { "git submit" } "."
+                @if repo_filter.is_some() {
+                    p .empty {
+                        "No runs for "
+                        @if let Some(name) = filter_name { strong { (name) } }
+                        @else { "that repository" }
+                        " yet. "
+                        a href="/" { "Show all runs" } "."
+                    }
+                } @else {
+                    p .empty {
+                        "Nothing has been submitted yet. Register a repository on "
+                        a href="/repos" { "Repositories" }
+                        " for a token, then from a clone with "
+                        code .mono { ".ci/workflows/*.yml" } " run " code .mono { "git submit" } "."
+                    }
                 }
             } @else {
                 div .scroll {
                     table {
                         thead { tr {
-                            th { "Workflow" } th { "Ref" } th { "Commit" }
+                            th { "Workflow" } th { "Repository" } th { "Ref" } th { "Commit" }
                             th { "Status" } th { "Duration" } th { "Started" } th { "By" }
                         } }
                         tbody {
@@ -1134,6 +1171,17 @@ pub fn runs_page(app_name: &str, who: Option<&str>, runs: &[Run]) -> Markup {
                                             .as_deref()
                                             .filter(|n| !n.trim().is_empty())
                                             .unwrap_or_else(|| workflow_label(&r.workflow_id)))
+                                    } }
+                                    // A link that applies the filter, so the
+                                    // column is also the affordance — no one
+                                    // has to find the dropdown to use it. A
+                                    // run without a registration (a shared-
+                                    // secret submit) has nothing to filter by.
+                                    td { @match (&r.repo_id, &r.repo_name) {
+                                        (Some(id), Some(name)) => {
+                                            a href={ "/?repo=" (id) } { (name) }
+                                        }
+                                        _ => { "—" }
                                     } }
                                     td { (short_ref(&r.git_ref)) }
                                     td .mono { (short(&r.sha, 12)) }
@@ -1804,6 +1852,8 @@ mod page_tests {
             workflow_path: ".ci/workflows/build.yml".into(),
             workflow_name: Some("build".into()),
             repo_url: "git@example.com:me/app.git".into(),
+            repo_id: Some("019fca648a6e-00000001".into()),
+            repo_name: Some("app".into()),
             git_ref: "refs/heads/main".into(),
             sha: "9183de223817abcdef".into(),
             actor_email: Some("sam@sarocu.com".into()),
@@ -1855,25 +1905,82 @@ mod page_tests {
         }
     }
 
+    fn registered_repo() -> Repo {
+        Repo {
+            id: "019fca648a6e-00000001".into(),
+            url: "git@example.com:me/app.git".into(),
+            normalized: "example.com/me/app".into(),
+            name: "app".into(),
+            workflow_path: None,
+            network: None,
+            enabled: true,
+            created_email: Some("sam@sarocu.com".into()),
+            created_at: Utc::now(),
+        }
+    }
+
     #[test]
     fn the_runs_page_lists_runs_and_links_to_them() {
-        let html = runs_page("ci", Some("Sam"), &[run("success"), run("failure")]).into_string();
+        let html = runs_page(
+            "ci",
+            Some("Sam"),
+            &[run("success"), run("failure")],
+            &[registered_repo()],
+            None,
+        )
+        .into_string();
         assert!(html.contains("/runs/019fca648a6e-00000000"));
         assert!(html.contains(r#"class="pill success""#));
         assert!(html.contains(r#"class="pill failure""#));
         assert!(html.contains("9183de223817"), "the sha is abbreviated");
         assert!(!html.contains("9183de223817abcdef"), "not the whole sha");
         assert!(html.contains("main"), "refs/heads/ is stripped");
+        assert!(
+            html.contains("/?repo=019fca648a6e-00000001"),
+            "the repository cell links to the filtered page"
+        );
     }
 
     #[test]
     fn an_empty_dashboard_says_how_to_start() {
-        let html = runs_page("ci", None, &[]).into_string();
+        let html = runs_page("ci", None, &[], &[], None).into_string();
         assert!(html.contains("git submit"));
         assert!(
             html.contains("/repos"),
             "and where the credential comes from"
         );
+        assert!(
+            !html.contains("All repositories"),
+            "no filter dropdown before anything is registered"
+        );
+    }
+
+    #[test]
+    fn a_filtered_page_with_no_runs_names_the_repo_and_offers_the_way_back() {
+        let html = runs_page(
+            "ci",
+            None,
+            &[],
+            &[registered_repo()],
+            Some("019fca648a6e-00000001"),
+        )
+        .into_string();
+        assert!(html.contains("No runs for"), "{html}");
+        assert!(html.contains("app"), "the filter is named");
+        assert!(html.contains(r#"href="/""#), "and can be cleared");
+        assert!(
+            !html.contains("git submit"),
+            "a filtered miss is not a fresh install"
+        );
+    }
+
+    #[test]
+    fn a_run_without_a_registration_shows_no_repo_link() {
+        let mut r = run("success");
+        r.repo_id = None;
+        r.repo_name = None;
+        let html = runs_page("ci", None, &[r], &[registered_repo()], None).into_string();
+        assert!(!html.contains("/?repo="), "nothing to filter by");
     }
 
     #[test]
@@ -2100,7 +2207,7 @@ mod page_tests {
         let mut r = run("success");
         r.workflow_id = String::new();
         r.workflow_name = None;
-        let html = runs_page("ci", None, &[r]).into_string();
+        let html = runs_page("ci", None, &[r], &[], None).into_string();
         assert!(html.contains("(unnamed)"), "{html}");
     }
 

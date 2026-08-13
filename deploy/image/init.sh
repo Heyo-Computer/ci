@@ -79,10 +79,20 @@ if [ -b /dev/vdb ]; then
         echo "init: cache disk at ${usage}%, wiping /var/cache/ci/target"
         rm -rf /var/cache/ci/target
     fi
+else
+    # Loud on purpose: without the data disk the cache lands on the rootfs,
+    # which a cold ~300-crate release build fills — and a full filesystem
+    # under rustc's mmap'd output is a SIGBUS, not a readable ENOSPC. This
+    # line in the captured VM console is the difference between diagnosing
+    # that in one look and chasing a "memory error" that is really a disk.
+    echo "init: WARNING: no data disk /dev/vdb; the build cache will land on the rootfs"
 fi
 # Both created either way. Without a data disk the cache lands on the rootfs,
 # which works but is sized for a toolchain rather than for a `target/`.
 mkdir -p /var/cache/ci/target /workspace
+# One line of ground truth in every VM console: which device backs the cache,
+# and how full it starts.
+df -P /var/cache/ci 2>/dev/null | awk 'NR==2 {print "init: cache disk " $1 " " $5 " used (" $4 " KB free)"}'
 chmod 1777 /var/cache/ci /var/cache/ci/target
 
 # sshd for `heyvm exec` / `heyvm sh`. Logs to a file, never to the serial

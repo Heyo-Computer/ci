@@ -331,11 +331,30 @@ fn who_of(headers: &HeaderMap) -> Option<Identity> {
     Identity::from_headers(headers)
 }
 
-async fn runs_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+async fn runs_page(
+    State(state): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let who = who_of(&headers);
-    match state.store.recent_runs(RECENT_RUNS).await {
-        Ok(runs) => pages::runs_page(&state.config.name, who.as_ref().map(|i| i.display()), &runs)
-            .into_response(),
+    // `?repo=<id>` narrows to one registered repository. An id that matches
+    // nothing filters everything out rather than erroring — the page says "no
+    // runs" and offers the way back, which is the right answer for a stale
+    // bookmark of a deleted registration.
+    let repo = q.get("repo").map(String::as_str).filter(|r| !r.is_empty());
+    let repos = match state.store.repos().await {
+        Ok(repos) => repos,
+        Err(e) => return page_error(&state, who.as_ref(), &e.to_string()),
+    };
+    match state.store.recent_runs(RECENT_RUNS, repo).await {
+        Ok(runs) => pages::runs_page(
+            &state.config.name,
+            who.as_ref().map(|i| i.display()),
+            &runs,
+            &repos,
+            repo,
+        )
+        .into_response(),
         Err(e) => page_error(&state, who.as_ref(), &e.to_string()),
     }
 }
@@ -462,7 +481,7 @@ async fn job_page(
 async fn workflows_page(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let who = who_of(&headers);
     let name = who.as_ref().map(|i| i.display());
-    match state.store.recent_runs(500).await {
+    match state.store.recent_runs(500, None).await {
         Ok(runs) => {
             // Newest first already, so the first sighting of an id is its most
             // recent run.

@@ -144,6 +144,14 @@ pub struct Run {
     pub workflow_path: String,
     pub workflow_name: Option<String>,
     pub repo_url: String,
+    /// The registration this run was submitted under, when the credential (or
+    /// the payload's URL) resolved to one. `None` for pre-registration rows
+    /// and shared-secret submits of unregistered repositories.
+    pub repo_id: Option<String>,
+    /// `ci_repo.name`, joined in by every query that builds a `Run` — the
+    /// display half of `repo_id`, denormalized here so pages never do a
+    /// second lookup per row.
+    pub repo_name: Option<String>,
     pub git_ref: String,
     pub sha: String,
     pub actor_email: Option<String>,
@@ -162,6 +170,8 @@ impl Run {
             workflow_path: r.get("workflow_path"),
             workflow_name: r.get("workflow_name"),
             repo_url: r.get("repo_url"),
+            repo_id: r.get("repo_id"),
+            repo_name: r.get("repo_name"),
             git_ref: r.get("git_ref"),
             sha: r.get("sha"),
             actor_email: r.get("actor_email"),
@@ -578,20 +588,40 @@ impl Store {
     }
 
     pub async fn get_run(&self, run_id: &str) -> Result<Option<Run>, StoreError> {
-        let row = sqlx::query("SELECT * FROM ci_run WHERE id = $1")
-            .bind(run_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(StoreError::sql)?;
+        let row = sqlx::query(
+            "SELECT r.*, rp.name AS repo_name
+               FROM ci_run r
+               LEFT JOIN ci_repo rp ON rp.id = r.repo_id
+              WHERE r.id = $1",
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
         Ok(row.as_ref().map(Run::from_row))
     }
 
-    pub async fn recent_runs(&self, limit: i64) -> Result<Vec<Run>, StoreError> {
-        let rows = sqlx::query("SELECT * FROM ci_run ORDER BY created_at DESC LIMIT $1")
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(StoreError::sql)?;
+    /// Newest first. `repo_id` narrows to one registered repository; `None` is
+    /// everything, so the unfiltered page and the filtered one are the same
+    /// query rather than two that can drift.
+    pub async fn recent_runs(
+        &self,
+        limit: i64,
+        repo_id: Option<&str>,
+    ) -> Result<Vec<Run>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT r.*, rp.name AS repo_name
+               FROM ci_run r
+               LEFT JOIN ci_repo rp ON rp.id = r.repo_id
+              WHERE $2::text IS NULL OR r.repo_id = $2
+              ORDER BY r.created_at DESC
+              LIMIT $1",
+        )
+        .bind(limit)
+        .bind(repo_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
         Ok(rows.iter().map(Run::from_row).collect())
     }
 

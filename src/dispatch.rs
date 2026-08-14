@@ -2537,6 +2537,11 @@ impl DispatchError {
             "Read-only file system",
             // EIO: the virtio device refused the read or write outright.
             "Input/output error",
+            // An upload whose end-to-end hash check failed: every chunk exec
+            // exited 0 and the assembled file still holds different bytes.
+            // See `VmError::UploadCorrupted` — the guest acknowledged writes
+            // it did not keep, which no ext4 errno ever surfaces.
+            "sha256 mismatch",
         ]
         .iter()
         .any(|marker| text.contains(marker))
@@ -2901,6 +2906,18 @@ mod tests {
         // A checkout that failed for an ordinary reason keeps its VM.
         let plain = DispatchError::Checkout("extracting the source exited 2".into());
         assert!(!plain.indicates_guest_corruption());
+
+        // An upload whose end-to-end hash check failed: every chunk landed
+        // with exit 0 and the guest still holds different bytes. Silent
+        // corruption — no errno string anywhere — and the strongest possible
+        // reason not to hand this VM to the next attempt.
+        let silent = DispatchError::Vm(VmError::UploadCorrupted {
+            sandbox: "sb-2e3c4317".into(),
+            path: "/workspace/.ci-source.tar.gz".into(),
+            expected: "a".repeat(64),
+            actual: "b".repeat(64),
+        });
+        assert!(silent.indicates_guest_corruption());
 
         // A step failure carries only the exit code — but even if output ever
         // leaked into it, a step is the user's code and must not match.

@@ -49,9 +49,10 @@ successfully and then fails every boot.
 the same `mke2fs` call: this workflow sets `6144`, because the crate registry
 under `CARGO_HOME` grows into the rootfs at runtime and the auto-size
 (exported tree × 1.2 + 64 MB) would leave it no headroom. It is part of the
-image fingerprint — changing it builds a new image. Too small shows up as a
-build failing on no space rather than as anything about the image, so leave
-headroom.
+image fingerprint — changing it builds a new image. Too small does **not**
+show up as anything about the image or as a readable "no space" — a full
+filesystem under rustc's mmap'd output is a SIGBUS. Leave headroom.
+(Measured August 2026: the built image uses ~1GB, so 6144 leaves ~4.7GB.)
 
 ## What the pipeline discards, and what that forces
 

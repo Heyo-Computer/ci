@@ -41,7 +41,9 @@ jobs:
         context: deploy/image
         # The `--size-mb 6144` from the old hand-run build, carried over: the
         # crate registry under CARGO_HOME grows into the rootfs at runtime, so
-        # auto-sizing (tree × 1.2 + 64MB) would leave it no headroom.
+        # auto-sizing (tree × 1.2 + 64MB) would leave it no headroom. (Measured
+        # August 2026: the toolchain uses ~1GB, leaving 4.7GB free — the
+        # registry fits with room to spare.)
         size_mb: 6144
       # `large`, because the one step is a cold cargo build of ~300 crates and
       # rustc parallelizes to the cores it is given. The class is part of the
@@ -99,7 +101,29 @@ jobs:
         # `--locked` because the VM is fingerprinted on `Cargo.lock`: resolving
         # a different dependency set than the one the fingerprint was taken
         # from would make the warm VM's cache a claim that is not true.
-        run: cargo build --release --locked
+        # `cargo fetch` first, then a df of both filesystems: the registry
+        # lands in CARGO_HOME on the *rootfs*, which the guard step's check
+        # deliberately doesn't fail on — so if the rootfs is what filled, the
+        # line printed here is the one that says so, adjacent to the failure
+        # instead of twenty minutes of compile output above it.
+        #
+        # On failure, the guest kernel's ring buffer is the one witness to
+        # anything the kernel did to the build — an OOM kill, a block-layer
+        # I/O error, an ext4 complaint, or a machine-check event injected
+        # from the host (delivered to the mapping process as SIGBUS). rustc
+        # dying on a signal looks identical from the outside in all four
+        # cases; this tail is what tells them apart. Printing it here is
+        # safe — step output rides the exec channel, not the serial console
+        # that carries the marker protocol.
+        run: |
+          cargo fetch --locked
+          df -P / "$CARGO_TARGET_DIR"
+          if ! cargo build --release --locked; then
+            echo "=== build failed; guest kernel log tail ==="
+            dmesg | tail -100 || true
+            df -P / "$CARGO_TARGET_DIR"
+            exit 1
+          fi
         # A cold build of ~300 crates is well past the 30-minute default. A warm
         # VM reuses the cache on /var/cache/ci and takes a fraction of this.
         timeout-minutes: 60

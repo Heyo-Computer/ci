@@ -755,7 +755,67 @@ impl Vm {
                 });
             }
         }
-        Ok(())
+
+        // The loop above proves every exec exited 0, which is a claim about
+        // the shell, not about the bytes: a guest whose exec channel or
+        // filesystem is corrupting data acknowledges every write and hands
+        // back garbage — seen in the wild as a source tarball that uploads
+        // cleanly and then fails `tar` with "not in gzip format". Hashing
+        // both ends turns that silent corruption into a named error at the
+        // layer that caused it, before anything downstream consumes the file.
+        use sha2::{Digest, Sha256};
+        let expected = format!("{:x}", Sha256::digest(bytes));
+        let out = self
+            .exec(
+                &format!("{operation_prefix}.uv"),
+                &format!("sha256sum {quoted}"),
+                &HashMap::new(),
+                Duration::from_secs(120),
+            )
+            .await?;
+        let combined = out.combined();
+        if !out.succeeded() {
+            // 127 is an image without coreutils — a gap in the image, not in
+            // the upload, so the upload stands unverified. Any other failure
+            // is the guest unable to read back a file it just acknowledged,
+            // which is exactly what this check exists to catch.
+            if out.exit_code == 127 {
+                tracing::warn!(
+                    sandbox = %self.id,
+                    path,
+                    "upload not verified: the guest has no sha256sum"
+                );
+                return Ok(());
+            }
+            return Err(VmError::UploadCorrupted {
+                sandbox: self.id.clone(),
+                path: path.to_string(),
+                expected,
+                actual: format!("no hash; sha256sum failed with: {}", combined.trim()),
+            });
+        }
+        let reported = combined
+            .split_whitespace()
+            .find(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()));
+        match reported {
+            Some(hash) if hash == expected => Ok(()),
+            Some(hash) => Err(VmError::UploadCorrupted {
+                sandbox: self.id.clone(),
+                path: path.to_string(),
+                expected,
+                actual: hash.to_string(),
+            }),
+            // Exit 0 with no hash in the output is a backend quirk, not
+            // evidence about the bytes; log it rather than fail on it.
+            None => {
+                tracing::warn!(
+                    sandbox = %self.id,
+                    path,
+                    "upload not verified: sha256sum exited 0 without printing a hash"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Push the TTL out so a pooled VM does not expire while it is still wanted.
@@ -941,6 +1001,19 @@ pub enum VmError {
         of: usize,
         detail: String,
     },
+    /// Every chunk exec exited 0 and the assembled file still hashes to
+    /// something other than what was sent. There is no innocent reading of
+    /// that: either the exec channel garbled the payload in flight or the
+    /// guest's filesystem is returning different bytes than it acknowledged —
+    /// and in both cases nothing else this VM reports can be trusted either,
+    /// which is why [`crate::dispatch::DispatchError::indicates_guest_corruption`]
+    /// treats it as grounds to destroy the VM rather than repool it.
+    UploadCorrupted {
+        sandbox: String,
+        path: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 impl VmError {
@@ -1019,6 +1092,18 @@ impl fmt::Display for VmError {
                 f,
                 "writing {path} into {sandbox} failed on chunk {} of {of}: {detail}",
                 chunk + 1
+            ),
+            Self::UploadCorrupted {
+                sandbox,
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "writing {path} into {sandbox} completed, but the guest does not \
+                 hold the bytes that were sent (sha256 mismatch: sent {expected}, \
+                 guest reports {actual}) — the exec channel or the guest \
+                 filesystem corrupted the data"
             ),
         }
     }

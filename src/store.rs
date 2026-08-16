@@ -176,7 +176,10 @@ impl Run {
             workflow_name: r.get("workflow_name"),
             repo_url: r.get("repo_url"),
             repo_id: r.get("repo_id"),
-            repo_name: r.get("repo_name"),
+            // Not a column on `ci_run` — an alias every `Run` query joins in.
+            // A query that forgets the join loses the display name, which the
+            // page already renders as `None`; it does not take the page down.
+            repo_name: r.try_get("repo_name").ok().flatten(),
             git_ref: r.get("git_ref"),
             sha: r.get("sha"),
             before_sha: r.get("before_sha"),
@@ -1496,12 +1499,18 @@ impl Store {
 
     /// The most recent run of a registered repository, for the dashboard.
     pub async fn last_run_of_repo(&self, repo_id: &str) -> Result<Option<Run>, StoreError> {
-        let row =
-            sqlx::query("SELECT * FROM ci_run WHERE repo_id = $1 ORDER BY created_at DESC LIMIT 1")
-                .bind(repo_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(StoreError::sql)?;
+        let row = sqlx::query(
+            "SELECT r.*, rp.name AS repo_name
+               FROM ci_run r
+               LEFT JOIN ci_repo rp ON rp.id = r.repo_id
+              WHERE r.repo_id = $1
+              ORDER BY r.created_at DESC
+              LIMIT 1",
+        )
+        .bind(repo_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(StoreError::sql)?;
         Ok(row.as_ref().map(Run::from_row))
     }
 

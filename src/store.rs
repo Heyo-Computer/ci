@@ -154,6 +154,11 @@ pub struct Run {
     pub repo_name: Option<String>,
     pub git_ref: String,
     pub sha: String,
+    pub before_sha: String,
+    /// What this run's commit changed, as the submit worked it out. Read by the
+    /// scheduler for the `ci` expression scope, so a job's `if:` can gate on a
+    /// subtree of a monorepo.
+    pub changes: crate::paths::Changes,
     pub actor_email: Option<String>,
     pub status: String,
     pub error: Option<String>,
@@ -174,6 +179,15 @@ impl Run {
             repo_name: r.get("repo_name"),
             git_ref: r.get("git_ref"),
             sha: r.get("sha"),
+            before_sha: r.get("before_sha"),
+            // A row whose JSON does not deserialize falls back to "no answer",
+            // which builds everything. The alternative — failing the query —
+            // would take the dashboard down over a column nothing renders.
+            changes: r
+                .try_get::<serde_json::Value, _>("changes")
+                .ok()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
             actor_email: r.get("actor_email"),
             status: r.get("status"),
             error: r.get("error"),
@@ -364,6 +378,10 @@ pub struct RunRequest {
     pub git_ref: String,
     pub sha: String,
     pub before_sha: String,
+    /// What the submit changed, relative to `before_sha`. Defaults to "no
+    /// answer", which is what a caller that cannot work it out should leave it
+    /// as — that reads as "build everything" downstream.
+    pub changes: crate::paths::Changes,
     pub actor_subject: Option<String>,
     pub actor_email: Option<String>,
     pub source: String,
@@ -539,8 +557,8 @@ impl Store {
         sqlx::query(
             "INSERT INTO ci_run (id, workflow_id, workflow_path, workflow_name, repo_url,
                                  git_ref, sha, before_sha, actor_subject, actor_email,
-                                 source, status, repo_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued',$12)",
+                                 source, status, repo_id, changes)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,'queued',$12,$13)",
         )
         .bind(run_id)
         .bind(&req.workflow_id)
@@ -558,6 +576,12 @@ impl Store {
             &req.source
         })
         .bind(&req.repo_id)
+        // Serializing a `Changes` cannot fail — it is an enum of owned strings —
+        // but the column is NOT NULL, so the fallback is the "no answer" shape
+        // rather than a null that would break every read.
+        .bind(serde_json::to_value(&req.changes).unwrap_or_else(|_| {
+            serde_json::to_value(crate::paths::Changes::default()).unwrap_or_default()
+        }))
         .execute(&mut *tx)
         .await
         .map_err(StoreError::sql)?;

@@ -40,6 +40,7 @@
 //! parsed — a JSON parse on unauthenticated input is a decision, not a default.
 
 use crate::config::Config;
+use crate::paths::Changes;
 use base64::Engine;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -421,6 +422,89 @@ fn check_contained(path: &Path) -> Result<(), TriggerError> {
         }
     }
     Ok(())
+}
+
+/// What a submit changed, read out of the submitted bundle's own history.
+///
+/// **The `after` side is the clone's `HEAD`, not the payload's `after` field.**
+/// With `git submit --dirty` the client reports `<sha>-dirty`, which is a label
+/// for a person and not a resolvable object: the tree that actually travelled is
+/// a throwaway commit the client made from the index plus the worktree, and the
+/// bundle's `HEAD` is the only thing that points at it. Diffing what arrived
+/// against what the client says it came from is also the only version of this
+/// that stays true for `--ref`, where `HEAD` is not the submitter's `HEAD`.
+///
+/// Every failure here is [`Changes::Unknown`], never an empty diff — see the
+/// [`crate::paths`] module doc for why that direction is the whole point.
+pub fn changed_paths(workspace: &Workspace, before: &str) -> Changes {
+    let Some((format, _)) = workspace.stored_source() else {
+        return Changes::unknown("this run's submitted source is no longer on disk");
+    };
+    if format != SourceFormat::GitBundle {
+        return Changes::unknown(
+            "the submit is a `--archive` tarball, which carries no history to diff against. \
+             Submit a git bundle (the default) for path filters to have an answer",
+        );
+    }
+    let before = before.trim();
+    if before.is_empty() {
+        return Changes::unknown(
+            "the submitted commit has no parent, so there is nothing to diff against",
+        );
+    }
+
+    let root = workspace.root.display().to_string();
+    let git = |args: &[&str]| -> Result<std::process::Output, String> {
+        std::process::Command::new("git")
+            .args(["-C", &root])
+            .args(args)
+            .output()
+            .map_err(|e| e.to_string())
+    };
+
+    // Checked separately from the diff so the reason names the missing commit
+    // rather than reporting git's own message about an ambiguous argument. A
+    // bundle reaches a root commit, so an absent parent means the client sent a
+    // `before` from a history this bundle is not part of.
+    match git(&[
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        &format!("{before}^{{commit}}"),
+    ]) {
+        Err(e) => return Changes::unknown(format!("could not run git to read the diff: {e}")),
+        Ok(out) if !out.status.success() => {
+            return Changes::unknown(format!(
+                "commit {before} is not in the submitted bundle, so there is nothing to \
+                 diff against"
+            ));
+        }
+        Ok(_) => {}
+    }
+
+    // `--no-renames` on purpose: with rename detection a file moved out of one
+    // package and into another reports only its new path, so the package that
+    // lost it would not rebuild. Both sides of a move are a change to both.
+    // `-z` because git quotes unusual bytes in a path otherwise, and a quoted
+    // path would not match the glob the workflow author wrote.
+    let out = match git(&["diff", "--name-only", "--no-renames", "-z", before, "HEAD"]) {
+        Ok(o) => o,
+        Err(e) => return Changes::unknown(format!("could not run git to read the diff: {e}")),
+    };
+    if !out.status.success() {
+        return Changes::unknown(format!(
+            "git could not diff {before}..HEAD: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    Changes::known(
+        String::from_utf8_lossy(&out.stdout)
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// Find workflow files in an extracted tree.
@@ -993,6 +1077,172 @@ mod tests {
             !ws.root.join("old.txt").exists(),
             "a file removed on the branch must be gone from the workspace"
         );
+        std::fs::remove_dir_all(ws.root.parent().unwrap()).ok();
+    }
+
+    // ---- what a submit changed -------------------------------------------
+
+    /// A bundle of two commits, returning `(bytes, parent_sha, tempdir)`.
+    ///
+    /// Two is the minimum that has a diff at all, and the parent is what the
+    /// client sends as `before` — so this is the ordinary push, which is the
+    /// only shape that produces a real answer.
+    fn bundle_with_parent(
+        first: &[(&str, &str)],
+        second: &[(&str, &str)],
+        removed: &[&str],
+    ) -> (Vec<u8>, String, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!("ci-diff-{}", crate::vm::new_id()));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .expect("git runs");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let write = |entries: &[(&str, &str)]| {
+            for (name, body) in entries {
+                let path = repo.join(name);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, body).unwrap();
+            }
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        write(first);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "first"]);
+        let parent = git(&["rev-parse", "HEAD"]);
+
+        write(second);
+        for r in removed {
+            std::fs::remove_file(repo.join(r)).unwrap();
+        }
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "second"]);
+
+        let bundle = base.join("out.bundle");
+        git(&["bundle", "create", &bundle.display().to_string(), "--all"]);
+        (std::fs::read(&bundle).unwrap(), parent, base)
+    }
+
+    /// The ordinary push: the diff is read out of the bundle's own history, and
+    /// it is what the path filters are matched against.
+    #[test]
+    fn a_bundle_yields_the_paths_its_commit_changed() {
+        let (bytes, parent, base) = bundle_with_parent(
+            &[
+                ("packages/api/main.rs", "1"),
+                ("packages/web/index.html", "1"),
+                ("gone.txt", "1"),
+            ],
+            &[("packages/api/main.rs", "2"), ("packages/api/new.rs", "1")],
+            &["gone.txt"],
+        );
+        let ws = workspace();
+        if materialize(&bundle_source(&bytes), &ws, 1 << 22).is_err() {
+            return; // no git here; nothing to assert
+        }
+
+        let changes = changed_paths(&ws, &parent);
+        assert!(changes.is_known(), "{changes}");
+        let mut got = changes.paths().to_vec();
+        got.sort();
+        assert_eq!(
+            got,
+            ["gone.txt", "packages/api/main.rs", "packages/api/new.rs"],
+            "a deleted file is a change to the package that held it"
+        );
+        // Which is the whole point: the untouched package does not build.
+        assert!(changes.matches_any(&["packages/api/**".to_string()]));
+        assert!(!changes.matches_any(&["packages/web/**".to_string()]));
+
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(ws.root.parent().unwrap()).ok();
+    }
+
+    /// A file moved between packages must rebuild both, which is why rename
+    /// detection is off: with it, git reports only the destination path and the
+    /// package that lost the file would sit out the build that broke it.
+    #[test]
+    fn a_move_between_packages_counts_as_a_change_to_both() {
+        let body = "fn main() {}\n".repeat(40);
+        let (bytes, parent, base) = bundle_with_parent(
+            &[("packages/api/moved.rs", &body)],
+            &[("packages/web/moved.rs", &body)],
+            &["packages/api/moved.rs"],
+        );
+        let ws = workspace();
+        if materialize(&bundle_source(&bytes), &ws, 1 << 22).is_err() {
+            return;
+        }
+
+        let changes = changed_paths(&ws, &parent);
+        assert!(changes.is_known(), "{changes}");
+        assert!(
+            changes.matches_any(&["packages/api/**".to_string()]),
+            "the package the file left must rebuild: {:?}",
+            changes.paths()
+        );
+        assert!(changes.matches_any(&["packages/web/**".to_string()]));
+
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(ws.root.parent().unwrap()).ok();
+    }
+
+    /// Every way of having no answer, and the one thing they must all agree on:
+    /// the result is `Unknown`, which builds — never an empty diff, which
+    /// would skip.
+    #[test]
+    fn every_undiffable_submit_is_unknown_rather_than_empty() {
+        // A tarball has no history at all.
+        let ws = workspace();
+        materialize(&source(&tarball(&[("a.txt", b"1")])), &ws, 1 << 20).unwrap();
+        let c = changed_paths(&ws, "deadbeef");
+        assert!(!c.is_known());
+        assert!(c.reason().unwrap().contains("--archive"), "{c}");
+        assert!(c.matches_any(&["anything/**".to_string()]));
+        std::fs::remove_dir_all(ws.root.parent().unwrap()).ok();
+
+        let (bytes, parent, base) = bundle_with_parent(&[("a.txt", "1")], &[("a.txt", "2")], &[]);
+        let ws = workspace();
+        if materialize(&bundle_source(&bytes), &ws, 1 << 22).is_err() {
+            std::fs::remove_dir_all(&base).ok();
+            return;
+        }
+
+        // A root commit: the client could not resolve a parent and sent "".
+        for empty in ["", "   "] {
+            let c = changed_paths(&ws, empty);
+            assert!(!c.is_known(), "{empty:?}");
+            assert!(c.reason().unwrap().contains("no parent"), "{c}");
+            assert!(c.matches_any(&["anything/**".to_string()]));
+        }
+
+        // A `before` from a history this bundle is not part of — which is also
+        // what `--dirty` used to produce before the `after` side was pinned to
+        // the clone's own HEAD.
+        let c = changed_paths(&ws, "0123456789012345678901234567890123456789");
+        assert!(!c.is_known());
+        assert!(
+            c.reason().unwrap().contains("not in the submitted bundle"),
+            "{c}"
+        );
+        assert!(c.matches_any(&["anything/**".to_string()]));
+
+        // And the control: the same workspace with a real parent does answer.
+        assert!(changed_paths(&ws, &parent).is_known());
+
+        std::fs::remove_dir_all(&base).ok();
         std::fs::remove_dir_all(ws.root.parent().unwrap()).ok();
     }
 

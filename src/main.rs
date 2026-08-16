@@ -19,6 +19,7 @@ mod expr;
 mod image;
 mod nats_auth;
 mod objects;
+mod paths;
 mod plan;
 mod pool;
 mod repos;

@@ -1856,6 +1856,8 @@ mod page_tests {
             repo_name: Some("app".into()),
             git_ref: "refs/heads/main".into(),
             sha: "9183de223817abcdef".into(),
+            before_sha: "0000de223817abcdef".into(),
+            changes: crate::paths::Changes::known(vec!["src/main.rs".into()]),
             actor_email: Some("sam@sarocu.com".into()),
             status: status.into(),
             error: None,

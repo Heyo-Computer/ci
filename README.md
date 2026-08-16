@@ -176,6 +176,102 @@ has no daemon field and there is no cloud-proxied exec — so `<network>/*/<vm>`
 would force the orchestrator to interrogate every host in the network to find one
 VM. Naming the node is refused-if-absent rather than guessed.
 
+### Monorepos: not every workflow on every commit
+
+`on: submit:` takes branch and path filters, and a workflow whose filters decline
+a submit produces no run at all.
+
+```yaml
+on:
+  submit:
+    branches: [main, 'release/*']   # or branches-ignore
+    paths:                          # or paths-ignore
+      - 'packages/api/**'
+      - Cargo.lock
+```
+
+```text
+*      any run of characters within one segment; never crosses `/`
+**     any number of whole segments, including none
+?      exactly one character within one segment
+```
+
+`paths` builds when **any** changed path matches. `paths-ignore` skips only when
+**every** changed path matches — one interesting file in a commit is enough to
+build. `paths`/`paths-ignore` and `branches`/`branches-ignore` are each mutually
+exclusive: GitHub allows a mixture and resolves it by pattern order within the
+list, which is not readable off the file, so the combination is refused. A
+leading `!` is refused for the same reason, naming `paths-ignore` instead.
+
+A misspelled filter is a **parse error**, not a filter that quietly does nothing
+— the same rule `stpes:` gets. This block used to be read and discarded, so a
+workflow that said `branches: [main]` built every branch with nothing reporting
+that it had.
+
+The finer-grained form is a condition on one job, which is what a monorepo
+usually wants — one workflow file, one run, and the packages that changed:
+
+```yaml
+jobs:
+  api:
+    if: ${{ changed('packages/api/**') }}
+    ...
+  web:
+    if: ${{ changed('packages/web/**', 'packages/shared/**') }}
+```
+
+`changed()` runs the same matcher the `paths:` filter does, so a job condition
+and a workflow filter cannot disagree about what a pattern covers. It is not
+`contains(ci.changed_files, …)`, which on an array is an equality test and would
+need the exact path of every file somebody might touch.
+
+**The diff comes from the submitted bundle's own history**, not from a fetch:
+`git diff --name-only --no-renames <before> HEAD` in the unpacked clone, where
+`before` is what the client sent (`git rev-parse HEAD^`). Rename detection is
+off deliberately — a file moved between two packages must rebuild both, and with
+it git reports only the destination.
+
+The **`after` side is the clone's `HEAD`, not the payload's `after`**, because
+`git submit --dirty` reports `<sha>-dirty`: a label for a person, not a
+resolvable object. The bundle's `HEAD` is the only thing that points at the tree
+that actually travelled.
+
+#### When the diff cannot be read
+
+`--archive` sends a tarball with no history. A root commit has no parent. A
+`before` from a history the bundle is not part of resolves to nothing. In all of
+these there is no answer, and **no answer matches every filter** — the workflow
+builds.
+
+The other direction is the failure worth designing against: unknown meaning
+"nothing changed" is a CI system that quietly stops building and reports a green
+tick on a commit nothing ran on. The same rule holds for `changed()`, which is
+true when the diff is unknown, and for `paths-ignore`, which does not skip on
+one. `ci.changes_known` and `ci.changes_reason` say which case a run is in.
+
+A submit where every workflow declined is a **success with no runs**, not an
+error: in a monorepo most commits touch one package, so most workflows correctly
+build nothing. `git submit` prints the reason each one gave. Nothing matching the
+glob at all is still an error — that is a mistake, not a decision.
+
+### The `ci` expression scope
+
+What commit a run is for, readable from any `if:` or `${{ }}`:
+
+```text
+ci.sha             ci.ref              ci.changed_files    (array)
+ci.before          ci.branch           ci.changes_known    (bool)
+ci.repository      ci.run_id           ci.changes_reason   (empty when known)
+ci.workflow
+```
+
+Read from the run row rather than frozen onto each job's plan, unlike the network
+assignment beside it. The two are not the same kind of fact: a repository can be
+reassigned to another network mid-build, so the plan freezes that; the commit a
+run is for is fixed when the bundle is unpacked and cannot move under a
+redelivery. Freezing it anyway would copy a monorepo-sized path list onto every
+job row.
+
 ### Images: `image:` or `build:`
 
 ```yaml
@@ -803,8 +899,10 @@ CI_TEST_STREAM_PREFIXES=citest cargo test -- --ignored delete_leftover
 ## Status
 
 Working: workflow parsing and planning (matrix, `needs`, `if`, `max-parallel`),
-runner discovery, the VM pool, the job queue, `git submit` with per-repository tokens, secrets with masking,
-disk and `artifacts` sinks, the dashboard with live logs, and workflow objects.
+branch and path filters with the `changed()` condition, runner discovery, the VM
+pool, the job queue, `git submit` with per-repository tokens, secrets with
+masking, disk and `artifacts` sinks, the dashboard with live logs, and workflow
+objects.
 
 Not built yet:
 

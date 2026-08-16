@@ -131,6 +131,14 @@ impl Dispatcher {
         let size =
             crate::trigger::materialize(&req.source, &workspace, self.config.max_source_bytes)?;
 
+        // Read once, from the seed workspace, before any run is created: every
+        // workflow file in this submit is looking at the same commit, and a
+        // second `git diff` per file would be the same answer at the same cost.
+        // Copied onto each run so the scheduler and the dashboard read it from
+        // the row rather than from a tree that gets swept.
+        let changes = crate::trigger::changed_paths(&workspace, &req.before);
+        tracing::info!("submit: {changes}");
+
         // Which repository this is, in one place. A registration's URL is the
         // canonical spelling and wins over the payload's, which matters for the
         // client that has no `origin` remote at all: it sends an empty URL, and
@@ -212,6 +220,11 @@ impl Dispatcher {
 
         let mut run_ids = Vec::new();
         let mut patterns_tried = Vec::new();
+        // Workflow files that matched the glob and then declined to build, with
+        // the filter that declined. Kept apart from `warnings` because they are
+        // the difference between "nothing matched your glob" — a mistake worth
+        // an error — and "your filters said no", which is the feature working.
+        let mut skipped: Vec<String> = Vec::new();
         // Carried back to the client. A submit that queued but will not run
         // until something changes should say so at the terminal that made it,
         // not only on a page nobody has open.
@@ -235,6 +248,15 @@ impl Dispatcher {
                     .map_err(|e| DispatchError::Workflow(e.to_string()))?;
                 if !wf.on.iter().any(|t| t == "submit") {
                     tracing::info!("{path} does not trigger on `submit`; skipping");
+                    continue;
+                }
+                // The monorepo gate. Evaluated per workflow file, because that
+                // is the unit a run is created for: in a repository with an
+                // `api.yml` and a `web.yml`, a commit touching only `api/` must
+                // produce one run and not two.
+                if let Err(why) = wf.on_submit.admits(req.branch(), &changes) {
+                    tracing::info!("{path} declined this submit: {why}");
+                    skipped.push(format!("{path}: {why}"));
                     continue;
                 }
                 let mut plan = crate::plan::Plan::build(&wf)
@@ -277,6 +299,7 @@ impl Dispatcher {
                             git_ref: req.r#ref.clone(),
                             sha: req.after.clone(),
                             before_sha: req.before.clone(),
+                            changes: changes.clone(),
                             actor_subject: actor.map(|a| a.subject.clone()),
                             actor_email: actor
                                 .map(|a| a.email.clone())
@@ -291,13 +314,28 @@ impl Dispatcher {
             }
         }
 
-        if run_ids.is_empty() {
+        // A submit that started nothing is two different situations, and
+        // collapsing them was survivable only while no workflow could decline.
+        //
+        // Nothing *matched* is a mistake — a glob pointing at a directory that
+        // is not there, or a workflow that triggers on something this build does
+        // not honour — and the submitter wants a non-zero exit for it.
+        //
+        // Everything *declining* is the feature doing its job. In a monorepo it
+        // is the common case: most commits touch one package, so most workflows
+        // correctly build nothing. Failing the submit for that would make `git
+        // submit` red on a healthy repository, and would break any hook that
+        // treats a failed submit as something to retry.
+        if run_ids.is_empty() && skipped.is_empty() {
             return Err(crate::trigger::TriggerError::NoWorkflows(format!(
                 "{} (nothing matched, or nothing triggering on `submit`)",
                 patterns_tried.join(", ")
             ))
             .into());
         }
+        // Reported whether or not anything else ran: with several workflows, the
+        // interesting question is usually why the *other* one did not.
+        warnings.extend(skipped.into_iter().map(|s| format!("no run started — {s}")));
         Ok(Submitted { run_ids, warnings })
     }
 
@@ -312,6 +350,9 @@ impl Dispatcher {
     pub async fn advance_run(&self, run_id: &str) -> Result<RunStatus, DispatchError> {
         let jobs = self.store.jobs_of(run_id).await?;
         let needs = self.store.needs_context(run_id).await?;
+        // One read for the whole wave, not one per job: the commit a run is for
+        // does not change between two jobs of the same run.
+        let ci = Self::ci_scope(self.store.get_run(run_id).await?.as_ref());
 
         // A base id is only satisfied once *every* cell of it is terminal —
         // `needs: [build]` cannot mean "the first cell of build".
@@ -356,7 +397,7 @@ impl Dispatcher {
             // Decide `if:` now that dependencies have results. A dependency that
             // failed makes the default guard false, which is what stops a deploy
             // job from shipping a broken build.
-            match self.should_run(&plan, &needs) {
+            match self.should_run(&plan, &needs, &ci) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.store
@@ -437,12 +478,50 @@ impl Dispatcher {
         Ok(self.store.roll_up_run(run_id).await?)
     }
 
+    /// The `ci` expression scope: which commit this run is for, and what it
+    /// changed.
+    ///
+    /// Built from the run row rather than persisted onto each `JobPlan`, unlike
+    /// the network assignment next to it. The reason is that the two are not the
+    /// same kind of fact: a repository's network can be reassigned while a build
+    /// is in flight, so the plan freezes it; the commit a run is for is fixed
+    /// when the bundle is unpacked and cannot move under a redelivery. Freezing
+    /// it anyway would copy a monorepo-sized path list onto every job row.
+    ///
+    /// A run this process cannot read at all yields an empty scope rather than
+    /// an error: `ci.sha` resolving to null is a condition an author can see is
+    /// wrong, whereas failing the job says nothing about what to fix.
+    fn ci_scope(run: Option<&crate::store::Run>) -> Value {
+        let Some(run) = run else {
+            return Value::Object(Default::default());
+        };
+        serde_json::json!({
+            "sha": run.sha,
+            "before": run.before_sha,
+            "ref": run.git_ref,
+            "branch": run.git_ref.strip_prefix("refs/heads/").unwrap_or(&run.git_ref),
+            "repository": run.repo_url,
+            "run_id": run.id,
+            "workflow": run.workflow_id,
+            "changed_files": run.changes.paths(),
+            // Read by `changed()`, and worth exposing on its own: a workflow
+            // that wants to be careful can write
+            // `if: !ci.changes_known || changed('api/**')` and get the same
+            // build-when-unsure default the path filters apply.
+            "changes_known": run.changes.is_known(),
+            // Empty when the diff was read. Present because "my path filter
+            // matched everything" is otherwise unexplainable from inside a
+            // build: `echo ${{ ci.changes_reason }}` in a step is the answer.
+            "changes_reason": run.changes.reason().unwrap_or_default(),
+        })
+    }
+
     /// Evaluate a job's `if:`.
     ///
     /// The default when there is no `if:` is GitHub's: run only if nothing this
     /// job needs failed. Writing an explicit `if:` opts out of that — which is
     /// how `if: always()` gets a cleanup job to run after a failure.
-    fn should_run(&self, plan: &JobPlan, needs: &Value) -> Result<bool, DispatchError> {
+    fn should_run(&self, plan: &JobPlan, needs: &Value, ci: &Value) -> Result<bool, DispatchError> {
         let any_failed = plan.needs.iter().any(|n| {
             matches!(
                 needs
@@ -459,6 +538,7 @@ impl Dispatcher {
 
         let mut ctx = plan.base_context();
         ctx.set("needs", needs.clone());
+        ctx.set("ci", ci.clone());
         ctx.set_status(if any_failed { "failure" } else { "success" });
         ctx.eval_condition(condition)
             .map_err(|e| DispatchError::Condition(e.to_string()))
@@ -1464,6 +1544,10 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
             .as_ref()
             .map(|r| r.workflow_id.clone())
             .unwrap_or_default();
+        // The same scope the scheduler evaluated the job's own `if:` against, so
+        // a step condition and a job condition cannot disagree about which
+        // commit they are looking at.
+        let ci = Self::ci_scope(run.as_ref());
         let environment = plan
             .env
             .get("CI_ENVIRONMENT")
@@ -1505,6 +1589,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
             ctx.set("steps", Value::Object(step_outputs.clone()));
             ctx.set("secrets", secret_scope.clone());
             ctx.set("vars", vars_scope.clone());
+            ctx.set("ci", ci.clone());
             ctx.set_status(if failed.is_some() {
                 "failure"
             } else {
@@ -1646,6 +1731,7 @@ has no git. Add it to the vm setup_hooks, or submit with `git submit --archive`.
         ctx.set("steps", Value::Object(step_outputs));
         ctx.set("secrets", secret_scope);
         ctx.set("vars", vars_scope);
+        ctx.set("ci", ci);
         // Masked as well: a job output is read by the next job's `if:` and shown
         // on the dashboard, so an output that interpolated a secret would put it
         // somewhere a log masker never sees.

@@ -581,6 +581,36 @@ impl<'a> Parser<'a> {
                 args.first().unwrap_or(&Value::Null).to_string(),
             )),
             "fromJSON" => Ok(serde_json::from_str(&s(0)).unwrap_or(Value::Null)),
+            // `changed('packages/api/**')` — the monorepo gate, at job level.
+            //
+            // Not expressible with `contains(ci.changed_files, …)`: `contains`
+            // on an array is an equality test, so it would need the exact path
+            // of every file somebody might touch. This runs the same glob
+            // matcher the `on: submit: paths:` filter uses, so a job's `if:` and
+            // a workflow's filter cannot disagree about what a pattern covers.
+            //
+            // **True when the change set is unknown**, matching the filters and
+            // for the same reason: a tarball submit, a root commit and a
+            // `--dirty` submit have no diff to read, and a job that silently
+            // skips on those is a green tick on work nothing did.
+            "changed" => {
+                let known = truthy(&self.ctx.lookup(&["ci".into(), "changes_known".into()]));
+                if !known {
+                    return Ok(Value::Bool(true));
+                }
+                let files = self.ctx.lookup(&["ci".into(), "changed_files".into()]);
+                let Value::Array(files) = files else {
+                    return Ok(Value::Bool(true));
+                };
+                // Every argument is a pattern, so `changed('a/**', 'b/**')` is
+                // the or of the two — the same shape a `paths:` list has.
+                Ok(Value::Bool(args.iter().any(|pat| {
+                    let pat = to_display(pat);
+                    files
+                        .iter()
+                        .any(|f| crate::paths::matches(&pat, &to_display(f)))
+                })))
+            }
             // Status checks read the status the caller installed. `always()` is
             // the one that must stay true after a failure, which is how cleanup
             // steps run at all.
@@ -649,6 +679,85 @@ mod tests {
             )
             .set("secrets", json!({"TOKEN": "s3cr3t"}));
         c
+    }
+
+    /// A `ci` scope the way `Dispatcher::ci_scope` builds one.
+    fn with_changes(files: &[&str], known: bool) -> Context {
+        let mut c = ctx();
+        c.set(
+            "ci",
+            json!({
+                "sha": "9183de2",
+                "branch": "main",
+                "changed_files": files,
+                "changes_known": known,
+            }),
+        );
+        c
+    }
+
+    /// The job-level monorepo gate. `contains(ci.changed_files, …)` cannot do
+    /// this — on an array it is an equality test, so it would need the exact
+    /// path of every file somebody might touch.
+    #[test]
+    fn changed_matches_a_glob_against_the_run_s_diff() {
+        let c = with_changes(&["packages/api/src/main.rs", "README.md"], true);
+
+        assert!(c.eval_condition("changed('packages/api/**')").unwrap());
+        assert!(c.eval_condition("changed('*.md')").unwrap());
+        assert!(!c.eval_condition("changed('packages/web/**')").unwrap());
+        // A single `*` must not cross a separator here either.
+        assert!(!c.eval_condition("changed('packages/*.rs')").unwrap());
+
+        // Several patterns are an or, the same shape a `paths:` list has.
+        assert!(
+            c.eval_condition("changed('packages/web/**', 'packages/api/**')")
+                .unwrap()
+        );
+        assert!(!c.eval_condition("changed('a/**', 'b/**')").unwrap());
+
+        // And it composes with everything else, which is the point of it being
+        // a function rather than a second filter block.
+        assert!(
+            c.eval_condition("changed('packages/api/**') && ci.branch == 'main'")
+                .unwrap()
+        );
+        assert!(!c.eval_condition("!changed('packages/api/**')").unwrap());
+    }
+
+    /// The same fallback the path filters take, and for the same reason: a
+    /// submit with no readable diff must build, not skip.
+    #[test]
+    fn changed_is_true_when_the_diff_could_not_be_read() {
+        let c = with_changes(&[], false);
+        assert!(c.eval_condition("changed('packages/api/**')").unwrap());
+        assert!(c.eval_condition("changed('nothing/like/this')").unwrap());
+
+        // A run this build cannot read at all gets an empty `ci` scope, which
+        // must land the same way rather than skipping every job.
+        let plain = ctx();
+        assert!(plain.eval_condition("changed('anything')").unwrap());
+
+        // A *known* empty diff is a real answer and does not match.
+        assert!(
+            !with_changes(&[], true)
+                .eval_condition("changed('**')")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn the_ci_scope_reads_like_any_other() {
+        let c = with_changes(&["a.rs"], true);
+        assert_eq!(c.eval("ci.sha").unwrap(), json!("9183de2"));
+        assert_eq!(c.eval("ci.changed_files.0").unwrap(), json!("a.rs"));
+        assert_eq!(c.substitute("build ${{ ci.branch }}"), "build main");
+        // The careful spelling an author can write when they want the
+        // build-when-unsure default made explicit.
+        assert!(
+            c.eval_condition("!ci.changes_known || changed('a*')")
+                .unwrap()
+        );
     }
 
     #[test]

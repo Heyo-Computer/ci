@@ -19,6 +19,7 @@
 //! that a malformed job reports *which* job rather than a line number inside a
 //! merged error.
 
+use crate::paths::Changes;
 use crate::vm::VmSpec;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -292,6 +293,109 @@ impl Job {
     }
 }
 
+/// The filters on `on: submit:` — which branches, and which paths.
+///
+/// **This block used to be read and thrown away.** `on: { submit: { branches:
+/// [main] } }` parsed, because only the *keys* of the `on:` mapping were looked
+/// at, and then built every branch anyway. A filter that silently does nothing
+/// is the same class of bug as a misspelled `stpes:`, which this file makes a
+/// hard parse error — so `deny_unknown_fields` is on here for the same reason.
+///
+/// `paths` and `paths-ignore` are mutually exclusive, as are `branches` and
+/// `branches-ignore`. GitHub allows a mixture and resolves it by pattern order
+/// within the list, which is behaviour nobody can read off the file; refusing
+/// the combination costs a workflow nothing and removes the question.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubmitFilter {
+    /// Build only these branches. Empty means every branch.
+    #[serde(default)]
+    pub branches: Vec<String>,
+    #[serde(rename = "branches-ignore", default)]
+    pub branches_ignore: Vec<String>,
+    /// Build only when a changed path matches. Empty means any change.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    /// Skip when *every* changed path matches.
+    #[serde(rename = "paths-ignore", default)]
+    pub paths_ignore: Vec<String>,
+}
+
+impl SubmitFilter {
+    fn validate(&self, path: &str) -> Result<(), WorkflowError> {
+        if !self.paths.is_empty() && !self.paths_ignore.is_empty() {
+            return Err(WorkflowError::ConflictingFilter {
+                path: path.to_string(),
+                a: "paths",
+                b: "paths-ignore",
+            });
+        }
+        if !self.branches.is_empty() && !self.branches_ignore.is_empty() {
+            return Err(WorkflowError::ConflictingFilter {
+                path: path.to_string(),
+                a: "branches",
+                b: "branches-ignore",
+            });
+        }
+        for (field, patterns) in [
+            ("branches", &self.branches),
+            ("branches-ignore", &self.branches_ignore),
+            ("paths", &self.paths),
+            ("paths-ignore", &self.paths_ignore),
+        ] {
+            for pattern in patterns {
+                crate::paths::validate(pattern).map_err(|detail| WorkflowError::BadFilter {
+                    path: path.to_string(),
+                    field,
+                    detail,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a submit on `branch` that changed `changes` should produce a run.
+    ///
+    /// `Err` carries the reason, which is reported to the submitter: a workflow
+    /// that decided not to build must say so at the terminal that asked, or the
+    /// answer to "why did nothing happen" is a log line on a server.
+    pub fn admits(&self, branch: &str, changes: &Changes) -> Result<(), String> {
+        if !self.branches.is_empty()
+            && !self
+                .branches
+                .iter()
+                .any(|p| crate::paths::matches(p, branch))
+        {
+            return Err(format!(
+                "branch {branch:?} is not in `branches: [{}]`",
+                self.branches.join(", ")
+            ));
+        }
+        if let Some(hit) = self
+            .branches_ignore
+            .iter()
+            .find(|p| crate::paths::matches(p, branch))
+        {
+            return Err(format!(
+                "branch {branch:?} matches `branches-ignore: {hit}`"
+            ));
+        }
+        if !self.paths.is_empty() && !changes.matches_any(&self.paths) {
+            return Err(format!(
+                "nothing under `paths: [{}]` changed ({changes})",
+                self.paths.join(", ")
+            ));
+        }
+        if changes.all_match(&self.paths_ignore) {
+            return Err(format!(
+                "every changed path matches `paths-ignore: [{}]`",
+                self.paths_ignore.join(", ")
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A parsed workflow file. `jobs` keeps the author's order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workflow {
@@ -300,6 +404,9 @@ pub struct Workflow {
     /// Trigger names from `on:`. Only `submit` is honoured today; anything else
     /// parses and is reported as unsupported rather than silently ignored.
     pub on: Vec<String>,
+    /// The filters written under `on: submit:`. Default — no filters, build
+    /// everything — when `on:` is absent or names `submit` without a block.
+    pub on_submit: SubmitFilter,
     pub env: BTreeMap<String, String>,
     pub jobs: Vec<(String, Job)>,
 }
@@ -351,15 +458,17 @@ impl Workflow {
             jobs.push((id, job));
         }
 
-        let on = match header.on {
-            None => vec!["submit".to_string()],
-            Some(v) => trigger_names(&v),
+        let (on, on_submit) = match header.on {
+            None => (vec!["submit".to_string()], SubmitFilter::default()),
+            Some(v) => (trigger_names(&v), submit_filter(path, &v)?),
         };
+        on_submit.validate(path)?;
 
         let wf = Self {
             path: path.to_string(),
             name: header.name,
             on,
+            on_submit,
             env: header.env,
             jobs,
         };
@@ -497,6 +606,34 @@ impl Workflow {
     }
 }
 
+/// The block under `on: submit:`, when `on:` is written as a mapping.
+///
+/// The other two spellings — a bare string and a sequence — carry no block, so
+/// they get the default. Only `submit`'s block is read: an unsupported trigger
+/// is already reported as unsupported, and parsing filters for a trigger that
+/// never fires would be inventing a contract this build does not honour.
+fn submit_filter(path: &str, v: &serde_yaml::Value) -> Result<SubmitFilter, WorkflowError> {
+    let Some(map) = v.as_mapping() else {
+        return Ok(SubmitFilter::default());
+    };
+    let Some(block) = map
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("submit"))
+        .map(|(_, v)| v)
+    else {
+        return Ok(SubmitFilter::default());
+    };
+    // `on: { submit: }` is a mapping whose value is null, and means the trigger
+    // with no filters — not a malformed block.
+    if block.is_null() {
+        return Ok(SubmitFilter::default());
+    }
+    serde_yaml::from_value(block.clone()).map_err(|e| WorkflowError::BadTriggerBlock {
+        path: path.to_string(),
+        detail: e.to_string(),
+    })
+}
+
 /// `on: submit`, `on: [submit, schedule]`, or `on: {submit: {...}}`.
 fn trigger_names(v: &serde_yaml::Value) -> Vec<String> {
     match v {
@@ -532,6 +669,24 @@ pub enum WorkflowError {
     NoJobs(String),
     DuplicateJob(String),
     BadJobId(String),
+    /// The block under `on: submit:` did not deserialize — a misspelled filter
+    /// name, or a scalar where a list belongs.
+    BadTriggerBlock {
+        path: String,
+        detail: String,
+    },
+    /// A filter pattern this dialect cannot represent.
+    BadFilter {
+        path: String,
+        field: &'static str,
+        detail: String,
+    },
+    /// Two filters that would need an ordering rule to combine.
+    ConflictingFilter {
+        path: String,
+        a: &'static str,
+        b: &'static str,
+    },
     BadJob {
         path: String,
         job: String,
@@ -574,6 +729,23 @@ impl fmt::Display for WorkflowError {
             Self::Yaml { path, detail } => write!(f, "{path} is not valid workflow YAML: {detail}"),
             Self::NoJobs(path) => write!(f, "{path} declares no jobs"),
             Self::DuplicateJob(path) => write!(f, "{path} declares the same job id twice"),
+            Self::BadTriggerBlock { path, detail } => write!(
+                f,
+                "the `on: submit:` block in {path} is malformed: {detail}. \
+                 The filters are `branches`, `branches-ignore`, `paths` and \
+                 `paths-ignore`, each a list of glob patterns."
+            ),
+            Self::BadFilter {
+                path,
+                field,
+                detail,
+            } => write!(f, "`on: submit: {field}:` in {path} — {detail}"),
+            Self::ConflictingFilter { path, a, b } => write!(
+                f,
+                "{path} sets both `{a}:` and `{b}:` under `on: submit:`. Which \
+                 wins would depend on the order the patterns happen to be \
+                 written in, so write one or the other."
+            ),
             Self::BadJobId(id) => write!(
                 f,
                 "job id {id:?} must be 1-64 characters of letters, digits, '_' or '-'; \
@@ -1122,6 +1294,156 @@ jobs:
             parse("jobs:\n  a:\n    vm: { driver: firecracker }\n    steps: [{ run: \"true\" }]\n")
                 .unwrap();
         assert_eq!(wf.on, ["submit"]);
+    }
+
+    fn with_on(block: &str) -> Result<Workflow, WorkflowError> {
+        parse(&format!(
+            "{block}\njobs:\n  a:\n    vm: {{ driver: firecracker }}\n    steps: [{{ run: \"true\" }}]\n"
+        ))
+    }
+
+    fn changed(paths: &[&str]) -> Changes {
+        Changes::known(paths.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// The regression this whole block exists for. `on: { submit: { branches:
+    /// [main] } }` used to parse — only the mapping's *keys* were read — and
+    /// then build every branch anyway, with nothing reporting that the filter
+    /// had been dropped.
+    #[test]
+    fn a_filter_block_is_read_rather_than_discarded() {
+        let wf = with_on("on:\n  submit:\n    branches: [main]\n    paths: ['api/**']").unwrap();
+        assert_eq!(wf.on_submit.branches, ["main"]);
+        assert_eq!(wf.on_submit.paths, ["api/**"]);
+
+        // The three spellings that carry no block all mean "no filters".
+        for block in ["on: submit", "on: [submit]", "on:\n  submit:"] {
+            let wf = with_on(block).unwrap_or_else(|e| panic!("{block}: {e}"));
+            assert_eq!(wf.on_submit, SubmitFilter::default(), "{block}");
+            assert_eq!(wf.on_submit.admits("anything", &changed(&["x"])), Ok(()));
+        }
+    }
+
+    /// The same rule the rest of this file applies to `stpes:`: a misspelled
+    /// filter name is a parse error, not a filter that silently does nothing.
+    #[test]
+    fn a_misspelled_filter_is_a_parse_error() {
+        for bad in ["path", "branch", "paths_ignore", "on-paths"] {
+            let err = with_on(&format!("on:\n  submit:\n    {bad}: ['a/**']"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("paths-ignore"), "{bad}: {err}");
+        }
+        // A scalar where a list belongs is caught by the same route.
+        assert!(with_on("on:\n  submit:\n    paths: 'api/**'").is_err());
+    }
+
+    #[test]
+    fn conflicting_filters_are_refused_rather_than_ordered() {
+        let err =
+            with_on("on:\n  submit:\n    paths: ['a/**']\n    paths-ignore: ['b/**']").unwrap_err();
+        assert!(
+            matches!(err, WorkflowError::ConflictingFilter { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("order"), "{err}");
+
+        let err = with_on("on:\n  submit:\n    branches: [main]\n    branches-ignore: [dev]")
+            .unwrap_err();
+        assert!(
+            matches!(err, WorkflowError::ConflictingFilter { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// `!` in a `paths:` list is GitHub's spelling and is order-dependent, so it
+    /// is refused with the spelling that is not.
+    #[test]
+    fn a_negated_pattern_names_paths_ignore() {
+        let err = with_on("on:\n  submit:\n    paths: ['!docs/**']")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("paths-ignore"), "{err}");
+        assert!(err.contains("docs/**"), "{err}");
+    }
+
+    /// The monorepo decision, both ways.
+    #[test]
+    fn paths_admit_only_a_submit_that_touched_them() {
+        let wf = with_on("on:\n  submit:\n    paths: ['packages/api/**', 'Cargo.lock']").unwrap();
+        let f = &wf.on_submit;
+
+        assert_eq!(
+            f.admits("main", &changed(&["packages/api/src/main.rs"])),
+            Ok(())
+        );
+        assert_eq!(f.admits("main", &changed(&["Cargo.lock"])), Ok(()));
+
+        let why = f
+            .admits("main", &changed(&["packages/web/index.html"]))
+            .unwrap_err();
+        assert!(why.contains("packages/api/**"), "{why}");
+        assert!(why.contains("1 path(s) changed"), "{why}");
+    }
+
+    /// `paths-ignore` skips only when *nothing* in the commit is interesting.
+    #[test]
+    fn paths_ignore_needs_every_path_to_match() {
+        let wf = with_on("on:\n  submit:\n    paths-ignore: ['docs/**', '*.md']").unwrap();
+        let f = &wf.on_submit;
+
+        assert!(
+            f.admits("main", &changed(&["docs/a.txt", "README.md"]))
+                .is_err()
+        );
+        // One interesting file is enough to build.
+        assert_eq!(
+            f.admits("main", &changed(&["docs/a.txt", "src/main.rs"])),
+            Ok(())
+        );
+        // A commit that changed nothing is not a commit that changed only docs.
+        assert_eq!(f.admits("main", &changed(&[])), Ok(()));
+    }
+
+    #[test]
+    fn branch_filters_use_the_same_glob_dialect() {
+        let wf = with_on("on:\n  submit:\n    branches: [main, 'release/*']").unwrap();
+        let f = &wf.on_submit;
+        assert_eq!(f.admits("main", &changed(&["x"])), Ok(()));
+        assert_eq!(f.admits("release/1.2", &changed(&["x"])), Ok(()));
+        // `*` does not cross a separator, so a nested branch is not a release.
+        assert!(f.admits("release/1.2/rc", &changed(&["x"])).is_err());
+        let why = f.admits("feature/x", &changed(&["x"])).unwrap_err();
+        assert!(why.contains("feature/x"), "{why}");
+
+        let wf = with_on("on:\n  submit:\n    branches-ignore: ['wip/**']").unwrap();
+        assert!(wf.on_submit.admits("wip/a/b", &changed(&["x"])).is_err());
+        assert_eq!(wf.on_submit.admits("main", &changed(&["x"])), Ok(()));
+    }
+
+    /// The safety property, at the level that decides whether a build happens:
+    /// a submit whose diff could not be read must build, not skip.
+    #[test]
+    fn an_unknown_change_set_still_builds_a_path_filtered_workflow() {
+        let unknown = Changes::unknown("a tarball carries no history");
+
+        let wf = with_on("on:\n  submit:\n    paths: ['packages/api/**']").unwrap();
+        assert_eq!(wf.on_submit.admits("main", &unknown), Ok(()));
+
+        // And `paths-ignore` must not skip on no answer either — that is the
+        // case a bare `.all()` gets wrong, because all-of-nothing is true.
+        let wf = with_on("on:\n  submit:\n    paths-ignore: ['**']").unwrap();
+        assert_eq!(wf.on_submit.admits("main", &unknown), Ok(()));
+    }
+
+    /// A branch filter is decided without reading the diff at all, so it holds
+    /// for the submits that have no diff to read.
+    #[test]
+    fn branch_filters_do_not_depend_on_the_change_set() {
+        let wf = with_on("on:\n  submit:\n    branches: [main]").unwrap();
+        let unknown = Changes::unknown("no parent");
+        assert!(wf.on_submit.admits("feature/x", &unknown).is_err());
+        assert_eq!(wf.on_submit.admits("main", &unknown), Ok(()));
     }
 
     #[test]
